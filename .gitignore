@@ -1,0 +1,7 @@
+/target
+**/node_modules
+config.local.toml
+*.key
+.env
+/bin/psiphon*
+/dist
