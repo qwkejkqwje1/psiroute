@@ -5,7 +5,11 @@
   - Сделано: workspace (psi-config, psi-core), загрузка/сохранение TOML с deep-merge и выносом секретов в `config.local.toml`, `Target/Outbound/BoxStream/Event/EventBus`, `DirectOutbound`, `MixedInbound` (SOCKS5 + HTTP CONNECT/proxy) со счётчиками `Event::Stats`.
   - Тесты: парсинг SOCKS5 (IPv4/домен), merge конфигов, разделение секретов, подсчёт событий, DIRECT-connect. `cargo check`, `clippy -D warnings`, `cargo test` зелёные.
   - Осталось: реальный append фактического трафика в UI появится вместе с движком (шаг 09).
-- [ ] 02 psi-psiphon: сайдкар, config.json, notices, страны
+- [x] 02 psi-psiphon: сайдкар, config.json, notices, страны
+  - Сделано: `PsiphonConfig` (PascalCase config.json), `PsiphonInstance` (spawn/kill_on_drop/CREATE_NO_WINDOW), парсинг notices в `watch`-состояние и `Event`-шину, `wait_connected`, `stop`, `restart_with_region`, `PsiphonOutbound` через SOCKS5, список стран по умолчанию.
+  - Прямой режим: `upstream_proxy_url = None` — Psiphon сам обходит блокировки своими протоколами (OSSH/TLS-OSSH/meek/QUIC), без VLESS/WARP/DPI-хопов.
+  - В psi-core добавлен переиспользуемый SOCKS5-клиент (`socks5_connect`).
+  - Осталось: реальная сборка/поставка бинаря `psiphon-tunnel-core` — шаг 11 (CI).
 - [ ] 03 psi-vless: VLESS-WS-TLS клиент + early-data; модернизация Worker
 - [ ] 04 psi-dpi: DPI-мост (TLS split/фрагментация), DoH
 - [ ] 05 psi-warp: WARP + boringtun + AWG-junk + сканер эндпоинтов

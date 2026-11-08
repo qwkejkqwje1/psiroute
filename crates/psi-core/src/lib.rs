@@ -1,11 +1,13 @@
 mod event;
 mod inbound;
 mod outbound;
+mod socks5;
 mod target;
 
 pub use event::{ConnState, Event, EventBus};
 pub use inbound::{Handler, Meta, MixedInbound};
 pub use outbound::{BoxFuture, DirectOutbound, Health, Outbound};
+pub use socks5::socks5_connect;
 pub use target::{AsyncStream, BoxStream, Target};
 
 use thiserror::Error;
