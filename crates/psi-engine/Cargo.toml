@@ -1,0 +1,26 @@
+[package]
+name = "psi-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+psi-core = { path = "../psi-core" }
+psi-config = { path = "../psi-config" }
+psi-bootstrap = { path = "../psi-bootstrap" }
+psi-psiphon = { path = "../psi-psiphon" }
+psi-router = { path = "../psi-router" }
+psi-vless = { path = "../psi-vless" }
+psi-warp = { path = "../psi-warp" }
+psi-dpi = { path = "../psi-dpi" }
+tokio.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+arc-swap = "1"
+futures.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+windows-sys = { version = "0.59", features = ["Win32_Networking_WinInet"] }
