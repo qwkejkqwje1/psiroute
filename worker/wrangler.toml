@@ -1,0 +1,15 @@
+name = "psiroute-vless"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+workers_dev = false
+
+# Свой домен (обязательно, не *.workers.dev):
+# routes = [{ pattern = "vpn.example.com/*", zone_name = "example.com" }]
+
+[vars]
+WS_PATH = "/api/v1/stream"
+DECOY_HOST = "www.cloudflare.com"
+
+# Секреты (задать через wrangler, НЕ в этом файле):
+#   wrangler secret put UUID      # один или несколько UUID через запятую
+#   wrangler secret put PROXYIP   # опционально: host:port для fallback
