@@ -14,7 +14,9 @@
   - Сделано: VLESS-заголовки (IPv4/домен/IPv6), ответный парсер, TLS (rustls + webpki-roots, ALPN h1), WS-upgrade с проверкой эха subprotocol, early-data ≤50 мс в `Sec-WebSocket-Protocol`, `VlessOutbound`, `vless://` парсер, `serve_socks`, `scan_clean_ips` (32 параллельно, топ-5), тест «16КБ-заморозки».
   - Worker: эхо subprotocol, несколько UUID в постоянном времени, `PROXYIP` fallback, UDP DNS→DoH, `/api/v1/dns`, прикрытие с кэшем, `wrangler.toml` и README.
   - Осталось: реальную DPI-фрагментацию ClientHello подключить на шаге 04 (хук `fragment` уже есть).
-- [ ] 04 psi-dpi: DPI-мост (TLS split/фрагментация), DoH
+- [x] 04 psi-dpi: DPI-мост (TLS split/фрагментация), DoH
+  - Сделано: `DpiOutbound` (перехват первой записи, nodelay, duplex), парсер ClientHello/SNI и HTTP `Host`, стратегии `split/tlsrec/disorder/oob/httphost` + 4 пресета, `autotune` по 4 хостам (≤4 параллельно), DoH (`hickory-proto` + `h2` поверх `DpiOutbound`, гонка серверов, кэш), `serve_socks`, опциональный запуск внешних движков.
+  - Тесты: SNI/offset, две валидные TLS-записи (склейка = исходник), HTTP Host и переписывание без смены длины, парсер стратегий, DPI-bridge, DoH bootstrap/запрос.
 - [ ] 05 psi-warp: WARP + boringtun + AWG-junk + сканер эндпоинтов
 - [ ] 06 psi-bootstrap: гонка стратегий + кэш
 - [ ] 07 psi-router: правила, geoip/geosite, пресеты

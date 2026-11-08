@@ -28,7 +28,7 @@ Psiphon-ядро (Go, `psiphon-tunnel-core`) **не переписываем** �
 | `psi-core` | Общие трейты: `Outbound`, `Inbound`, `Event`-шина (tokio broadcast), SOCKS5/HTTP inbound | tokio, bytes |
 | `psi-psiphon` | Управление сайдкаром: генерация config.json, запуск, парсинг JSON-notices, страны | tokio::process, serde_json |
 | `psi-vless` | VLESS поверх WS+TLS, early-data (0-RTT) | tokio-tungstenite, rustls, uuid |
-| `psi-dpi` | Обход DPI в userspace: split/фрагментация TLS ClientHello, DoH | rustls (не нужен — работаем с байтами), hickory-resolver |
+| `psi-dpi` | Обход DPI в userspace: split/фрагментация TLS ClientHello, DoH | rustls (работаем с байтами), hickory-proto + h2 (DoH через DpiOutbound) |
 | `psi-warp` | Регистрация WARP, WireGuard (boringtun) + AmneziaWG-junk, перебор эндпоинтов, SOCKS-выход через smoltcp | boringtun, smoltcp |
 | `psi-bootstrap` | Гонка стратегий, кэш победителя на сеть | — |
 | `psi-router` | Движок правил: domain/suffix/keyword/regex, CIDR, geoip(mmdb), geosite(списки), process, port | maxminddb, ipnet, regex, aho-corasick |
@@ -48,6 +48,15 @@ pub enum Target { Domain(String, u16), Ip(SocketAddr) }
 pub enum Event { State(ConnState), Log(String), Stats{up:u64, down:u64}, Regions(Vec<String>), Route{dst:String, outbound:String} }
 ```
 `ConnState`: `Idle | Bootstrapping{strategy} | Connecting{region} | Connected{region, via} | Error(String)`.
+
+```rust
+// psi-dpi
+pub enum SplitAt { Fixed(usize), Sni, SniPlusOne }
+pub enum Strategy { Split(SplitAt), TlsRec(SplitAt), Disorder{at: SplitAt, ttl: u8}, Oob(SplitAt), HttpHost }
+pub struct StrategyPlan { pub actions: Vec<Strategy> } // presets(): tlsrec+split(sni), disorder(1), split(1)+oob, tlsrec(sni)+disorder(sni)
+pub struct DpiOutbound; // impl Outbound; перехватывает первую запись и применяет StrategyPlan
+pub struct DohResolver;  // resolve(name) -> Vec<IpAddr>; DoH-трафик идёт через DpiOutbound
+```
 
 ## Psiphon: как подключаем
 - Бинарь `psiphon-tunnel-core` ConsoleClient (собираем в CI из github.com/Psiphon-Labs/psiphon-tunnel-core, `go build ./ConsoleClient`).
