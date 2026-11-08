@@ -210,6 +210,8 @@ pub struct Bootstrap {
     pub order: Vec<String>,
     pub stagger_ms: u64,
     pub timeout_s: u64,
+    /// Автоматически переключаться на прямой путь Psiphon, если он снова доступен.
+    pub auto_promote: bool,
 }
 
 impl Default for Bootstrap {
@@ -223,6 +225,7 @@ impl Default for Bootstrap {
             ],
             stagger_ms: 300,
             timeout_s: 25,
+            auto_promote: true,
         }
     }
 }

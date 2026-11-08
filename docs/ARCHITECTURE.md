@@ -30,7 +30,7 @@ Psiphon-ядро (Go, `psiphon-tunnel-core`) **не переписываем** �
 | `psi-vless` | VLESS поверх WS+TLS, early-data (0-RTT) | tokio-tungstenite, rustls, uuid |
 | `psi-dpi` | Обход DPI в userspace: split/фрагментация TLS ClientHello, DoH | rustls (работаем с байтами), hickory-proto + h2 (DoH через DpiOutbound) |
 | `psi-warp` | Регистрация WARP, WireGuard (boringtun) + AmneziaWG-junk, перебор эндпоинтов, SOCKS-выход через smoltcp | boringtun, smoltcp, x25519-dalek, rustls, rand |
-| `psi-bootstrap` | Гонка стратегий, кэш победителя на сеть | — |
+| `psi-bootstrap` | Гонка стратегий, кэш победителя на сеть, reconnect/auto-promote | netdev, tokio-util (CancellationToken), sha2 |
 | `psi-router` | Движок правил: domain/suffix/keyword/regex, CIDR, geoip(mmdb), geosite(списки), process, port | maxminddb, ipnet, regex, aho-corasick |
 | `psi-tun` | TUN + userspace TCP/IP (ipstack), fake-ip DNS, защита от петель | tun-rs, ipstack |
 | `psi-engine` | Движок-библиотека: `Engine::start(cfg) -> Handle{events, cmd}`; используется Tauri in-process + бинарь `psiroute-cli` | всё выше |
@@ -64,6 +64,15 @@ pub struct WarpRegistration; // register()/register_via(&dyn Outbound), import_c
 pub struct WarpOutbound;     // impl Outbound; TCP через smoltcp поверх boringtun
 pub async fn scan(&WarpRegistration, &JunkConfig) -> Result<Vec<EndpointResult>>; // 200 пар, 50 параллельно, топ-3 RTT
 pub fn inject_reserved(&mut [u8], [u8; 3]) -> bool; // байты 1..4 каждого WG-пакета
+```
+
+```rust
+// psi-bootstrap
+pub struct NetworkFingerprint; // current() -> hash(шлюз + MAC/SSID), NetworkID Psiphon и ключ кэша
+#[async_trait] pub trait Strategy { fn tag(&self) -> &str; async fn prepare(&self) -> Option<Bridge>; }
+pub struct Bootstrap; // race() -> Winner; run_forever() = кэш + stagger/head-start + reconnect 20 с + auto_promote
+pub struct Winner { /* tag, PsiphonInstance, Bridge */ }
+pub async fn wait_lost(state, lost_after) -> bool;
 ```
 
 ## Psiphon: как подключаем

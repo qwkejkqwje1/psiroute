@@ -20,7 +20,9 @@
 - [x] 05 psi-warp: WARP + boringtun + AWG-junk + сканер эндпоинтов
   - Сделано: регистрация через API `v0a2158/reg` (x25519, reserved из `client_id`), импорт `wgcf`/AmneziaWG `.conf` с junk `Jc/Jmin/Jmax/I1`; `WarpTransport` (boringtun, reserved в байты 1..4, junk перед handshake); стек `smoltcp` (IPv4/IPv6, MTU 1280, TCP, DNS через туннель к 1.1.1.1) → `WarpOutbound` + `serve_socks`; сканер WARP-эндпоинтов (200 пар, 50 параллельно, топ-3 RTT).
   - Тесты: запись reserved, длины junk в диапазоне, импорт профилей, парсер HTTP/DNS, timestamp, подсети/порты. `cargo check`, `clippy -D warnings`, `cargo test` зелёные.
-- [ ] 06 psi-bootstrap: гонка стратегий + кэш
+- [x] 06 psi-bootstrap: гонка стратегий + кэш
+  - Сделано: `NetworkFingerprint::current()` (netdev, хэш шлюза/MAC) как `NetworkID`; стратегии `direct/dpi/vless/warp` через локальные SOCKS-мосты; гонка с кэшем `bootstrap_cache.json` (победитель первым + фора 1500 мс), stagger 300 мс, отдельный `data/psiphon/<tag>`, общий таймаут; проигравшие отменяются (`CancellationToken`); reconnect при потере туннелей >20 с; фоновая проверка `direct` раз в 15 мин + `auto_promote`.
+  - Тесты: `tokio::time::pause` (быстрая стратегия побеждает, проигравшие отменены), порядок/задержки кэша, кэш на диске, `wait_lost`. `cargo check`, `clippy -D warnings`, `cargo test` зелёные.
 - [ ] 07 psi-router: правила, geoip/geosite, пресеты
 - [ ] 08 psi-tun: TUN-режим, fake-ip DNS, защита от петель
 - [ ] 09 psi-engine: сборка движка, команды, CLI

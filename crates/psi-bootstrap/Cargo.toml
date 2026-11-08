@@ -1,0 +1,27 @@
+[package]
+name = "psi-bootstrap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+psi-core = { path = "../psi-core" }
+psi-config = { path = "../psi-config" }
+psi-psiphon = { path = "../psi-psiphon" }
+psi-dpi = { path = "../psi-dpi" }
+psi-vless = { path = "../psi-vless" }
+psi-warp = { path = "../psi-warp" }
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio-util = { version = "0.7", features = ["rt"] }
+netdev = "0.47"
+sha2 = "0.10"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
