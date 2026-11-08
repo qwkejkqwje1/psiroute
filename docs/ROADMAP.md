@@ -17,7 +17,9 @@
 - [x] 04 psi-dpi: DPI-мост (TLS split/фрагментация), DoH
   - Сделано: `DpiOutbound` (перехват первой записи, nodelay, duplex), парсер ClientHello/SNI и HTTP `Host`, стратегии `split/tlsrec/disorder/oob/httphost` + 4 пресета, `autotune` по 4 хостам (≤4 параллельно), DoH (`hickory-proto` + `h2` поверх `DpiOutbound`, гонка серверов, кэш), `serve_socks`, опциональный запуск внешних движков.
   - Тесты: SNI/offset, две валидные TLS-записи (склейка = исходник), HTTP Host и переписывание без смены длины, парсер стратегий, DPI-bridge, DoH bootstrap/запрос.
-- [ ] 05 psi-warp: WARP + boringtun + AWG-junk + сканер эндпоинтов
+- [x] 05 psi-warp: WARP + boringtun + AWG-junk + сканер эндпоинтов
+  - Сделано: регистрация через API `v0a2158/reg` (x25519, reserved из `client_id`), импорт `wgcf`/AmneziaWG `.conf` с junk `Jc/Jmin/Jmax/I1`; `WarpTransport` (boringtun, reserved в байты 1..4, junk перед handshake); стек `smoltcp` (IPv4/IPv6, MTU 1280, TCP, DNS через туннель к 1.1.1.1) → `WarpOutbound` + `serve_socks`; сканер WARP-эндпоинтов (200 пар, 50 параллельно, топ-3 RTT).
+  - Тесты: запись reserved, длины junk в диапазоне, импорт профилей, парсер HTTP/DNS, timestamp, подсети/порты. `cargo check`, `clippy -D warnings`, `cargo test` зелёные.
 - [ ] 06 psi-bootstrap: гонка стратегий + кэш
 - [ ] 07 psi-router: правила, geoip/geosite, пресеты
 - [ ] 08 psi-tun: TUN-режим, fake-ip DNS, защита от петель

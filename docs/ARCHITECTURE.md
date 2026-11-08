@@ -29,7 +29,7 @@ Psiphon-ядро (Go, `psiphon-tunnel-core`) **не переписываем** �
 | `psi-psiphon` | Управление сайдкаром: генерация config.json, запуск, парсинг JSON-notices, страны | tokio::process, serde_json |
 | `psi-vless` | VLESS поверх WS+TLS, early-data (0-RTT) | tokio-tungstenite, rustls, uuid |
 | `psi-dpi` | Обход DPI в userspace: split/фрагментация TLS ClientHello, DoH | rustls (работаем с байтами), hickory-proto + h2 (DoH через DpiOutbound) |
-| `psi-warp` | Регистрация WARP, WireGuard (boringtun) + AmneziaWG-junk, перебор эндпоинтов, SOCKS-выход через smoltcp | boringtun, smoltcp |
+| `psi-warp` | Регистрация WARP, WireGuard (boringtun) + AmneziaWG-junk, перебор эндпоинтов, SOCKS-выход через smoltcp | boringtun, smoltcp, x25519-dalek, rustls, rand |
 | `psi-bootstrap` | Гонка стратегий, кэш победителя на сеть | — |
 | `psi-router` | Движок правил: domain/suffix/keyword/regex, CIDR, geoip(mmdb), geosite(списки), process, port | maxminddb, ipnet, regex, aho-corasick |
 | `psi-tun` | TUN + userspace TCP/IP (ipstack), fake-ip DNS, защита от петель | tun-rs, ipstack |
@@ -56,6 +56,14 @@ pub enum Strategy { Split(SplitAt), TlsRec(SplitAt), Disorder{at: SplitAt, ttl: 
 pub struct StrategyPlan { pub actions: Vec<Strategy> } // presets(): tlsrec+split(sni), disorder(1), split(1)+oob, tlsrec(sni)+disorder(sni)
 pub struct DpiOutbound; // impl Outbound; перехватывает первую запись и применяет StrategyPlan
 pub struct DohResolver;  // resolve(name) -> Vec<IpAddr>; DoH-трафик идёт через DpiOutbound
+```
+
+```rust
+// psi-warp
+pub struct WarpRegistration; // register()/register_via(&dyn Outbound), import_conf(&str) -> ImportedProfile
+pub struct WarpOutbound;     // impl Outbound; TCP через smoltcp поверх boringtun
+pub async fn scan(&WarpRegistration, &JunkConfig) -> Result<Vec<EndpointResult>>; // 200 пар, 50 параллельно, топ-3 RTT
+pub fn inject_reserved(&mut [u8], [u8; 3]) -> bool; // байты 1..4 каждого WG-пакета
 ```
 
 ## Psiphon: как подключаем
