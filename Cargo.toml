@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
-# Шаг 10 добавит GUI:
-# members = ["crates/*", "app/src-tauri"]
+members = ["crates/*", "app-slint"]
+# Шаг 10: GUI — две сборки для сравнения Amy: app-slint (Slint, чистый Rust)
+# и app-tauri (Tauri 2, добавляется отдельным членом воркспейса).
 
 [workspace.package]
 version = "0.1.0"

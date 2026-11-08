@@ -1,0 +1,342 @@
+import { LineEdit, ListView, CheckBox, ComboBox, ScrollView } from "std-widgets.slint";
+
+export struct RegionRow {
+    code: string,
+    label: string,
+    fav: bool,
+}
+
+export struct RuleRow {
+    name: string,
+    target: string,
+    action: string,
+}
+
+export global Logic {
+    in-out property <int> page: 0; // 0 главный, 1 страны, 2 маршруты, 3 лента, 4 настройки
+    in property <bool> connected: false;
+    in property <bool> connecting: false;
+    in property <string> status-text: "Отключено";
+    in property <string> region-label: "Страна: авто";
+    in property <string> strategy-text: "—";
+    in property <string> ping-text: "—";
+    in property <string> up-text: "0 КБ/с";
+    in property <string> down-text: "0 КБ/с";
+    in property <[RegionRow]> regions;
+    in property <[RuleRow]> rules;
+    in property <[string]> log-lines;
+    in property <string> preset-name: "smart_ru";
+    in-out property <bool> system-proxy: true;
+
+    in-out property <string> search-text: "";
+    in-out property <string> test-text: "";
+    in property <string> test-result: "";
+    in-out property <string> add-domain: "";
+    in-out property <int> add-action-index: 3;
+    in-out property <string> vless-uri: "";
+    in-out property <string> psi-channel: "";
+    in-out property <string> psi-sponsor: "";
+    in-out property <string> psi-url: "";
+    in-out property <string> psi-key: "";
+
+    callback toggle-connect();
+    callback pick-region(string);
+    callback toggle-fav(string);
+    callback set-preset(string);
+    callback run-test();
+    callback add-rule();
+    callback delete-rule(int);
+    callback import-vless();
+    callback save-psiphon();
+    callback register-warp();
+    callback scan-ips();
+    callback scan-warp();
+    callback autotune();
+    callback sysproxy-changed(bool);
+    callback search-edited();
+    callback quit-app();
+}
+
+component NavButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    callback tapped();
+    height: 44px;
+    border-radius: 12px;
+    background: active ? #7C5CFF : #1b1b2e;
+    Text {
+        text: root.text;
+        color: white;
+        font-size: 13px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    TouchArea { clicked => { root.tapped(); } }
+}
+
+component ActionButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> accent: false;
+    callback tapped();
+    height: 40px;
+    border-radius: 12px;
+    background: accent ? #7C5CFF : #23233a;
+    Text {
+        text: root.text;
+        color: white;
+        font-size: 14px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    TouchArea { clicked => { root.tapped(); } }
+}
+
+export component Tray inherits SystemTrayIcon {
+    in property <bool> connected;
+    in property <bool> busy;
+    in property <image> icon-off;
+    in property <image> icon-on;
+    in property <image> icon-busy;
+    icon: busy ? icon-busy : connected ? icon-on : icon-off;
+    tooltip: "PsiRoute";
+    title: "PsiRoute";
+    callback show-window();
+    callback toggle();
+    callback quit();
+    clicked => { root.show-window(); }
+    Menu {
+        MenuItem {
+            title: "Открыть PsiRoute";
+            activated => { root.show-window(); }
+        }
+        MenuItem {
+            title: root.connected || root.busy ? "Отключить" : "Подключить";
+            activated => { root.toggle(); }
+        }
+        MenuSeparator { }
+        MenuItem {
+            title: "Выход";
+            activated => { root.quit(); }
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "PsiRoute";
+    width: 400px;
+    height: 700px;
+    background: #0d0d17;
+    in property <image> app-icon;
+    icon: app-icon;
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+
+        // ---------- страницы ----------
+        Rectangle {
+            vertical-stretch: 1;
+            background: transparent;
+
+            // Главный экран
+            if Logic.page == 0: VerticalLayout {
+                alignment: center;
+                spacing: 14px;
+                padding-top: 24px;
+
+                Rectangle {
+                    width: 190px;
+                    height: 190px;
+                    x: (parent.width - self.width) / 2;
+                    border-radius: 95px;
+                    background: Logic.connected ? @linear-gradient(135deg, #00D1FF, #7C5CFF) : (Logic.connecting ? #8a6d1f : #23233a);
+                    Text {
+                        text: Logic.connecting ? "…" : (Logic.connected ? "Отключить" : "Подключить");
+                        color: white;
+                        font-size: 20px;
+                        font-weight: 700;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    TouchArea { clicked => { Logic.toggle-connect(); } }
+                }
+
+                Text {
+                    text: Logic.status-text;
+                    color: #c9c9e0;
+                    font-size: 15px;
+                    horizontal-alignment: center;
+                }
+
+                ActionButton {
+                    text: Logic.region-label;
+                    tapped => { Logic.page = 1; }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle {
+                        border-radius: 12px; background: #171728; height: 56px;
+                        Text { text: "Стратегия\n" + Logic.strategy-text; color: #a7a7c7; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Rectangle {
+                        border-radius: 12px; background: #171728; height: 56px;
+                        Text { text: "Пинг\n" + Logic.ping-text; color: #a7a7c7; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle {
+                        border-radius: 12px; background: #171728; height: 56px;
+                        Text { text: "↑ " + Logic.up-text; color: #8be9c9; font-size: 14px; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Rectangle {
+                        border-radius: 12px; background: #171728; height: 56px;
+                        Text { text: "↓ " + Logic.down-text; color: #8ec9e9; font-size: 14px; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+            }
+
+            // Страны
+            if Logic.page == 1: VerticalLayout {
+                spacing: 10px;
+                LineEdit {
+                    text <=> Logic.search-text;
+                    placeholder-text: "Поиск страны…";
+                    edited => { Logic.search-edited(); }
+                }
+                ListView {
+                    vertical-stretch: 1;
+                    for region in Logic.regions: Rectangle {
+                        height: 46px;
+                        border-radius: 10px;
+                        background: #171728;
+                        HorizontalLayout {
+                            padding-left: 12px; padding-right: 8px; spacing: 8px;
+                            Text {
+                                text: region.label;
+                                color: white; font-size: 15px;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                            Rectangle {
+                                width: 36px;
+                                Text { text: region.fav ? "★" : "☆"; color: #ffd34d; font-size: 18px; horizontal-alignment: center; vertical-alignment: center; }
+                                TouchArea { clicked => { Logic.toggle-fav(region.code); } }
+                            }
+                        }
+                        TouchArea { clicked => { Logic.pick-region(region.code); } }
+                    }
+                }
+                ActionButton { text: "Лучшая (авто)"; accent: true; tapped => { Logic.pick-region(""); } }
+            }
+
+            // Маршруты
+            if Logic.page == 2: VerticalLayout {
+                spacing: 10px;
+                Text { text: "Пресет"; color: #a7a7c7; font-size: 13px; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    NavButton { text: "Умный РФ"; active: Logic.preset-name == "smart_ru"; tapped => { Logic.set-preset("smart_ru"); } }
+                    NavButton { text: "Только заблок."; active: Logic.preset-name == "blocked_only"; tapped => { Logic.set-preset("blocked_only"); } }
+                    NavButton { text: "Всё через VPN"; active: Logic.preset-name == "all_vpn"; tapped => { Logic.set-preset("all_vpn"); } }
+                }
+                Text { text: "Свои правила (выше пресетов)"; color: #a7a7c7; font-size: 13px; }
+                ListView {
+                    height: 150px;
+                    for rule[idx] in Logic.rules: Rectangle {
+                        height: 40px;
+                        border-radius: 10px;
+                        background: #171728;
+                        HorizontalLayout {
+                            padding-left: 10px; padding-right: 6px; spacing: 6px;
+                            Text { text: rule.target + " → " + rule.action; color: white; font-size: 13px; vertical-alignment: center; horizontal-stretch: 1; }
+                            Rectangle {
+                                width: 32px;
+                                Text { text: "✕"; color: #ff7b7b; font-size: 14px; horizontal-alignment: center; vertical-alignment: center; }
+                                TouchArea { clicked => { Logic.delete-rule(idx); } }
+                            }
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    LineEdit { text <=> Logic.add-domain; placeholder-text: "домен, напр. youtube.com"; horizontal-stretch: 1; }
+                    ComboBox {
+                        model: ["direct", "dpi", "vless", "psiphon", "warp", "block"];
+                        current-index <=> Logic.add-action-index;
+                        width: 110px;
+                    }
+                }
+                ActionButton { text: "Добавить правило"; tapped => { Logic.add-rule(); } }
+                Rectangle { height: 1px; background: #2a2a44; }
+                Text { text: "Куда пойдёт:"; color: #a7a7c7; font-size: 13px; }
+                LineEdit { text <=> Logic.test-text; placeholder-text: "домен для проверки"; accepted => { Logic.run-test(); } }
+                ActionButton { text: "Проверить"; tapped => { Logic.run-test(); } }
+                Text { text: Logic.test-result; color: #8be9c9; font-size: 13px; }
+            }
+
+            // Лента
+            if Logic.page == 3: VerticalLayout {
+                spacing: 8px;
+                Text { text: "События и соединения"; color: #a7a7c7; font-size: 13px; }
+                ListView {
+                    vertical-stretch: 1;
+                    for line in Logic.log-lines: Text {
+                        text: line;
+                        color: #c9c9e0;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
+            // Настройки
+            if Logic.page == 4: ScrollView {
+                VerticalLayout {
+                    spacing: 10px;
+                    alignment: start;
+                    CheckBox {
+                        text: "Системный прокси при подключении";
+                        checked <=> Logic.system-proxy;
+                        toggled => { Logic.sysproxy-changed(Logic.system-proxy); }
+                    }
+                    Text { text: "TUN-режим: шаг 08, в этой сборке недоступен"; color: #77779a; font-size: 12px; }
+                    Rectangle { height: 1px; background: #2a2a44; }
+                    Text { text: "Импорт VLESS (свой Worker)"; color: white; font-size: 14px; }
+                    LineEdit { text <=> Logic.vless-uri; placeholder-text: "vless://…"; }
+                    ActionButton { text: "Импортировать"; tapped => { Logic.import-vless(); } }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        ActionButton { text: "Сканер чистых IP"; tapped => { Logic.scan-ips(); } }
+                        ActionButton { text: "Автоподбор DPI"; tapped => { Logic.autotune(); } }
+                    }
+                    Rectangle { height: 1px; background: #2a2a44; }
+                    Text { text: "WARP"; color: white; font-size: 14px; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        ActionButton { text: "Зарегистрировать"; tapped => { Logic.register-warp(); } }
+                        ActionButton { text: "Сканер эндпоинтов"; tapped => { Logic.scan-warp(); } }
+                    }
+                    Rectangle { height: 1px; background: #2a2a44; }
+                    Text { text: "Сеть Psiphon (секреты уйдут в config.local.toml)"; color: white; font-size: 14px; }
+                    LineEdit { text <=> Logic.psi-channel; placeholder-text: "PropagationChannelId"; }
+                    LineEdit { text <=> Logic.psi-sponsor; placeholder-text: "SponsorId"; }
+                    LineEdit { text <=> Logic.psi-url; placeholder-text: "RemoteServerListUrl"; }
+                    LineEdit { text <=> Logic.psi-key; placeholder-text: "RemoteServerListSignaturePublicKey"; }
+                    ActionButton { text: "Сохранить параметры Psiphon"; tapped => { Logic.save-psiphon(); } }
+                }
+            }
+        }
+
+        // ---------- нижняя навигация ----------
+        HorizontalLayout {
+            spacing: 8px;
+            NavButton { text: "Главная"; active: Logic.page == 0; tapped => { Logic.page = 0; } }
+            NavButton { text: "Страны"; active: Logic.page == 1; tapped => { Logic.page = 1; } }
+            NavButton { text: "Маршруты"; active: Logic.page == 2; tapped => { Logic.page = 2; } }
+            NavButton { text: "Лента"; active: Logic.page == 3; tapped => { Logic.page = 3; } }
+            NavButton { text: "Настройки"; active: Logic.page == 4; tapped => { Logic.page = 4; } }
+        }
+    }
+}
