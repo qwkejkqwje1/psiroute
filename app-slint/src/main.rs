@@ -24,25 +24,6 @@ fn rgba(bytes: &[u8], size: u32) -> slint::Image {
     ))
 }
 
-fn flag(code: &str) -> String {
-    if code.len() != 2 {
-        return "🌐".to_string();
-    }
-    let mut out = String::new();
-    for ch in code.chars() {
-        let v = ch as u32;
-        if (0x41..=0x5A).contains(&v) {
-            if let Some(flag_ch) = char::from_u32(0x1F1E6 + (v - 0x41)) {
-                out.push(flag_ch);
-            }
-        }
-    }
-    if out.is_empty() {
-        "🌐".to_string()
-    } else {
-        out
-    }
-}
 
 fn country_name(code: &str) -> String {
     let name = match code {
@@ -179,9 +160,7 @@ impl Ui {
             })
             .map(|code| RegionRow {
                 code: SharedString::from(code.as_str()),
-                label: SharedString::from(
-                    format!("{} {} ({})", flag(code), country_name(code), code).as_str(),
-                ),
+                label: SharedString::from(country_name(code).as_str()),
                 fav: self.favorites.contains(code),
             })
             .collect();
@@ -322,8 +301,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let label = if code.is_empty() {
                     "Страна: авто".to_string()
                 } else {
-                    format!("{} {} ({})", flag(&code), country_name(&code), code)
+                    format!("Страна: {} ({})", country_name(&code), code)
                 };
+                window
+                    .global::<Logic>()
+                    .set_region_code(SharedString::from(code.as_str()));
                 window.global::<Logic>().set_region_label(SharedString::from(label.as_str()));
                 window.global::<Logic>().set_page(0);
             }
@@ -647,6 +629,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             },
         );
+    }
+
+    // Режим скриншотов для отладки вёрстки (необязательные env):
+    // PSI_SHOT=путь.ppm PSI_PAGE=N — снять страницу N и выйти.
+    if let Ok(shot_path) = std::env::var("PSI_SHOT") {
+        if let Ok(page) = std::env::var("PSI_PAGE") {
+            if let Ok(page) = page.parse::<i32>() {
+                window.global::<Logic>().set_page(page);
+            }
+        }
+        let weak = window.as_weak();
+        slint::Timer::single_shot(std::time::Duration::from_millis(1500), move || {
+            if let Some(ui) = weak.upgrade() {
+                if let Ok(buffer) = ui.window().take_snapshot() {
+                    let mut out =
+                        format!("P6\n{} {}\n255\n", buffer.width(), buffer.height()).into_bytes();
+                    for pixel in buffer.as_slice() {
+                        out.extend_from_slice(&[pixel.r, pixel.g, pixel.b]);
+                    }
+                    let _ = std::fs::write(&shot_path, out);
+                }
+                let _ = slint::quit_event_loop();
+            }
+        });
     }
 
     window.run()?;

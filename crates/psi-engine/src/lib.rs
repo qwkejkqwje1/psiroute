@@ -15,11 +15,14 @@ use psi_config::{Config, RuleCfg};
 use psi_core::{ConnState, DirectOutbound, Event, EventBus, Handler, MixedInbound, Outbound, Target};
 use psi_dpi::DpiOutbound;
 use psi_psiphon::PsiphonState;
-use psi_router::{CompiledRouter, HotRouter, Meta as RouteMeta, Network, ProcessLookup, RouterAssets};
+use psi_router::{
+    CompiledRouter, HotRouter, ListUpdater, Meta as RouteMeta, Network, ProcessLookup,
+    RouterAssets,
+};
 use psi_vless::{VlessOutbound, VlessSettings};
 use psi_warp::{JunkConfig, WarpOutbound, WarpRegistration};
 
-use outbounds::{ErrorOutbound, OutboundSet};
+use outbounds::{ErrorOutbound, FallbackOutbound, OutboundSet};
 
 /// Снимок состояния движка для UI.
 #[derive(Debug, Clone, Default)]
@@ -67,6 +70,8 @@ pub enum Cmd {
     AutotuneDpi,
     ToggleTun(bool),
     ToggleSystemProxy(bool),
+    /// Служебная: фоновое обновление списков завершилось — пересобрать роутер.
+    ListsUpdated,
 }
 
 /// Ручка управления движком.
@@ -112,7 +117,13 @@ impl Engine {
         let status = Arc::new(Mutex::new(Status::default()));
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
 
-        let actor = Actor::new(config, config_dir, bus.clone(), Arc::clone(&status));
+        let actor = Actor::new(
+            config,
+            config_dir,
+            bus.clone(),
+            Arc::clone(&status),
+            cmd_tx.clone(),
+        );
         tokio::spawn(actor.run(cmd_rx));
 
         Handle {
@@ -127,6 +138,7 @@ struct Actor {
     cfg: Config,
     dir: PathBuf,
     bus: EventBus,
+    tx: mpsc::Sender<Cmd>,
     status: Arc<Mutex<Status>>,
     winner: Option<psi_bootstrap::Winner>,
     inbound_task: Option<JoinHandle<()>>,
@@ -140,12 +152,19 @@ struct Actor {
 }
 
 impl Actor {
-    fn new(cfg: Config, dir: PathBuf, bus: EventBus, status: Arc<Mutex<Status>>) -> Self {
+    fn new(
+        cfg: Config,
+        dir: PathBuf,
+        bus: EventBus,
+        status: Arc<Mutex<Status>>,
+        tx: mpsc::Sender<Cmd>,
+    ) -> Self {
         let router = Arc::new(HotRouter::new(build_router(&cfg, &bus)));
         Self {
             cfg,
             dir,
             bus,
+            tx,
             status,
             winner: None,
             inbound_task: None,
@@ -170,6 +189,7 @@ impl Actor {
 
     async fn run(mut self, mut rx: mpsc::Receiver<Cmd>) {
         self.bus.publish(Event::Regions(self.regions.clone()));
+        self.spawn_lists_update();
         while let Some(cmd) = rx.recv().await {
             match cmd {
                 Cmd::Connect => self.connect().await,
@@ -258,8 +278,50 @@ impl Actor {
                     }
                     self.log(format!("системный прокси: {}", if on { "вкл" } else { "выкл" }));
                 }
+                Cmd::ListsUpdated => {
+                    self.rebuild_router();
+                    self.log("списки geosite/geoip подхвачены роутером");
+                }
             }
         }
+    }
+
+    /// Фоновое обновление списков geosite/geoip при старте: без них «умные»
+    /// правила пресетов пусты. Качает, только если файлов нет или они старше суток.
+    fn spawn_lists_update(&self) {
+        let Ok(data_dir) = Config::data_dir() else {
+            return;
+        };
+        let lists_dir = data_dir.join("lists");
+        let stale = ["geosite.dat", "geoip.dat"].iter().any(|name| {
+            let path = lists_dir.join(name);
+            match std::fs::metadata(&path).and_then(|meta| meta.modified()) {
+                Ok(modified) => modified.elapsed().map(|age| age > Duration::from_secs(86_400)).unwrap_or(true),
+                Err(_) => true,
+            }
+        });
+        if !stale {
+            return;
+        }
+        let bus = self.bus.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let updater = ListUpdater::new(lists_dir);
+            match updater.update(None).await {
+                Ok(files) => {
+                    bus.publish(Event::Log(format!(
+                        "списки geosite/geoip обновлены ({} файлов)",
+                        files.len()
+                    )));
+                    let _ = tx.send(Cmd::ListsUpdated).await;
+                }
+                Err(error) => {
+                    bus.publish(Event::Log(format!(
+                        "не удалось обновить списки geosite/geoip: {error} (правила по доменам работают, по geosite — пока нет)"
+                    )));
+                }
+            }
+        });
     }
 
     fn status(&self) -> Status {
@@ -488,7 +550,8 @@ impl Actor {
             "psiphon",
             "Psiphon не настроен: нужны параметры сети (Настройки → Psiphon)",
         ));
-        let mut strategy_name = "без Psiphon (direct/dpi/vless/warp)".to_string();
+        let mut psiphon_real = false;
+        let mut strategy_name = String::new();
         let mut state_rx: Option<watch::Receiver<PsiphonState>> = None;
 
         let creds_ok = !self.cfg.psiphon.propagation_channel_id.trim().is_empty()
@@ -505,6 +568,7 @@ impl Actor {
                                     "psiphon",
                                     socks_addr,
                                 ));
+                                psiphon_real = true;
                                 state_rx = Some(winner.subscribe());
                                 self.winner = Some(winner);
                             }
@@ -528,30 +592,76 @@ impl Actor {
             None => Arc::new(DpiOutbound::from(&self.cfg.dpi)),
         };
 
-        let vless_outbound: Arc<dyn Outbound> = match &self.cfg.vless {
+        let (vless_outbound, vless_real): (Arc<dyn Outbound>, bool) = match &self.cfg.vless {
             Some(vless_cfg) => match VlessSettings::from_config(vless_cfg)
                 .and_then(VlessOutbound::new)
             {
-                Ok(outbound) => Arc::new(outbound),
-                Err(error) => Arc::new(ErrorOutbound::new("vless", format!("VLESS: {error}"))),
+                Ok(outbound) => (Arc::new(outbound), true),
+                Err(error) => (
+                    Arc::new(ErrorOutbound::new("vless", format!("VLESS: {error}"))),
+                    false,
+                ),
             },
-            None => Arc::new(ErrorOutbound::new("vless", "VLESS не импортирован")),
+            None => (
+                Arc::new(ErrorOutbound::new("vless", "VLESS не импортирован")),
+                false,
+            ),
         };
 
-        let warp_outbound: Arc<dyn Outbound> = match &self.cfg.warp {
+        let (warp_outbound, warp_real): (Arc<dyn Outbound>, bool) = match &self.cfg.warp {
             Some(warp_cfg) if !warp_cfg.private_key.trim().is_empty() => {
                 match WarpOutbound::from_settings(warp_cfg).await {
-                    Ok(outbound) => Arc::new(outbound),
-                    Err(error) => Arc::new(ErrorOutbound::new("warp", format!("WARP: {error}"))),
+                    Ok(outbound) => (Arc::new(outbound), true),
+                    Err(error) => (
+                        Arc::new(ErrorOutbound::new("warp", format!("WARP: {error}"))),
+                        false,
+                    ),
                 }
             }
-            _ => Arc::new(ErrorOutbound::new("warp", "WARP не зарегистрирован")),
+            _ => (
+                Arc::new(ErrorOutbound::new("warp", "WARP не зарегистрирован")),
+                false,
+            ),
         };
+
+        // Действие роутера «proxy» (psiphon) — цепочка живых выходов:
+        // Psiphon → VLESS → WARP → DPI. Иначе без параметров Psiphon весь
+        // проксируемый трафик умирал бы об заглушку, а программа выглядела мёртвой.
+        let mut chain: Vec<Arc<dyn Outbound>> = Vec::new();
+        if psiphon_real {
+            chain.push(Arc::clone(&psiphon_outbound));
+        }
+        if vless_real {
+            chain.push(Arc::clone(&vless_outbound));
+        }
+        if warp_real {
+            chain.push(Arc::clone(&warp_outbound));
+        }
+        chain.push(Arc::clone(&dpi_outbound));
+        let primary_tag = chain
+            .first()
+            .map(|outbound| outbound.tag().to_string())
+            .unwrap_or_else(|| "dpi".to_string());
+        let proxy_outbound: Arc<dyn Outbound> = if chain.len() == 1 {
+            chain.into_iter().next().unwrap_or(dpi_outbound.clone())
+        } else {
+            Arc::new(FallbackOutbound::new(chain))
+        };
+        if !psiphon_real {
+            strategy_name = match primary_tag.as_str() {
+                "vless" => "VLESS (Psiphon не настроен)".to_string(),
+                "warp" => "WARP (Psiphon не настроен)".to_string(),
+                _ => "DPI-фрагментация (Psiphon не настроен)".to_string(),
+            };
+            self.log(format!(
+                "выход «proxy» работает через {primary_tag}; Psiphon задаётся в Настройках"
+            ));
+        }
 
         self.outbounds.store(Arc::new(OutboundSet {
             direct: Arc::new(DirectOutbound::new()),
             dpi: dpi_outbound,
-            psiphon: psiphon_outbound.clone(),
+            psiphon: proxy_outbound.clone(),
             vless: vless_outbound,
             warp: warp_outbound,
             block: Arc::new(ErrorOutbound::new("block", "заблокировано правилом")),
@@ -577,7 +687,7 @@ impl Actor {
         if let Some(rx) = state_rx {
             self.aux_tasks.push(spawn_sampler(rx, Arc::clone(&self.status), self.bus.clone()));
         }
-        self.aux_tasks.push(spawn_ping(psiphon_outbound, Arc::clone(&self.status)));
+        self.aux_tasks.push(spawn_ping(proxy_outbound, Arc::clone(&self.status)));
 
         let region = if self.cfg.psiphon.egress_region.is_empty() {
             "авто".to_string()
