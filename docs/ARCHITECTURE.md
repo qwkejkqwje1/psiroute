@@ -31,7 +31,7 @@ Psiphon-ядро (Go, `psiphon-tunnel-core`) **не переписываем** �
 | `psi-dpi` | Обход DPI в userspace: split/фрагментация TLS ClientHello, DoH | rustls (работаем с байтами), hickory-proto + h2 (DoH через DpiOutbound) |
 | `psi-warp` | Регистрация WARP, WireGuard (boringtun) + AmneziaWG-junk, перебор эндпоинтов, SOCKS-выход через smoltcp | boringtun, smoltcp, x25519-dalek, rustls, rand |
 | `psi-bootstrap` | Гонка стратегий, кэш победителя на сеть, reconnect/auto-promote | netdev, tokio-util (CancellationToken), sha2 |
-| `psi-router` | Движок правил: domain/suffix/keyword/regex, CIDR, geoip(mmdb), geosite(списки), process, port | maxminddb, ipnet, regex, aho-corasick |
+| `psi-router` | Движок правил: domain/suffix/keyword/regex, CIDR, geoip(mmdb и v2ray geoip.dat), geosite(v2ray geosite.dat), process, port | maxminddb, ip_network_table, regex, aho-corasick, prost, quick_cache, arc-swap |
 | `psi-tun` | TUN + userspace TCP/IP (ipstack), fake-ip DNS, защита от петель | tun-rs, ipstack |
 | `psi-engine` | Движок-библиотека: `Engine::start(cfg) -> Handle{events, cmd}`; используется Tauri in-process + бинарь `psiroute-cli` | всё выше |
 | `app` | Tauri 2 GUI + трей | tauri 2, svelte/solid (лёгкий фронт) |

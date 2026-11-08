@@ -23,7 +23,10 @@
 - [x] 06 psi-bootstrap: гонка стратегий + кэш
   - Сделано: `NetworkFingerprint::current()` (netdev, хэш шлюза/MAC) как `NetworkID`; стратегии `direct/dpi/vless/warp` через локальные SOCKS-мосты; гонка с кэшем `bootstrap_cache.json` (победитель первым + фора 1500 мс), stagger 300 мс, отдельный `data/psiphon/<tag>`, общий таймаут; проигравшие отменяются (`CancellationToken`); reconnect при потере туннелей >20 с; фоновая проверка `direct` раз в 15 мин + `auto_promote`.
   - Тесты: `tokio::time::pause` (быстрая стратегия побеждает, проигравшие отменены), порядок/задержки кэша, кэш на диске, `wait_lost`. `cargo check`, `clippy -D warnings`, `cargo test` зелёные.
-- [ ] 07 psi-router: правила, geoip/geosite, пресеты
+- [x] 07 psi-router: правила, geoip/geosite, пресеты
+  - Сделано: `CompiledRouter` (suffix по меткам, keyword — aho-corasick, regex — RegexSet, CIDR — ip_network_table, LRU-кэш решений на 10k, `explain()`), пресеты `smart_ru`/`blocked_only`/`all_vpn`, сниффинг домена из TLS SNI/HTTP Host (парсер psi-dpi), процесс по локальному порту (netstat2+sysinfo, кэш 2 с), обновление списков раз в сутки (runetfreedom + itdoginfo) с атомарной заменой и `HotRouter` на arc-swap; в psi-config модель правил заменена на `MatchCfg` (`match`/`all`/`not`).
+  - Ревью Muse 08.11.2026: исправлена семантика типов geosite.dat (Plain — подстрока, Domain — домен+поддомены, Full — точное), обновление списков больше не оставляет наполовину обновлённый набор (сначала скачиваются все файлы), убраны неиспользуемые зависимости psi-core/futures, кэш процессов sysinfo переиспользуется вместо `new_all()` каждые 2 с. Тесты воркспейса: 85 зелёных, clippy psi-router чист.
+  - Осталось: первое обновление списков происходит через сутки после старта (стартовые .dat приносит CI на шаге 11); реальные geosite.dat/geoip.dat на живой сети не проверялись.
 - [ ] 08 psi-tun: TUN-режим, fake-ip DNS, защита от петель
 - [ ] 09 psi-engine: сборка движка, команды, CLI
 - [ ] 10 app: Tauri 2 UI + трей + выбор стран

@@ -172,17 +172,44 @@ impl Default for Dpi {
     }
 }
 
+/// Условия правила; внутри одного `match` действует ИЛИ.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MatchCfg {
+    pub domain: Vec<String>,
+    pub domain_suffix: Vec<String>,
+    pub domain_keyword: Vec<String>,
+    pub domain_regex: Vec<String>,
+    pub geosite: Vec<String>,
+    pub ip_cidr: Vec<String>,
+    pub geoip: Vec<String>,
+    pub process: Vec<String>,
+    /// Диапазоны портов: `"443,8000-9000"`.
+    pub port: String,
+    /// `"tcp"` или `"udp"`.
+    pub network: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RuleCfg {
-    pub condition: String,
+    pub name: String,
+    #[serde(rename = "match")]
+    pub matcher: MatchCfg,
+    /// Все условия должны совпасть (И).
+    pub all: Vec<MatchCfg>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not: Option<MatchCfg>,
     pub action: String,
 }
 
 impl Default for RuleCfg {
     fn default() -> Self {
         Self {
-            condition: String::new(),
+            name: String::new(),
+            matcher: MatchCfg::default(),
+            all: Vec::new(),
+            not: None,
             action: "direct".to_string(),
         }
     }
@@ -335,7 +362,10 @@ impl Config {
             }
 
             if let Some(warp) = table.get_mut("warp").and_then(toml::Value::as_table_mut) {
-                warp.insert("private_key".to_string(), toml::Value::String(String::new()));
+                warp.insert(
+                    "private_key".to_string(),
+                    toml::Value::String(String::new()),
+                );
                 warp.insert(
                     "peer_public_key".to_string(),
                     toml::Value::String(String::new()),
@@ -377,10 +407,7 @@ impl Config {
         if let Some(vless) = &self.vless {
             if !vless.uuid.is_empty() {
                 let mut table = toml::map::Map::new();
-                table.insert(
-                    "uuid".to_string(),
-                    toml::Value::String(vless.uuid.clone()),
-                );
+                table.insert("uuid".to_string(), toml::Value::String(vless.uuid.clone()));
                 root.insert("vless".to_string(), toml::Value::Table(table));
             }
         }
@@ -487,10 +514,7 @@ mod tests {
 
     #[test]
     fn save_splits_secrets() {
-        let dir = std::env::temp_dir().join(format!(
-            "psiroute-config-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("psiroute-config-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut config = Config::default();

@@ -1,0 +1,38 @@
+final = "direct"
+
+[[rules]]
+name = "Заблокированные в РФ"
+action = "psiphon"
+[rules.match]
+geosite = ["ru-blocked", "ru-blocked-all"]
+
+[[rules]]
+name = "YouTube и Discord через DPI-обход"
+action = "dpi"
+[rules.match]
+domain_suffix = [
+  "youtube.com",
+  "youtu.be",
+  "googlevideo.com",
+  "ytimg.com",
+  "ggpht.com",
+  "discord.com",
+  "discordapp.com",
+  "discord.gg",
+  "discord.media",
+]
+
+[[rules]]
+name = "Локальная сеть"
+action = "direct"
+[rules.match]
+ip_cidr = [
+  "10.0.0.0/8",
+  "172.16.0.0/12",
+  "192.168.0.0/16",
+  "127.0.0.0/8",
+  "169.254.0.0/16",
+  "::1/128",
+  "fc00::/7",
+  "fe80::/10",
+]
