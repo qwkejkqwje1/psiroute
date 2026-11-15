@@ -43,7 +43,7 @@ func TestRouterPlanBlockAndAutoRules(t *testing.T) {
 		t.Fatalf("always block rule in psiphon mode = %v (%q)", order, rule)
 	}
 
-	// 3. An "auto" rule in rules mode expands to the auto chain and respects learned routes.
+	// 3. Manual rules expand auto to the configured chain; learned state is smart-only.
 	setCfg(app, func(c *Config) { c.Routing.Mode = "rules" })
 	order, rule = app.router.plan("video.example.com", 443)
 	if strings.Join(order, ",") != "direct,direct-dpi,psiphon" || rule != "авто-правило" {
@@ -51,8 +51,13 @@ func TestRouterPlanBlockAndAutoRules(t *testing.T) {
 	}
 	app.router.remember("video.example.com", obDesync, "тест", true)
 	order, rule = app.router.plan("video.example.com", 443)
-	if strings.Join(order, ",") != "direct-dpi,psiphon" || rule != "авто-правило" {
-		t.Fatalf("auto rule plan with learned = %v (%q)", order, rule)
+	if strings.Join(order, ",") != "direct,direct-dpi,psiphon" || rule != "авто-правило" {
+		t.Fatalf("manual auto rule used learned state = %v (%q)", order, rule)
+	}
+	setCfg(app, func(c *Config) { c.Routing.Mode = "auto" })
+	order, rule = app.router.plan("video.example.com", 443)
+	if strings.Join(order, ",") != "direct-dpi,psiphon" {
+		t.Fatalf("smart auto rule lost learning: %v", order)
 	}
 
 	// 4. UDP for a blocked host returns empty outbound (dropped).
@@ -277,7 +282,6 @@ func TestReloadConfigPreservesTunSettings(t *testing.T) {
 		t.Fatalf("Tun after reloadConfig = %+v", app.cfg.Tun)
 	}
 }
-
 
 func TestRoutingPipelineSevenLevelsAndExplainRoute(t *testing.T) {
 	app := testApp(t)

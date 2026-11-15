@@ -16,6 +16,7 @@ import (
 
 // tracked is one proxied connection, live or recently closed.
 type tracked struct {
+	protocol  string
 	id        int64
 	app       string
 	host      string
@@ -31,6 +32,7 @@ type tracked struct {
 	down      atomic.Int64
 	chanCode  atomic.Int32
 	closersMu sync.Mutex
+	forced    bool
 	closers   []io.Closer
 }
 
@@ -65,6 +67,11 @@ func (t *tracked) addCloser(c io.Closer) {
 		return
 	}
 	t.closersMu.Lock()
+	if t.forced {
+		t.closersMu.Unlock()
+		_ = c.Close()
+		return
+	}
 	t.closers = append(t.closers, c)
 	t.closersMu.Unlock()
 }
@@ -74,6 +81,7 @@ func (t *tracked) forceClose() {
 		return
 	}
 	t.closersMu.Lock()
+	t.forced = true
 	list := append([]io.Closer(nil), t.closers...)
 	t.closers = nil
 	t.closersMu.Unlock()
@@ -280,10 +288,14 @@ func bump(m map[string]*agg, k string, conns int, up, down int64) *agg {
 }
 
 func (s *Stats) open(app, host, sni string, port int, outbound, rule string) *tracked {
+	return s.openProto("tcp", app, host, sni, port, outbound, rule)
+}
+
+func (s *Stats) openProto(proto, app, host, sni string, port int, outbound, rule string) *tracked {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.nextID++
-	t := &tracked{id: s.nextID, app: app, host: host, sni: sni, port: port, outbound: outbound, rule: rule, start: time.Now()}
+	t := &tracked{protocol: proto, id: s.nextID, app: app, host: host, sni: sni, port: port, outbound: outbound, rule: rule, start: time.Now()}
 	t.chanCode.Store(outboundChanCode(outbound))
 	s.live[t.id] = t
 	bump(s.byOb, outbound, 1, 0, 0)

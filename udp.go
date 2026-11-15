@@ -83,9 +83,9 @@ func (a *App) planUDPIP(host, dstIP string, port int, app string) (ob, rule stri
 		if blockQUIC && port == 443 {
 			return "", "блок QUIC (UDP 443)"
 		}
-		return obPsiphon, "весь UDP через Psiphon"
+		return obPsiphon, "глобальный режим UDP: весь трафик через Psiphon (правила UDP не применяются)"
 	case "direct":
-		return obDirect, "весь UDP напрямую"
+		return obDirect, "глобальный режим UDP: весь трафик напрямую (правила UDP не применяются)"
 	}
 	order, rule := a.router.planForProto("udp", host, dstIP, port, app)
 	for _, o := range order {
@@ -423,20 +423,25 @@ func (s *udpSession) send(host string, port int, data []byte) {
 // Only readClient calls it, so flows are never opened twice.
 func (s *udpSession) flow(host string, port int) *udpFlow {
 	key := net.JoinHostPort(host, strconv.Itoa(port))
+	ob, rule := s.a.planUDP(host, port, s.app)
 	s.mu.Lock()
 	if f := s.flows[key]; f != nil {
+		if ob != "" && f.ob == ob {
+			s.mu.Unlock()
+			return f
+		}
+		delete(s.flows, key)
+		s.endFlow(f)
+	}
+	if ob == "" {
 		s.mu.Unlock()
-		return f
+		return nil
 	}
 	if s.closed || time.Since(s.failed[key]) < 10*time.Second {
 		s.mu.Unlock()
 		return nil
 	}
 	s.mu.Unlock()
-	ob, rule := s.a.planUDP(host, port, s.app)
-	if ob == "" {
-		return nil
-	}
 	f := &udpFlow{
 		key:        key,
 		host:       host,
@@ -455,7 +460,7 @@ func (s *udpSession) flow(host string, port int) *udpFlow {
 	default:
 		err = s.openGW(f)
 	}
-	f.t = s.a.stats.open(s.app, host, "", port, ob, rule+" · UDP")
+	f.t = s.a.stats.openProto("udp", s.app, host, "", port, ob, rule+" · UDP")
 	if err != nil {
 		s.a.stats.close(f.t, err)
 		s.mu.Lock()

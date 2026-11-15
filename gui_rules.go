@@ -83,31 +83,6 @@ var ruleQuickListIDs = [12]struct{ id, title string }{
 	{"!ru", "list:!ru (кроме РФ)"},
 }
 
-func ruleEditableTokens(r map[string]any) string {
-	var parts []string
-	addStrs := func(key, prefix string) {
-		if arr, ok := r[key].([]any); ok {
-			for _, it := range arr {
-				if s, ok := it.(string); ok && strings.TrimSpace(s) != "" {
-					if prefix != "" && !strings.HasPrefix(s, prefix) {
-						parts = append(parts, prefix+s)
-					} else {
-						parts = append(parts, s)
-					}
-				}
-			}
-		}
-	}
-	addStrs("lists", "list:")
-	addStrs("domains", "")
-	addStrs("ips", "")
-	addStrs("apps", "")
-	if p, ok := r["ports"].(string); ok && strings.TrimSpace(p) != "" {
-		parts = append(parts, "port:"+strings.TrimSpace(p))
-	}
-	return strings.Join(parts, ", ")
-}
-
 func (ui *gioUI) listUseBtn(id string) *widget.Clickable {
 	ui.mu.Lock()
 	defer ui.mu.Unlock()
@@ -422,6 +397,7 @@ func (ui *gioUI) layoutRulesTab(gtx layout.Context) layout.Dimensions {
 					if eBtn.Clicked(gtx) {
 						ui.editingRuleIdx = idx
 						ui.ruleNameEditor.SetText(nm)
+						ui.editingRuleOriginal = r
 						ui.hostEditor.SetText(ruleEditableTokens(r))
 						if ob != "" {
 							ui.selectedRuleOb = ob

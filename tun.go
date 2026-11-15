@@ -172,7 +172,7 @@ func (t *tunCtl) view() map[string]any {
 		"on": on, "state": state, "error": errS, "text": text,
 		"admin": admin, "need_admin": needAdmin && !admin,
 		"flows": t.flows.Load(), "total": t.total.Load(), "supported": tunSupported,
-		"fakeip_count": theFakeIP.count(),
+		"fakeip_count":  theFakeIP.count(),
 		"effective_mtu": effMTU, "tcp_mss": mss4, "tcp_mss6": mss6, "mss_clamped": clamped,
 	}
 }
@@ -233,6 +233,9 @@ type tunEngine struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	mtu         int
+	mtuMu       sync.Mutex
+	mtuDirty    bool
+	setMTU      func(tunDevice, int, bool) error
 	curMTU      atomic.Int32
 	mss4        atomic.Uint32
 	mss6        atomic.Uint32
@@ -269,17 +272,33 @@ func (e *tunEngine) cascadeState() (cfgMTU int, warpCascade, psiActive bool) {
 // syncDynamicMTU recalculates the effective MTU and TCP MSS ceiling for the
 // active cascade (TUN -> WARP -> Psiphon) and updates the Wintun adapter if needed.
 func (e *tunEngine) syncDynamicMTU() {
+	e.mtuMu.Lock()
+	defer e.mtuMu.Unlock()
 	cfgMTU, warpCascade, psiActive := e.cascadeState()
 	effMTU := effectiveTunMTU(cfgMTU, warpCascade, psiActive)
 	m4 := effectiveTunMSS(cfgMTU, false, warpCascade, psiActive)
 	m6 := effectiveTunMSS(cfgMTU, true, warpCascade, psiActive)
+	prevMTU := int(e.curMTU.Load())
+	if prevMTU != 0 && (prevMTU != effMTU || e.mtuDirty) && e.dev != nil {
+		setter := e.setMTU
+		if setter == nil {
+			setter = setTunAdapterMTU
+		}
+		if err := setter(e.dev, effMTU, e.v6); err != nil {
+			e.mtuDirty = true
+			logf("warn", "TUN: не удалось изменить MTU %d → %d: %v", prevMTU, effMTU, err)
+			return
+		}
+	}
+	e.mtuDirty = false
+	if e.ep != nil {
+		e.ep.SetMTU(uint32(effMTU))
+	}
 	e.mss4.Store(uint32(m4))
 	e.mss6.Store(uint32(m6))
-	prevMTU := int(e.curMTU.Swap(int32(effMTU)))
-	if prevMTU != 0 && prevMTU != effMTU && e.dev != nil {
-		_ = setTunAdapterMTU(e.dev, effMTU, e.v6)
-		logf("info", "TUN: динамическая коррекция каскада: MTU %d → %d, TCP MSS=%d (WARP=%v, Psiphon=%v)",
-			prevMTU, effMTU, m4, warpCascade, psiActive)
+	e.curMTU.Store(int32(effMTU))
+	if prevMTU != 0 && prevMTU != effMTU {
+		logf("info", "TUN: динамическая коррекция каскада: MTU %d → %d, TCP MSS=%d (WARP=%v, Psiphon=%v)", prevMTU, effMTU, m4, warpCascade, psiActive)
 	}
 }
 
@@ -307,7 +326,6 @@ func newTunEngine(a *App, ctl *tunCtl) (*tunEngine, error) {
 	}
 	e := &tunEngine{a: a, ctl: ctl, dev: dev, mtu: mtu, v6: v6}
 	e.curMTU.Store(int32(effMTU))
-	e.syncDynamicMTU()
 	e.ctx, e.cancel = context.WithCancel(a.ctx)
 	if err := e.initStack(effMTU); err != nil {
 		e.cancel()
@@ -315,6 +333,7 @@ func newTunEngine(a *App, ctl *tunCtl) (*tunEngine, error) {
 		tunActive.Store(false)
 		return nil, err
 	}
+	e.syncDynamicMTU()
 	goSafe("TUN: приём", e.readLoop)
 	goSafe("TUN: отправка", e.writeLoop)
 	goSafe("TUN: адаптер", func() {
@@ -749,7 +768,7 @@ func (e *tunEngine) serveUDP(c net.Conn, dst netip.Addr, dport int, sport uint16
 	if ob == "" {
 		return // UDP is off or blocked
 	}
-	t := e.a.stats.open(app, host, "", dport, ob, rule+" · TUN UDP")
+	t := e.a.stats.openProto("udp", app, host, "", dport, ob, rule+" · TUN UDP")
 	switch ob {
 	case obDirect, obDesync:
 		if tunPhysIdx(realDst) == 0 {
@@ -780,6 +799,8 @@ func (e *tunEngine) serveUDP(c net.Conn, dst netip.Addr, dport int, sport uint16
 // When quicDesync is true, the first QUIC Initial packet on UDP:443 is preceded
 // by low-TTL/invalid-version UDP fake packets (Priority 5).
 func (e *tunEngine) udpRelay(c, up net.Conn, t *tracked, quicDesync bool) {
+	t.addCloser(c)
+	t.addCloser(up)
 	var last atomic.Int64
 	last.Store(time.Now().UnixNano())
 	alive := func() bool {
@@ -853,6 +874,7 @@ func (e *tunEngine) udpRelay(c, up net.Conn, t *tracked, quicDesync bool) {
 
 // udpGW sends one UDP flow through Psiphon's udpgw (one TCP stream per flow).
 func (e *tunEngine) udpGW(c net.Conn, dst netip.Addr, port int, t *tracked) {
+	t.addCloser(c)
 	ctx, cancel := context.WithTimeout(e.ctx, 20*time.Second)
 	gw, err := e.a.psi.Dial(ctx, "tcp", udpgwServer)
 	cancel()
@@ -860,6 +882,7 @@ func (e *tunEngine) udpGW(c net.Conn, dst netip.Addr, port int, t *tracked) {
 		e.a.stats.close(t, err)
 		return
 	}
+	t.addCloser(gw)
 	const conid = 1
 	ip := net.IP(dst.AsSlice())
 	var wmu sync.Mutex

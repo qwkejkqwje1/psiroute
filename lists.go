@@ -184,29 +184,6 @@ var listPresets = map[string]string{
 
 // Built-in instant seed lists so rules using popular presets and v2fly
 // "include:" directives work immediately at startup.
-var builtinListSeeds = map[string]string{
-	"youtube":           "youtube.com\nyoutu.be\ngooglevideo.com\nytimg.com\nggpht.com\nyoutubei.googleapis.com\nyoutube-nocookie.com\nyoutubekids.com\nyoutube.googleapis.com\nwide-youtube.l.google.com\n",
-	"discord":           "discord.com\ndiscord.gg\ndiscordapp.com\ndiscordapp.net\ndiscord.media\ndiscord.co\ndiscord.design\ndiscord.new\ndiscord.gift\ndiscord.gifts\ndiscordstatus.com\ndis.gd\n",
-	"telegram-ip":       "telegram.org\nt.me\ntelegram.me\ntdesktop.com\ntelesco.pe\ncdn-telegram.org\ncomments.app\nfragment.com\n91.108.4.0/22\n91.108.8.0/22\n91.108.12.0/22\n91.108.16.0/22\n91.108.20.0/22\n91.108.56.0/22\n91.105.192.0/23\n149.154.160.0/20\n185.76.151.0/24\n2001:67c:4e8::/48\n2001:b28:f23d::/48\n2001:b28:f23f::/48\n",
-	"meta-instagram":    "instagram.com\ncdninstagram.com\nfbcdn.net\nfacebook.com\nfb.com\nfb.me\nmessenger.com\nthreads.net\nwhatsapp.com\nwhatsapp.net\nig.me\n",
-	"twitter-x":         "x.com\ntwitter.com\nt.co\ntwimg.com\nads-twitter.com\nperiscope.tv\npscp.tv\ntwitter.jp\n",
-	"ai-services":       "openai.com\nchatgpt.com\noaiusercontent.com\noaistatic.com\nanthropic.com\nclaude.ai\nclaudeusercontent.com\ngemini.google.com\naistudio.google.com\nbard.google.com\nperplexity.ai\ncopilot.microsoft.com\nmidjourney.com\ncursor.sh\ncursor.com\nhuggingface.co\npoe.com\ngrok.com\nx.ai\n",
-	"gaming-steam-epic": "steampowered.com\nsteamcommunity.com\nsteamstatic.com\nsteamusercontent.com\nsteamcontent.com\nsteamgames.com\nvalve.net\nepicgames.com\nunrealengine.com\nbattle.net\nblizzard.com\nriotgames.com\nleagueoflegends.com\nvalorant.com\n",
-	"ru-gov-banks":      "gosuslugi.ru\nnalog.ru\nmos.ru\nsberbank.ru\nsber.ru\ntbank.ru\ntinkoff.ru\nvtb.ru\nalfabank.ru\ngazprombank.ru\nraiffeisen.ru\nyandex.ru\nyandex.net\nyastatic.net\nya.ru\nvk.com\nvk.me\nuserapi.com\nvkuser.net\nozon.ru\nwildberries.ru\nwb.ru\navito.ru\nrutube.ru\ndzen.ru\nmail.ru\npochta.ru\nrzd.ru\n",
-	"ads-trackers":      "doubleclick.net\ngooglesyndication.com\ngoogleadservices.com\nadservice.google.com\npagead2.googlesyndication.com\nadnxs.com\ncriteo.com\ntaboola.com\noutbrain.com\nscorecardresearch.com\napp-measurement.com\n",
-	"google":            "google.com\ngoogleapis.com\ngstatic.com\ngoogleusercontent.com\ngvt1.com\n1e100.net\n",
-	"twitch":            "twitch.tv\nttvnw.net\njtvnw.net\ntwitchcdn.net\n",
-	"spotify":           "spotify.com\nscdn.co\nspotifycdn.com\naudio-ak-spotify-com.akamaized.net\n",
-	"github":            "github.com\ngithubusercontent.com\ngithubassets.com\nghcr.io\ngithub.io\n",
-	"ru-blocked":        "ntc.party\nrutracker.org\nlostfilm.tv\nmeduza.io\nbbc.com\ndw.com\n",
-	// Common v2fly include targets
-	"yandex":      "yandex.ru\nyandex.net\nyastatic.net\nya.ru\nyandex.com\n",
-	"vk":          "vk.com\nvk.me\nuserapi.com\nvkuser.net\nvk-cdn.net\n",
-	"mailru":      "mail.ru\nimgsmail.ru\nmradx.net\n",
-	"google-ads":  "doubleclick.net\ngooglesyndication.com\ngoogleadservices.com\nadservice.google.com\n",
-	"category-ru": "include:yandex\ninclude:vk\ninclude:mailru\ngosuslugi.ru\nsberbank.ru\ntbank.ru\nvtb.ru\nozon.ru\nwildberries.ru\n",
-	"category-ads": "include:google-ads\nadnxs.com\ncriteo.com\ntaboola.com\noutbrain.com\n",
-}
 
 // Remote lists may be fetched from these built-in hosts and any host added by
 // the user to lists.trusted_hosts.
@@ -499,11 +476,11 @@ type listData struct {
 	domains       flatDomainIndex // pointer-free sorted suffix domains (O(log N) binary search, 0 GC pointers)
 	exact         flatDomainIndex // pointer-free sorted exact domains ("DOMAIN,..." or "full:...")
 	keywords      []string        // substring match ("DOMAIN-KEYWORD,..." or "keyword:...")
-	v4Ranges      []ipv4Range // sorted, merged IPv4 intervals for O(log N) lookup
-	v6Ranges      []ipv6Range // sorted, merged IPv6 intervals for O(log N) lookup
-	includes      []string    // v2fly "include:..." directives encountered
-	skippedLines  int         // malformed or unrecognized non-empty lines skipped
-	regexpSkipped int         // "regexp:..." rules skipped with warning
+	v4Ranges      []ipv4Range     // sorted, merged IPv4 intervals for O(log N) lookup
+	v6Ranges      []ipv6Range     // sorted, merged IPv6 intervals for O(log N) lookup
+	includes      []string        // v2fly "include:..." directives encountered
+	skippedLines  int             // malformed or unrecognized non-empty lines skipped
+	regexpSkipped int             // "regexp:..." rules skipped with warning
 	etag          string
 	lastModified  string
 	updated       time.Time
@@ -565,7 +542,8 @@ func newLists(app *App, dir string) *Lists {
 	if app != nil && app.cfg != nil {
 		syncListRegistryFromConfig(app.cfg)
 	}
-	for id, raw := range builtinListSeeds {
+	for _, id := range builtinSeedNames() {
+		raw, _ := builtinSeed(id)
 		if u, err := resolveListURL(id); err == nil {
 			sd := parseListWithIncludes(strings.NewReader(raw), l.resolveIncludeReader, 0)
 			sd.builtin = true
@@ -583,7 +561,7 @@ func (l *Lists) resolveRemoteIncludeReader(name string) io.ReadCloser {
 	if cleanName == "" {
 		return nil
 	}
-	if raw, ok := builtinListSeeds[cleanName]; ok {
+	if raw, ok := builtinSeed(cleanName); ok {
 		return io.NopCloser(strings.NewReader(raw))
 	}
 	return nil
@@ -596,7 +574,7 @@ func (l *Lists) resolveIncludeReader(name string) io.ReadCloser {
 	if cleanName == "" {
 		return nil
 	}
-	if raw, ok := builtinListSeeds[cleanName]; ok {
+	if raw, ok := builtinSeed(cleanName); ok {
 		return io.NopCloser(strings.NewReader(raw))
 	}
 	// Запрещаем любые разделители путей, "..", двоеточия и скрытые имена
@@ -1602,12 +1580,12 @@ func (l *Lists) GetListContent(id string) (string, error) {
 	if b, rerr := os.ReadFile(f); rerr == nil {
 		return string(b), nil
 	}
-	if raw, ok := builtinListSeeds[clean]; ok {
+	if raw, ok := builtinSeed(clean); ok {
 		return raw, nil
 	}
 	for k, presetURL := range listPresets {
 		if presetURL == u {
-			if raw, ok := builtinListSeeds[k]; ok {
+			if raw, ok := builtinSeed(k); ok {
 				return raw, nil
 			}
 		}
@@ -2051,7 +2029,7 @@ func matchIPv6Ranges(ranges []ipv6Range, ip [16]byte) bool {
 func parseList(r io.Reader) *listData {
 	return parseListWithIncludes(r, func(name string) io.ReadCloser {
 		name = strings.ToLower(strings.TrimSpace(name))
-		if raw, ok := builtinListSeeds[name]; ok {
+		if raw, ok := builtinSeed(name); ok {
 			return io.NopCloser(strings.NewReader(raw))
 		}
 		return nil
@@ -2376,8 +2354,8 @@ func (d *listData) finalize(domSet, exactSet map[string]struct{}, v4Raw []ipv4Ra
 		d.exact = buildFlatDomainIndex(sortedExact)
 	}
 
-// MatchRUWhitelist checks whether host belongs to Russian national TLDs (.ru, .рф, .su, .xn--p1ai)
-// or the built-in ru-gov-banks / ru lists (Priority 4 in the Top-to-Bottom routing pipeline).
+	// MatchRUWhitelist checks whether host belongs to Russian national TLDs (.ru, .рф, .su, .xn--p1ai)
+	// or the built-in ru-gov-banks / ru lists (Priority 4 in the Top-to-Bottom routing pipeline).
 }
 
 func (l *Lists) MatchRUWhitelist(host string) bool {

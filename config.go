@@ -40,8 +40,8 @@ func normalizeFavoriteCountries(in []string) []string {
 type CustomList struct {
 	ID            string `json:"id"`
 	Title         string `json:"title"`
-	Type          string `json:"type"`                     // "url" | "local"
-	URL           string `json:"url"`                      // https://... or local:<file>.lst
+	Type          string `json:"type"` // "url" | "local"
+	URL           string `json:"url"`  // https://... or local:<file>.lst
 	Category      string `json:"category,omitempty"`
 	About         string `json:"about,omitempty"`
 	Enabled       bool   `json:"enabled"`
@@ -245,18 +245,32 @@ func loadConfig(path string) *Config {
 		_ = json.Unmarshal(b, &rawMeta)
 		if uerr := json.Unmarshal(b, c); uerr != nil {
 			backupPath := fmt.Sprintf("%s.corrupt.%s", path, time.Now().Format("20060102-150405"))
-			_ = os.WriteFile(backupPath, b, 0o600)
+			backupErr := writeFileAtomic(backupPath, b, 0o600)
 			c = defaultConfig()
 			c.path = path
 			c.corruptErr = fmt.Sprintf("Ошибка синтаксиса %s: %v (сохранена резервная копия %s)", filepath.Base(path), uerr, filepath.Base(backupPath))
-			c.corruptBackup = backupPath
+			if backupErr != nil {
+				c.corruptErr = fmt.Sprintf("Ошибка синтаксиса %s: %v; резервная копия не сохранена: %v", filepath.Base(path), uerr, backupErr)
+			} else {
+				c.corruptBackup = backupPath
+			}
 			logf("error", "%s", c.corruptErr)
 		} else if rawMeta.SchemaVersion < currentConfigSchemaVersion {
 			bakPath := path + ".bak"
-			_ = os.WriteFile(bakPath, b, 0o600)
+			if err := writeFileAtomic(bakPath, b, 0o600); err != nil {
+				c.postLoadDefaults()
+				c.corruptErr = fmt.Sprintf("Миграция конфигурации не сохранена: резервная копия не создана: %v", err)
+				logf("error", "%s", c.corruptErr)
+				return c
+			}
+			c.corruptBackup = bakPath
 			c.SchemaVersion = currentConfigSchemaVersion
 			c.postLoadDefaults()
-			_ = c.save()
+			if err := c.save(); err != nil {
+				c.corruptErr = fmt.Sprintf("Миграция конфигурации не сохранена: %v (резервная копия: %s)", err, filepath.Base(bakPath))
+				logf("error", "%s", c.corruptErr)
+				return c
+			}
 			logf("info", "Конфигурация мигрирована до схемы v%d (резервная копия: %s)", currentConfigSchemaVersion, filepath.Base(bakPath))
 			return c
 		}
@@ -512,15 +526,18 @@ func writeFileAtomic(path string, b []byte, perm os.FileMode) error {
 
 func (c *Config) save() error {
 	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.saveLocked()
+}
+
+func (c *Config) saveLocked() error {
 	c.corruptErr = ""
 	syncListRegistryLocked(c)
 	p := c.path
 	if p == "" {
-		c.mu.Unlock()
 		return nil
 	}
 	b, err := json.MarshalIndent(c, "", "  ")
-	c.mu.Unlock()
 	if err != nil {
 		return err
 	}

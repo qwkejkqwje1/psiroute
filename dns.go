@@ -28,8 +28,9 @@ import (
 
 const dnsTypeTXT uint16 = 16
 
-// Default Ed25519 public key (hex) for verifying signed mirror / DNS TXT payloads.
-const defaultBootstrapEd25519PubHex = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+// No production signing key has been provisioned. Keep verification fail-closed;
+// never use a public test-vector key as a trust anchor.
+const defaultBootstrapEd25519PubHex = ""
 
 type dnsEntry struct {
 	ips []string
@@ -341,18 +342,17 @@ func assembleChunkedTXTRecords(txts []string) string {
 		if strings.Contains(raw, "seq=") && strings.Contains(raw, "data=") {
 			seq := -1
 			var d string
-			for _, part := range strings.Split(raw, ";") {
+			// The chunk data may itself contain semicolons (the signed envelope).
+			metadata, data, hasData := strings.Cut(raw, ";data=")
+			if hasData {
+				d = strings.TrimSpace(data)
+			}
+			for _, part := range strings.Split(metadata, ";") {
 				k, v, ok := strings.Cut(strings.TrimSpace(part), "=")
-				if !ok {
-					continue
-				}
-				switch strings.ToLower(strings.TrimSpace(k)) {
-				case "seq":
+				if ok && strings.EqualFold(strings.TrimSpace(k), "seq") {
 					if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
 						seq = n
 					}
-				case "data":
-					d = strings.TrimSpace(v)
 				}
 			}
 			if seq >= 0 && d != "" {

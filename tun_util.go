@@ -202,12 +202,24 @@ func clampTCPMSS(pkt []byte, maxMSS4, maxMSS6 uint16) bool {
 		if binary.BigEndian.Uint16(pkt[6:8])&0x1fff != 0 {
 			return false
 		}
+		totalLen := int(binary.BigEndian.Uint16(pkt[2:4]))
+		if totalLen < ihl+20 || totalLen > len(pkt) {
+			return false
+		}
+		pkt = pkt[:totalLen]
 		tcpOff = ihl
 		maxMSS = maxMSS4
 	case 6:
 		if maxMSS6 == 0 || len(pkt) < 60 {
 			return false
 		}
+		// Jumbograms require parsing a Jumbo Payload option and are not
+		// supported here. Never interpret trailing buffer bytes as TCP data.
+		payloadLen := int(binary.BigEndian.Uint16(pkt[4:6]))
+		if payloadLen < 20 || 40+payloadLen > len(pkt) {
+			return false
+		}
+		pkt = pkt[:40+payloadLen]
 		nxt := pkt[6]
 		off := 40
 		// Skip common IPv6 extension headers (Hop-by-Hop=0, Routing=43, DestOpts=60)

@@ -205,7 +205,7 @@ func (ui *gioUI) layoutTrafficDiagTab(gtx layout.Context) layout.Dimensions {
 							return ui.subCard(gtx, ui.pal.card2, ui.pal.border, space1, func(gtx layout.Context) layout.Dimensions {
 								return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle, Spacing: layout.SpaceBetween}.Layout(gtx,
 									layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-										return ui.labelLine(gtx, fontBody, ui.pal.text, font.SemiBold, fmt.Sprintf("%s  →  %s", orDefault(appNm, "Система"), ui.maskSensitive(h)))
+										return ui.labelLine(gtx, fontBody, ui.pal.text, font.SemiBold, fmt.Sprintf("%s  →  %s", orDefault(appNm, "Система"), h))
 									}),
 									layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 										return ui.routeBadge(gtx, ob)

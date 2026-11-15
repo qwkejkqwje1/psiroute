@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon"
 	"io"
 	"net"
 	"os"
@@ -325,8 +326,12 @@ func (c *Countries) get(cc string) (*countryWorker, error) {
 // Dial goes out through the main Psiphon tunnel when it already matches cc (or
 // in single-process hot-switch mode), otherwise through the slim worker for cc.
 func (c *Countries) Dial(ctx context.Context, cc, addr string) (net.Conn, error) {
+	cc = strings.ToUpper(strings.TrimSpace(cc))
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if c.canReuseMain(cc) {
-		return c.app.psi.DialBalanced(ctx, "tcp", addr)
+		return c.waitConfirmedCountry(ctx, cc, addr)
 	}
 	w, err := c.get(cc)
 	if err != nil {
@@ -457,7 +462,9 @@ func runPsiWorker(cfgPath, dir, region string) {
 		if err != nil {
 			break
 		}
-		go serveWorkerSocks(ctx, c, slimApp.psi.Dial)
+		go serveWorkerSocks(ctx, c, func(dctx context.Context, network, addr string) (net.Conn, error) {
+			return (&Countries{app: slimApp}).waitConfirmedCountry(dctx, region, addr)
+		})
 	}
 	slimApp.psi.Stop()
 }
@@ -553,4 +560,67 @@ func serveWorkerSocks(ctx context.Context, c net.Conn, dial dialFunc) {
 	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
 	_ = up.SetDeadline(time.Now().Add(5 * time.Second))
 	<-errc
+}
+
+// dialConfirmedMainCountry captures the primary controller with its observed
+// egress. Balanced/standby fallback is forbidden for an exact country rule.
+func (c *Countries) dialConfirmedMainCountry(ctx context.Context, cc, addr string) (net.Conn, bool, error) {
+	p := c.app.psi
+	p.mu.Lock()
+	controller := p.cur.Load()
+	ready := p.state == "connected" && strings.EqualFold(p.confirmedEgress, cc) && p.confirmedController == controller
+	hook := p.primaryDialHook
+	p.mu.Unlock()
+	if !ready || (controller == nil && hook == nil) {
+		return nil, false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, true, err
+	}
+	if hook != nil {
+		conn, err := hook(ctx, "tcp", addr)
+		return conn, true, err
+	}
+	conn, err := dialCountryController(ctx, controller, addr)
+	return conn, true, err
+}
+
+func dialCountryController(ctx context.Context, controller *psiphon.Controller, addr string) (net.Conn, error) {
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	results := make(chan result, 1)
+	go func() { conn, err := controller.Dial(addr, nil); results <- result{conn, err} }()
+	select {
+	case r := <-results:
+		return r.conn, r.err
+	case <-ctx.Done():
+		go func() {
+			r := <-results
+			if r.conn != nil {
+				r.conn.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	}
+}
+
+func (c *Countries) waitConfirmedCountry(ctx context.Context, cc, addr string) (net.Conn, error) {
+	deadline := time.NewTimer(25 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if conn, ready, err := c.dialConfirmedMainCountry(ctx, cc, addr); ready {
+			return conn, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-deadline.C:
+			return nil, fmt.Errorf("Psiphon %s: выход ещё не подтверждён", cc)
+		case <-ticker.C:
+		}
+	}
 }

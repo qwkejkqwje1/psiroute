@@ -393,3 +393,21 @@ func TestWarpSettingsKeys(t *testing.T) {
 		t.Errorf("values: %v %v %v", v["warp.mask"], v["warp.endpoint"], v["warp.engine"])
 	}
 }
+
+func TestWarpScanRejectsCancelledResults(t *testing.T) {
+	var scanner warpCleanScanner
+	ctx, cancel := context.WithCancel(context.Background())
+	got := scanner.scanWithProbe(ctx, []string{"a", "b"}, 1, time.Second, func(context.Context, string, time.Duration) (time.Duration, error) {
+		cancel()
+		return time.Millisecond, nil
+	})
+	if len(got) != 0 || len(scanner.cachedEndpoints()) != 0 {
+		t.Fatal("cancelled scan published results")
+	}
+}
+func TestWarpScanRequiresAuthenticatedProbe(t *testing.T) {
+	var scanner warpCleanScanner
+	if got := scanner.Scan(context.Background(), []string{"127.0.0.1:1"}, 1, time.Millisecond); len(got) != 0 {
+		t.Fatal("scan without identity/probe accepted endpoint")
+	}
+}

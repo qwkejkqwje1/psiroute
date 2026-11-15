@@ -1,18 +1,21 @@
 package main
 
 import (
-	"encoding/json"
+	"bufio"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"io"
-	"os"
-	"path/filepath"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -388,7 +391,6 @@ func TestProcessesAPIAndRuleToggle(t *testing.T) {
 	}
 }
 
-
 func TestBrowserCanaryDoHAndIPv6BlockAAAA(t *testing.T) {
 	app := testApp(t)
 	// 1. Canary domains (Firefox use-application-dns.net, Chrome/Edge DDR _dns.resolver.arpa) must return NXDOMAIN (rcode 3)
@@ -436,8 +438,8 @@ func TestCaptivePortalWhitelistAnd16KBBlackholeAndBitTorrent(t *testing.T) {
 	}
 
 	// 2. 16-32 KB TSPU Blackhole detector
-	if !is16KBBlackholeBlock(18*1024, 512, 4*time.Second, nil, false) {
-		t.Fatal("expected 18 KB server drop to be detected as 16KB TSPU blackhole")
+	if is16KBBlackholeBlock(18*1024, 512, 4*time.Second, nil, false) {
+		t.Fatal("normal server EOF is not evidence of a failed transfer")
 	}
 	if is16KBBlackholeBlock(128*1024, 512, 4*time.Second, nil, false) {
 		t.Fatal("128 KB transfer must not be flagged as 16KB blackhole")
@@ -512,5 +514,42 @@ func TestConfigSchemaMigrationAndPauseTimerAndUpdater(t *testing.T) {
 	manifest.Ed25519Sig = hex.EncodeToString(ed25519.Sign(priv, manifest.CanonicalPayload()))
 	if err := manifest.VerifyManifestSignature(pubHex); err != nil {
 		t.Fatalf("VerifyManifestSignature valid failed: %v", err)
+	}
+}
+
+func TestP2PDoesNotEscapePsiphon(t *testing.T) {
+	a := testApp(t)
+	for _, outbound := range []string{obPsiphon, "psiphon:US"} {
+		for _, kill := range []bool{false, true} {
+			setCfg(a, func(c *Config) { c.Routing.KillSwitch = kill })
+			client, server := net.Pipe()
+			upstream, remote := net.Pipe()
+			tracked := a.stats.open("test", "127.0.0.1", "", 1, outbound, "explicit")
+			go func() { _, _ = client.Write(append([]byte{19}, []byte("BitTorrent protocol00000000")...)) }()
+			done := make(chan error, 1)
+			go func() { err, _ := a.relay(server, bufio.NewReader(server), upstream, tracked); done <- err }()
+			select {
+			case err := <-done:
+				if !errors.Is(err, errBlocked) {
+					t.Fatalf("expected block, got %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("P2P block stalled")
+			}
+			client.Close()
+			server.Close()
+			upstream.Close()
+			remote.Close()
+		}
+	}
+}
+func TestTransferInterruptionRequiresNetworkFailure(t *testing.T) {
+	for _, clientFirst := range []bool{false, true} {
+		for _, err := range []error{nil, io.EOF, syscall.ECONNRESET} {
+			got := is16KBBlackholeBlock(18*1024, 512, time.Second, err, clientFirst)
+			if got != (!clientFirst && err == syscall.ECONNRESET) {
+				t.Fatalf("clientFirst=%v err=%v got=%v", clientFirst, err, got)
+			}
+		}
 	}
 }

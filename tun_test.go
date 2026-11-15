@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
+	"fmt"
+	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"net"
 	"net/netip"
 	"testing"
@@ -119,17 +123,17 @@ func TestTunDynamicMTUAndTCPMSSClamping(t *testing.T) {
 
 	// 2. Build a synthetic IPv4 TCP SYN packet with MSS=1460 (20B IPv4 + 28B TCP)
 	pkt4 := make([]byte, 48)
-	pkt4[0] = 0x45                                  // IPv4, IHL=5 (20 bytes)
-	binary.BigEndian.PutUint16(pkt4[2:4], 48)       // Total Length
-	pkt4[8] = 64                                    // TTL
-	pkt4[9] = 6                                     // Protocol = TCP
-	copy(pkt4[12:16], []byte{172, 19, 0, 1})        // Src IP
-	copy(pkt4[16:20], []byte{93, 184, 216, 34})     // Dst IP
-	binary.BigEndian.PutUint16(pkt4[20:22], 51234)  // Src Port
-	binary.BigEndian.PutUint16(pkt4[22:24], 443)    // Dst Port
-	pkt4[32] = 0x70                                 // Data offset = 7 (28 bytes)
-	pkt4[33] = 0x02                                 // Flags = SYN
-	binary.BigEndian.PutUint16(pkt4[34:36], 64240)  // Window
+	pkt4[0] = 0x45                                 // IPv4, IHL=5 (20 bytes)
+	binary.BigEndian.PutUint16(pkt4[2:4], 48)      // Total Length
+	pkt4[8] = 64                                   // TTL
+	pkt4[9] = 6                                    // Protocol = TCP
+	copy(pkt4[12:16], []byte{172, 19, 0, 1})       // Src IP
+	copy(pkt4[16:20], []byte{93, 184, 216, 34})    // Dst IP
+	binary.BigEndian.PutUint16(pkt4[20:22], 51234) // Src Port
+	binary.BigEndian.PutUint16(pkt4[22:24], 443)   // Dst Port
+	pkt4[32] = 0x70                                // Data offset = 7 (28 bytes)
+	pkt4[33] = 0x02                                // Flags = SYN
+	binary.BigEndian.PutUint16(pkt4[34:36], 64240) // Window
 	// TCP Options: NOP(1), NOP(1), MSS(kind=2, len=4, val=1460), NOP(1), EOL(0)
 	copy(pkt4[40:48], []byte{1, 1, 2, 4, 0x05, 0xb4, 1, 0})
 	binary.BigEndian.PutUint16(pkt4[36:38], computeIPv4TCPChecksum(pkt4))
@@ -166,5 +170,94 @@ func TestTunDynamicMTUAndTCPMSSClamping(t *testing.T) {
 	}
 	if got6 := binary.BigEndian.Uint16(pkt6[62:64]); got6 != 1160 {
 		t.Fatalf("clamped IPv6 MSS = %d, want 1160", got6)
+	}
+}
+
+// IP lengths must bound option parsing even when the backing buffer is larger.
+func TestTunMSSPacketLengths(t *testing.T) {
+	for _, ipv6 := range []bool{false, true} {
+		for _, delta := range []int{-25, -4, 0, 1} {
+			name := fmt.Sprintf("ipv6=%v/delta=%d", ipv6, delta)
+			t.Run(name, func(t *testing.T) {
+				off := 20
+				if ipv6 {
+					off = 40
+				}
+				pkt := make([]byte, off+24)
+				if ipv6 {
+					pkt[0], pkt[6] = 0x60, 6
+					binary.BigEndian.PutUint16(pkt[4:6], uint16(24+delta))
+				} else {
+					pkt[0], pkt[9] = 0x45, 6
+					binary.BigEndian.PutUint16(pkt[2:4], uint16(len(pkt)+delta))
+				}
+				pkt[off+12], pkt[off+13] = 0x60, 2
+				copy(pkt[off+20:], []byte{2, 4, 5, 180})
+				before := bytes.Clone(pkt)
+				changed := clampTCPMSS(pkt, 1180, 1160)
+				if changed != (delta == 0) {
+					t.Fatalf("changed=%v", changed)
+				}
+				if !changed && !bytes.Equal(before, pkt) {
+					t.Fatal("invalid packet modified")
+				}
+			})
+		}
+	}
+}
+
+type mtuTestDevice struct{ tunDevice }
+
+func TestTunMTURetryAndEndpoint(t *testing.T) {
+	e := &tunEngine{mtu: 1280, dev: &mtuTestDevice{}, ep: channel.New(1, 1500, "")}
+	e.curMTU.Store(1500)
+	e.mss4.Store(1460)
+	calls := 0
+	e.setMTU = func(tunDevice, int, bool) error {
+		calls++
+		if calls == 1 {
+			return errors.New("adapter failure")
+		}
+		return nil
+	}
+	e.syncDynamicMTU()
+	if e.curMTU.Load() != 1500 || e.mss4.Load() != 1460 || e.ep.MTU() != 1500 {
+		t.Fatal("published failed MTU update")
+	}
+	e.syncDynamicMTU()
+	if calls != 2 || e.curMTU.Load() != 1280 || e.ep.MTU() != 1280 || e.mss4.Load() != 1240 {
+		t.Fatal("retry did not synchronize MTU/MSS")
+	}
+	e.syncDynamicMTU()
+	if calls != 2 {
+		t.Fatal("unchanged MTU reapplied")
+	}
+}
+func TestTunMTUInitialization(t *testing.T) {
+	e := &tunEngine{mtu: 1500}
+	e.syncDynamicMTU()
+	if e.curMTU.Load() != 1500 || e.mss4.Load() != 1460 {
+		t.Fatal("initial MTU/MSS missing")
+	}
+}
+
+func TestTunMTUPartialFailureRestoresPreviousTarget(t *testing.T) {
+	e := &tunEngine{mtu: 1280, dev: &mtuTestDevice{}, ep: channel.New(1, 1500, "")}
+	e.curMTU.Store(1500)
+	applied := 1500
+	calls := 0
+	e.setMTU = func(_ tunDevice, mtu int, _ bool) error {
+		calls++
+		applied = mtu // IPv4 applied before IPv6 fails.
+		if calls == 1 {
+			return errors.New("IPv6 failure")
+		}
+		return nil
+	}
+	e.syncDynamicMTU()
+	e.mtu = 1500 // Configuration returns to last published value before retry.
+	e.syncDynamicMTU()
+	if calls != 2 || applied != 1500 || e.mtuDirty {
+		t.Fatal("partially changed adapter was not restored")
 	}
 }

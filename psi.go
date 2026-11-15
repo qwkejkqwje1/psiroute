@@ -206,14 +206,16 @@ type Psi struct {
 	poolRR        atomic.Uint64
 	balancedDials atomic.Int64
 
-	cur       atomic.Pointer[psiphon.Controller]
-	standby   atomic.Pointer[psiphon.Controller]
-	dialFails atomic.Int32
-	lastCheck atomic.Int64
-	notes     chan psiNotice
-	cmd       chan string
-	cancel    context.CancelFunc
-	done      chan struct{}
+	confirmedController *psiphon.Controller
+	confirmedEgress     string
+	cur                 atomic.Pointer[psiphon.Controller]
+	standby             atomic.Pointer[psiphon.Controller]
+	dialFails           atomic.Int32
+	lastCheck           atomic.Int64
+	notes               chan psiNotice
+	cmd                 chan string
+	cancel              context.CancelFunc
+	done                chan struct{}
 }
 
 func newPsi(app *App, dataDir string) *Psi {
@@ -903,7 +905,7 @@ func (p *Psi) attemptOnce(ctx context.Context, s strategyDef, timeout int) (conn
 					}
 					logf("info", "Psiphon подключён: «%s» (%d мс, сеть %s)", s.Title, connMs, netKey)
 					upAt, holdC = time.Now(), time.After(holdOK)
-					go p.onConnected(actx, s)
+					go p.onConnected(actx, s, ctl)
 				} else if count == 0 && p.cur.Load() != nil {
 					p.cur.Store(nil)
 					p.set(func() { p.state = "reconnecting"; p.since = time.Time{} })
@@ -1039,16 +1041,20 @@ func (p *Psi) effectiveStrategyID(s strategyDef) string {
 
 // onConnected checks where we came out, measures latency and, if a minimum
 // speed is set, measures the speed and reconnects slow nodes without wiping NetworkID.
-func (p *Psi) onConnected(ctx context.Context, s strategyDef) {
+func (p *Psi) onConnected(ctx context.Context, s strategyDef, controller *psiphon.Controller) {
 	p.dpiAuto.good()
 	p.persistConnectedNodeHint()
 	tctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	tr, err := getTrace(tctx, p.Dial)
+	tr, err := getTrace(tctx, func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return dialCountryController(ctx, controller, addr)
+	})
 	cancel()
 	if err == nil {
 		p.set(func() {
-			if tr.Loc != "" {
+			if tr.Loc != "" && p.cur.Load() == controller {
 				p.egress = tr.Loc
+				p.confirmedEgress = tr.Loc
+				p.confirmedController = controller
 			}
 		})
 		logf("info", "Psiphon: выход %s (%s, %s)", tr.IP, tr.Loc, tr.Colo)
@@ -1356,12 +1362,11 @@ func (p *Psi) bootstrapEmergencyServerEntries(ctx context.Context, pubKeyHex str
 		if raw == "" {
 			return 0
 		}
-		if verified, ok := verifySignedBootstrapPayload(raw, pubKeyHex); ok {
-			raw = verified
-		} else if strings.Contains(raw, "sig=") && strings.Contains(raw, "data=") && pubKeyHex != "" {
-			// Reject tampered signed payload when signature check fails
+		verified, ok := verifySignedBootstrapPayload(raw, pubKeyHex)
+		if !ok {
 			return 0
 		}
+		raw = verified
 		raw = strings.TrimPrefix(raw, "psiroute-se:")
 		added, _, _, err := p.importServerEntriesWithoutRestart(raw, src)
 		if err != nil {
@@ -1986,7 +1991,7 @@ func (p *Psi) info() map[string]any {
 	return map[string]any{
 		"egress_region": p.egress, "regions": regions, "regions_live": live, "region_stats": rs,
 		"favorite_countries": favs,
-		"nodes": nodes, "strategies": list, "order": order, "parallel": parallel, "standby": standby,
+		"nodes":              nodes, "strategies": list, "order": order, "parallel": parallel, "standby": standby,
 		"health_interval_secs": health, "min_speed_kbps": minSpeed, "dpi": psiDPINames,
 	}
 }

@@ -391,10 +391,6 @@ func (w *Warp) connectOnce(ctx context.Context) (*warpTunnel, error) {
 		return nil, err
 	}
 	mask, fixed := w.settings()
-	if strings.TrimSpace(fixed) == "" {
-		w.setState("connecting", "сканирую чистые IP Cloudflare…")
-		_ = theWarpScanner.EnsureScanned(ctx)
-	}
 	auto := mask == "" || mask == "auto"
 	ids := []string{mask}
 	if auto {
@@ -407,6 +403,15 @@ func (w *Warp) connectOnce(ctx context.Context) (*warpTunnel, error) {
 				ids = append(ids, m)
 			}
 		}
+	}
+	if strings.TrimSpace(fixed) == "" && len(ids) > 0 {
+		if scanMask, err := makeWarpMask(ids[0]); err == nil {
+			w.setState("connecting", "проверяю туннели Cloudflare…")
+			_ = theWarpScanner.EnsureScanned(ctx, id, scanMask)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	cands := warpCandidates(id, fixed)
 	var last error
@@ -647,16 +652,16 @@ func (w *Warp) view() map[string]any {
 	case !enabled:
 		st, text = "off", "выключен"
 	case external:
-		st, text = "external", "внешний SOCKS5 " + socks
+		st, text = "external", "внешний SOCKS5 "+socks
 	case st == "connected":
 		text += ", " + humanDur(time.Since(w.since))
 	case st == "idle":
 		text = "включится, когда Psiphon пойдёт «Через WARP»"
 	}
 	return map[string]any{
-		"state":      st,
-		"text":       text,
-		"clean_ips":  len(theWarpScanner.cachedEndpoints()),
+		"state":     st,
+		"text":      text,
+		"clean_ips": len(theWarpScanner.cachedEndpoints()),
 	}
 }
 

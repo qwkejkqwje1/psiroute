@@ -1,0 +1,9 @@
+include:yandex
+include:vk
+include:mailru
+gosuslugi.ru
+sberbank.ru
+tbank.ru
+vtb.ru
+ozon.ru
+wildberries.ru

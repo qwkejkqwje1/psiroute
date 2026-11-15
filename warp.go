@@ -1,8 +1,8 @@
 package main
 
 // Built-in Cloudflare WARP as an underlay for Psiphon («Через WARP»): the
-// provider sees a WireGuard/QUIC/MASQUE flow to Cloudflare instead of a
-// connection to Psiphon. Includes a fast parallel Cloudflare Clean IP
+// provider sees WireGuard with optional UDP preambles to Cloudflare instead
+// of a connection to Psiphon. Preambles do not implement QUIC or MASQUE. Includes a fast parallel Cloudflare Clean IP
 // Auto-Scanner and I1–I5 multi-packet CPS masking (Priority 2).
 
 import (
@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"io"
 	mrand "math/rand/v2"
-	"net"
 	"net/http"
 	"net/netip"
 	"os"
@@ -312,7 +311,7 @@ func buildWarpSig(parts []warpSigPart, counter uint32) []byte {
 
 type warpCleanResult struct {
 	Endpoint string        `json:"endpoint"`
-	RTT      time.Duration `json:"rtt"`
+	RTT      time.Duration `json:"rtt"` // Includes tunnel setup, handshake and TCP probe; retained JSON field for compatibility.
 }
 
 type warpCleanScanner struct {
@@ -386,54 +385,31 @@ func generateWarpScanTargets(count int) []string {
 	return out
 }
 
-// probeWarpCleanUDP sends a QUIC Version Negotiation trigger packet (Long Header
-// with version 0x00000000 and 1200 bytes total) or WireGuard initiation probe to
-// a Cloudflare endpoint. Cloudflare UDP/QUIC/WARP edge servers respond immediately
-// with a QUIC Version Negotiation or WG Cookie/Handshake response, whereas
-// blackholed IPs time out.
-func probeWarpCleanUDP(ctx context.Context, addr string, timeout time.Duration) (time.Duration, error) {
-	uaddr, err := net.ResolveUDPAddr("udp", addr)
+// probeWarpTunnel verifies usable traffic through an authenticated WireGuard
+// tunnel. Unauthenticated UDP replies cannot establish WARP availability.
+func probeWarpTunnel(ctx context.Context, id *warpIdentity, mask warpMask, addr string, timeout time.Duration) (time.Duration, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if id == nil {
+		return 0, errors.New("WARP identity is required")
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	started := time.Now()
+	tunnel, err := openWarpTunnel(id, addr, mask)
 	if err != nil {
 		return 0, err
 	}
-	conn, err := listenUDPDirectFor(uaddr.IP)
-	if err != nil {
+	defer tunnel.Close()
+	if err := tunnel.probe(ctx); err != nil {
 		return 0, err
 	}
-	defer conn.Close()
-
-	dl := time.Now().Add(timeout)
-	if cdl, ok := ctx.Deadline(); ok && cdl.Before(dl) {
-		dl = cdl
+	hs, _, _ := tunnel.stats()
+	if hs.IsZero() {
+		return 0, errors.New("WARP handshake not confirmed")
 	}
-	_ = conn.SetDeadline(dl)
-
-	// Construct a 1200-byte QUIC v0 probe (triggers instant RFC 9000 Version Negotiation
-	// from Cloudflare UDP/MASQUE/QUIC edge servers) plus a 148-byte WireGuard-shaped probe.
-	probe := make([]byte, 1200)
-	probe[0] = 0xc0 // QUIC Long Header
-	// Version 0x00000000 (bytes 1..4) triggers Version Negotiation
-	probe[5] = 8 // DCID length
-	_, _ = rand.Read(probe[6:14])
-	probe[14] = 8 // SCID length
-	_, _ = rand.Read(probe[15:23])
-
-	t0 := time.Now()
-	if _, err := conn.WriteToUDP(probe, uaddr); err != nil {
-		return 0, err
-	}
-	// Also send a compact 148-byte WireGuard initiation-sized packet with random MACs
-	wgProbe := make([]byte, 148)
-	wgProbe[0] = 1
-	_, _ = rand.Read(wgProbe[4:])
-	_, _ = conn.WriteToUDP(wgProbe, uaddr)
-
-	resp := make([]byte, 1500)
-	n, _, err := conn.ReadFromUDP(resp)
-	if err != nil || n == 0 {
-		return 0, errors.New("нет UDP-ответа")
-	}
-	return time.Since(t0), nil
+	return time.Since(started), nil
 }
 
 // Scan probes candidate Cloudflare endpoints in parallel and caches the fastest
@@ -451,8 +427,12 @@ func (s *warpCleanScanner) Scan(ctx context.Context, targets []string, concurren
 	s.mu.Lock()
 	pfn := s.probeFunc
 	s.mu.Unlock()
+	return s.scanWithProbe(ctx, targets, concurrency, timeout, pfn)
+}
+
+func (s *warpCleanScanner) scanWithProbe(ctx context.Context, targets []string, concurrency int, timeout time.Duration, pfn func(context.Context, string, time.Duration) (time.Duration, error)) []warpCleanResult {
 	if pfn == nil {
-		pfn = probeWarpCleanUDP
+		return nil
 	}
 
 	sem := make(chan struct{}, concurrency)
@@ -482,6 +462,9 @@ func (s *warpCleanScanner) Scan(ctx context.Context, targets []string, concurren
 		}(ep)
 	}
 	wg.Wait()
+	if ctx.Err() != nil {
+		return nil
+	}
 
 	sort.Slice(found, func(i, j int) bool {
 		if found[i].RTT != found[j].RTT {
@@ -495,20 +478,26 @@ func (s *warpCleanScanner) Scan(ctx context.Context, targets []string, concurren
 		s.results = found
 		s.updatedAt = time.Now()
 		s.mu.Unlock()
-		logf("info", "WARP: автосканер нашёл %d чистых IP Cloudflare (лучший: %s, %d мс)",
+		logf("info", "WARP: проверено %d туннелей Cloudflare (лучший: %s, установка и TCP-проверка %d мс)",
 			len(found), found[0].Endpoint, found[0].RTT.Milliseconds())
 	}
 	return found
 }
 
-// EnsureScanned runs a quick parallel scan if the clean IP cache is empty or expired.
-func (s *warpCleanScanner) EnsureScanned(ctx context.Context) []string {
+// EnsureScanned verifies endpoints serially when the authenticated cache expires.
+func (s *warpCleanScanner) EnsureScanned(ctx context.Context, id *warpIdentity, mask warpMask) []string {
 	if cached := s.cachedEndpoints(); len(cached) > 0 {
 		return cached
 	}
-	sctx, cancel := context.WithTimeout(ctx, 1600*time.Millisecond)
+	sctx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	defer cancel()
-	res := s.Scan(sctx, generateWarpScanTargets(20), 10, warpScanTimeout)
+	// Cloudflare allows one active session per identity; serial probes avoid
+	// replacing each other's peer sessions. Include both endpoint families.
+	targets := generateWarpScanTargets(4)
+	targets = append(targets, warpCleanIPv6Seeds[:min(2, len(warpCleanIPv6Seeds))]...)
+	res := s.scanWithProbe(sctx, targets, 1, 750*time.Millisecond, func(ctx context.Context, addr string, timeout time.Duration) (time.Duration, error) {
+		return probeWarpTunnel(ctx, id, mask, addr, timeout)
+	})
 	out := make([]string, 0, len(res))
 	for _, r := range res {
 		out = append(out, r.Endpoint)

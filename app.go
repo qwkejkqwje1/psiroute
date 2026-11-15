@@ -25,13 +25,14 @@ var errAlreadyRunning = errors.New("psiroute уже запущен")
 // App wires everything together: config, Psiphon engine, router, stats,
 // local proxy, LAN share, web UI.
 type App struct {
-	tun     tunCtl // TUN mode, tun.go
-	ctx     context.Context
-	cancel  context.CancelFunc
-	cfg     *Config
-	cfgPath string
-	dataDir string
-	token   string
+	rulesWriteMu sync.Mutex
+	tun          tunCtl // TUN mode, tun.go
+	ctx          context.Context
+	cancel       context.CancelFunc
+	cfg          *Config
+	cfgPath      string
+	dataDir      string
+	token        string
 
 	psi    *Psi
 	stats  *Stats
@@ -572,7 +573,11 @@ func (a *App) onRulesChanged() int {
 			return false
 		}
 		targetHost, host, port, appName, curOb := a.stats.routeAndHost(t)
-		order, _ := a.router.planForProto("tcp", targetHost, host, port, appName)
+		proto := t.protocol
+		if proto == "" {
+			proto = "tcp"
+		}
+		order, _ := a.router.planForProto(proto, targetHost, host, port, appName)
 		if len(order) == 0 {
 			return false
 		}
@@ -639,7 +644,7 @@ func (a *App) stateCompact(compact bool) map[string]any {
 		"countries": a.countries.Status(), "favorite_countries": favCountries,
 		"config_error": cfgErr, "config_backup": cfgBackup,
 		"probe_running": a.isProbeRunning(),
-		"paused": a.IsPaused(), "pause_remaining_sec": a.PauseRemainingSec(), "pause_until": a.pauseUntil.Load(),
+		"paused":        a.IsPaused(), "pause_remaining_sec": a.PauseRemainingSec(), "pause_until": a.pauseUntil.Load(),
 	}
 }
 
@@ -781,7 +786,7 @@ func (a *App) probeState() map[string]any {
 	for _, r := range res {
 		if !r.OK {
 			continue
-			}
+		}
 		score := float64(r.Kbps) + 100000.0/float64(r.ConnectMs+1)
 		if score > bestScore {
 			best, bestScore = r.ID, score

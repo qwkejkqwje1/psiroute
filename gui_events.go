@@ -131,7 +131,7 @@ type gioUI struct {
 	privacyMode      bool
 	homeRuleEditor   widget.Editor
 	homeRuleOb       string
-	homeRuleObBtns   [3]widget.Clickable
+	homeRuleObBtns   [5]widget.Clickable
 	homeRuleAddBtn   widget.Clickable
 	homeCheckBtn     widget.Clickable
 	homeRoutePreview string
@@ -141,31 +141,32 @@ type gioUI struct {
 	resetStatsBtn    widget.Clickable
 
 	// Rules Constructor
-	ruleFilterEditor widget.Editor
-	batchRuleEditor  widget.Editor
-	batchImportBtn   widget.Clickable
-	ruleNameEditor   widget.Editor
-	hostEditor       widget.Editor
-	selectedRuleOb   string
-	selectedProto    string
-	ruleAlways       bool
-	editingRuleIdx   int
-	ruleObBtns       [10]widget.Clickable
-	ruleProtoBtns    [3]widget.Clickable
-	ruleAlwaysBtn    widget.Clickable
-	ruleCancelBtn    widget.Clickable
-	checkRouteBtn    widget.Clickable
-	addRuleBtn       widget.Clickable
-	presetRuleBtns   [8]widget.Clickable
-	listPickBtns     [12]widget.Clickable
-	listUseBtns      map[string]*widget.Clickable
-	profileBtns      [5]widget.Clickable
-	undoProfileBtn   widget.Clickable
-	ruleToggleBtns   map[int]*widget.Clickable
-	ruleDeleteBtns   map[int]*widget.Clickable
-	ruleEditBtns     map[int]*widget.Clickable
-	ruleUpBtns       map[int]*widget.Clickable
-	ruleDownBtns     map[int]*widget.Clickable
+	ruleFilterEditor    widget.Editor
+	batchRuleEditor     widget.Editor
+	batchImportBtn      widget.Clickable
+	ruleNameEditor      widget.Editor
+	hostEditor          widget.Editor
+	selectedRuleOb      string
+	selectedProto       string
+	ruleAlways          bool
+	editingRuleIdx      int
+	ruleObBtns          [10]widget.Clickable
+	ruleProtoBtns       [3]widget.Clickable
+	ruleAlwaysBtn       widget.Clickable
+	ruleCancelBtn       widget.Clickable
+	checkRouteBtn       widget.Clickable
+	addRuleBtn          widget.Clickable
+	presetRuleBtns      [8]widget.Clickable
+	listPickBtns        [12]widget.Clickable
+	listUseBtns         map[string]*widget.Clickable
+	profileBtns         [5]widget.Clickable
+	undoProfileBtn      widget.Clickable
+	ruleToggleBtns      map[int]*widget.Clickable
+	ruleDeleteBtns      map[int]*widget.Clickable
+	ruleEditBtns        map[int]*widget.Clickable
+	editingRuleOriginal map[string]any
+	ruleUpBtns          map[int]*widget.Clickable
+	ruleDownBtns        map[int]*widget.Clickable
 
 	// Lists Manager (Stage 1 & Stage 3)
 	listActionBtns         map[string]*widget.Clickable
@@ -222,8 +223,8 @@ type gioUI struct {
 var navTitles = [4]string{
 	"Главная",
 	"Маршруты",
-	"Сеть и Обход",
-	"Система и Логи",
+	"Сеть",
+	"Система",
 }
 
 var navHints = [4]string{
@@ -266,9 +267,6 @@ func loadWindowsSystemFonts() []font.FontFace {
 		for _, f := range faces {
 			f.Font.Weight = c.weight
 			f.Font.Style = c.style
-			if c.variant != "" {
-				f.Font.Variant = font.Variant(c.variant)
-			}
 			collection = append(collection, f)
 			// Дублируем дескриптор шрифта для Typeface "Go" и "Go Mono", которые использует material.NewTheme()
 			alias := f
@@ -356,7 +354,7 @@ func runGioWindow(dataDir, uiURL string, parentPID int) {
 		w.Option(
 			app.Title(windowTitle),
 			app.Size(unit.Dp(1040), unit.Dp(680)),
-			app.MinSize(unit.Dp(820), unit.Dp(560)),
+			app.MinSize(unit.Dp(960), unit.Dp(640)),
 		)
 		ui.w = w
 		setWindowIcon()
@@ -385,7 +383,6 @@ func runGioWindow(dataDir, uiURL string, parentPID int) {
 			switch e := w.Event().(type) {
 			case app.DestroyEvent:
 				close(stopPoll)
-				ReleaseGUIMemory()
 				os.Exit(0)
 				return
 			case app.ConfigEvent:
@@ -839,7 +836,7 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 	if ui.privacyBtn.Clicked(gtx) {
 		ui.privacyMode = !ui.privacyMode
 		if ui.privacyMode {
-			ui.setToast("Режим «Чистый экран» включён: IP и домены скрыты для скриншотов", false)
+			ui.setToast("Чистый экран: IP и домены скрыты в подписях и логах. Поля ввода остаются видимыми", false)
 		} else {
 			ui.setToast("Режим «Чистый экран» выключен", false)
 		}
@@ -930,7 +927,7 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 		})
 	}
 
-	homeObs := [3]string{obPsiphon, obDesync, obDirect}
+	homeObs := [5]string{obDirect, obDesync, obWarp, obPsiphon, obBlock}
 	for i := range ui.homeRuleObBtns {
 		if ui.homeRuleObBtns[i].Clicked(gtx) {
 			ui.homeRuleOb = homeObs[i]
@@ -1329,19 +1326,17 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 		proto := ui.selectedProto
 		alw := ui.ruleAlways
 		editIdx := ui.editingRuleIdx
+		original := ui.editingRuleOriginal
+		if editIdx < 0 {
+			original = nil
+		}
 		if target != "" {
 			ui.editingRuleIdx = -1
 			ui.ruleAlways = true
 			ui.ruleNameEditor.SetText("")
 			ui.hostEditor.SetText("")
 			ui.doAsync(fmt.Sprintf("Правило сохранено → %s", ob), func() (map[string]any, error) {
-				body := map[string]any{
-					"name":     name,
-					"tokens":   target,
-					"outbound": ob,
-					"proto":    proto,
-					"always":   alw,
-				}
+				body := ruleEditRequest(original, target, name, ob, proto, alw)
 				if editIdx >= 0 {
 					body["index"] = editIdx
 				}

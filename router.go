@@ -33,7 +33,7 @@ const (
 )
 
 const (
-	learnedMax = 2000              // TZ §4.4: cap the learned table
+	learnedMax = 2000               // TZ §4.4: cap the learned table
 	learnedTTL = 7 * 24 * time.Hour // TZ §4.4: expire entries not used for 7 days
 )
 
@@ -257,10 +257,11 @@ func formatRouteBadge(ob string, stage int, ruleName, app string) string {
 }
 
 // rulePriorityTier относит правило к уровню конвейера (2..5):
-//   2 — чистое правило для конкретной программы (Apps без доменов/списков/портов)
-//   3 — личное правило пользователя (точные домены/IP/порты без внешних списков)
-//   4 — правило Белого списка РФ / исключений (ru-gov-banks / ru -> direct)
-//   5 — правило на основе подключённых списков (Lists)
+//
+//	2 — явное правило для программы; proto/ports/domain/list уточняют совпадение
+//	3 — личное правило пользователя (точные домены/IP/порты без внешних списков)
+//	4 — правило Белого списка РФ / исключений (ru-gov-banks / ru -> direct)
+//	5 — правило на основе подключённых списков (Lists)
 func rulePriorityTier(ru Rule) int {
 	hasPosApp := false
 	for _, a := range ru.Apps {
@@ -270,7 +271,7 @@ func rulePriorityTier(ru Rule) int {
 			break
 		}
 	}
-	if hasPosApp && len(ru.Domains) == 0 && len(ru.Keywords) == 0 && len(ru.CIDR) == 0 && len(ru.Lists) == 0 && len(ru.Ports) == 0 && len(ru.PortRanges) == 0 && ru.Proto == "" {
+	if hasPosApp {
 		return 2
 	}
 	if len(ru.Lists) == 0 {
@@ -303,14 +304,15 @@ var serviceCompanionDomains = map[string][]string{
 }
 
 type Router struct {
-	a          *App
-	file       string
-	mu         sync.Mutex
-	seen       map[string]*learned
-	cacheMu    sync.RWMutex
-	routeCache map[string]routeCacheEntry
-	saveT      *time.Timer
-	savePen    bool
+	a               *App
+	file            string
+	mu              sync.Mutex
+	seen            map[string]*learned
+	cacheMu         sync.RWMutex
+	routeCache      map[string]routeCacheEntry
+	rulesGeneration uint64
+	saveT           *time.Timer
+	savePen         bool
 }
 
 // InvalidateRules сбрасывает кэш маршрутных решений (routeCache) при любом изменении правил или режима.
@@ -320,6 +322,7 @@ func (r *Router) InvalidateRules() {
 	}
 	r.cacheMu.Lock()
 	r.routeCache = map[string]routeCacheEntry{}
+	r.rulesGeneration++
 	r.cacheMu.Unlock()
 }
 
@@ -800,6 +803,9 @@ func (r *Router) ExplainRoute(proto, host, dstIP string, port int, app string) R
 }
 
 func (r *Router) planForProtoWithStage(proto, host, dstIP string, port int, app string) (order []string, rule string, stage int) {
+	r.cacheMu.RLock()
+	generation := r.rulesGeneration
+	r.cacheMu.RUnlock()
 	cleanH := cleanHostKey(host)
 	if a, err := netip.ParseAddr(cleanH); err == nil && isFakeIP(a) {
 		if fdom := theFakeIP.Lookup(a); fdom != "" {
@@ -830,8 +836,8 @@ func (r *Router) planForProtoWithStage(proto, host, dstIP string, port int, app 
 	rulesLen := len(r.a.cfg.Routing.Rules)
 	r.a.cfg.mu.Unlock()
 
-	cacheKey := fmt.Sprintf("%s|%s|%s|%d|%s|%s|%s|%t|%t|%t|%d",
-		proto, cleanH, dstIP, port, normAppFullPath(app), mode, def, failover, bypassLAN, blockSTUN, rulesLen)
+	cacheKey := fmt.Sprintf("%d|%s|%s|%s|%d|%s|%s|%s|%t|%t|%t|%d",
+		generation, proto, cleanH, dstIP, port, normAppFullPath(app), mode, def, failover, bypassLAN, blockSTUN, rulesLen)
 	if !killSwitch && mode != "auto" && len(theDNS.cachedIPs(cleanH)) == 0 {
 		if addr, err := netip.ParseAddr(cleanH); err != nil || theRevDNS.get(addr) == "" {
 			r.cacheMu.RLock()
@@ -871,7 +877,7 @@ func (r *Router) planForProtoWithStage(proto, host, dstIP string, port int, app 
 	}
 
 	buildAutoChain := func() ([]string, int) {
-		if learn {
+		if learn && mode == "auto" {
 			if l := r.learnedFor(cleanH); l != "" {
 				return []string{l}, 6
 			}
@@ -895,10 +901,8 @@ func (r *Router) planForProtoWithStage(proto, host, dstIP string, port int, app 
 	matchedOb, matchedName, matchedStage := r.matchRuleFullWithStage(proto, host, dstIP, port, app, false)
 
 	// Приоритет 4 (в режиме «Умный обход»): автоматический Белый список РФ (.ru, .рф, Госуслуги, банки)
-	if matchedOb == "" && mode == "auto" && r.a.lists != nil && r.a.lists.MatchRUWhitelist(cleanH) {
-		if !learn || r.learnedFor(cleanH) == "" {
-			return []string{obDirect}, "Белый список РФ", 4
-		}
+	if (matchedOb == "" || matchedStage == 5) && mode == "auto" && r.a.lists != nil && r.a.lists.MatchRUWhitelist(cleanH) {
+		return []string{obDirect}, "Белый список РФ", 4
 	}
 
 	if matchedOb == "" {

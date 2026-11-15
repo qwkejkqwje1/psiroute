@@ -5,10 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -338,8 +340,56 @@ func (w *netWatch) setCaptivePortalState(active bool, portalURL string) {
 	w.mu.Unlock()
 }
 
-// detectCaptivePortal проверяет, перехватывает ли локальный шлюз Wi-Fi (отель, аэропорт, кафе, метро)
-// HTTP-запросы редиректом (302 Found / 307 / 511) на страницу авторизации.
+const captiveConnectivityURL = "http://connectivitycheck.gstatic.com/generate_204"
+
+// captivePortalResponse classifies only our fixed no-content probe. It never
+// follows links from HTML or treats arbitrary web pages as portal evidence.
+func captivePortalResponse(resp *http.Response) (bool, string) {
+	if resp == nil || resp.Request == nil || resp.Request.URL == nil || resp.Request.URL.String() != captiveConnectivityURL {
+		return false, ""
+	}
+	base := resp.Request.URL
+	if (resp.StatusCode >= 300 && resp.StatusCode < 400) || resp.StatusCode == http.StatusNetworkAuthenticationRequired {
+		raw := strings.TrimSpace(resp.Header.Get("Location"))
+		if raw == "" {
+			return false, ""
+		}
+		ref, err := url.Parse(raw)
+		if err != nil {
+			return false, ""
+		}
+		target := base.ResolveReference(ref)
+		if (target.Scheme != "http" && target.Scheme != "https") || target.Hostname() == "" || target.User != nil || target.Opaque != "" {
+			return false, ""
+		}
+		if port := target.Port(); port != "" {
+			n, err := strconv.Atoi(port)
+			if err != nil || n < 1 || n > 65535 {
+				return false, ""
+			}
+		}
+		target.Fragment = ""
+		return true, target.String()
+	}
+	if resp.StatusCode == http.StatusOK && resp.Body != nil {
+		media := strings.ToLower(strings.TrimSpace(strings.Split(resp.Header.Get("Content-Type"), ";")[0]))
+		if media != "text/html" {
+			return false, ""
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if err != nil {
+			return false, ""
+		}
+		prefix := strings.ToLower(strings.TrimSpace(string(body)))
+		if strings.HasPrefix(prefix, "<!doctype html") || strings.HasPrefix(prefix, "<html") {
+			return true, captiveConnectivityURL
+		}
+	}
+	return false, ""
+}
+
+// detectCaptivePortal checks our known no-content endpoint without following
+// redirects. HTML interception is evidence of changed probe content, not DPI.
 func (w *netWatch) detectCaptivePortal(ctx context.Context) (bool, string) {
 	if w == nil || isRunningTests() {
 		return false, ""
@@ -354,7 +404,7 @@ func (w *netWatch) detectCaptivePortal(ctx context.Context) (bool, string) {
 			return http.ErrUseLastResponse
 		},
 	}
-	req, err := http.NewRequestWithContext(ctx, "GET", "http://connectivitycheck.gstatic.com/generate_204", nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", captiveConnectivityURL, nil)
 	if err != nil {
 		return false, ""
 	}
@@ -363,17 +413,15 @@ func (w *netWatch) detectCaptivePortal(ctx context.Context) (bool, string) {
 		return false, ""
 	}
 	defer resp.Body.Close()
+	defer cl.CloseIdleConnections()
 	if resp.StatusCode == http.StatusNoContent {
 		w.setCaptivePortalState(false, "")
 		return false, ""
 	}
-	if (resp.StatusCode >= 300 && resp.StatusCode < 400) || resp.StatusCode == http.StatusNetworkAuthenticationRequired {
-		loc := strings.TrimSpace(resp.Header.Get("Location"))
-		if loc != "" {
-			w.setCaptivePortalState(true, loc)
-			logf("warn", "Обнаружен Captive Portal (публичный Wi-Fi требует авторизации): %s", loc)
-			return true, loc
-		}
+	if active, location := captivePortalResponse(resp); active {
+		w.setCaptivePortalState(true, location)
+		logf("warn", "Проверка подключения перехвачена: %s", location)
+		return true, location
 	}
 	return false, ""
 }

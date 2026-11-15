@@ -42,23 +42,14 @@ func ReleaseGUIMemory() {
 	debug.FreeOSMemory()
 }
 
-// memTrimmer gives freed heap pages back to the system and periodically prunes
+// memTrimmer periodically prunes
 // expired entries from in-memory caches (DNS, DoH wire cache, Reverse DNS,
 // FakeIP, ECH, and LAN auth rate-limiter).
 func memTrimmer() {
-	s := []metrics.Sample{{Name: "/memory/classes/heap/free:bytes"}}
-	tk := time.NewTicker(15 * time.Second)
+	tk := time.NewTicker(30 * time.Second)
 	defer tk.Stop()
-	ticks := 0
 	for range tk.C {
-		ticks++
-		if ticks%2 == 0 {
-			pruneAllCaches()
-		}
-		metrics.Read(s)
-		if s[0].Value.Kind() == metrics.KindUint64 && s[0].Value.Uint64() >= 4<<20 {
-			debug.FreeOSMemory()
-		}
+		pruneAllCaches()
 	}
 }
 

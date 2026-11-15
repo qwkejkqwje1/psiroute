@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/subtle"
-	_ "embed"
 	"encoding/json"
 	"errors"
 	"net"
@@ -16,9 +15,6 @@ import (
 	"strings"
 	"time"
 )
-
-//go:embed ui/index.html
-var indexHTML []byte
 
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -110,6 +106,11 @@ func (a *App) routes() http.Handler {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.Header().Set("Cache-Control", "no-store")
 			w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'")
+			indexHTML, err := readCompressedAsset("ui/index.html.gz")
+			if err != nil {
+				http.Error(w, "UI asset unavailable", http.StatusInternalServerError)
+				return
+			}
 			_, _ = w.Write(bytes.ReplaceAll(indexHTML, []byte("__PSIROUTE_TOKEN__"), []byte(a.token)))
 		default:
 			http.NotFound(w, r)
@@ -127,6 +128,11 @@ func (a *App) restartIfRunning() bool {
 
 func (a *App) api(w http.ResponseWriter, r *http.Request) {
 	p := strings.TrimPrefix(r.URL.Path, "/api/")
+	if r.Method != http.MethodGet && (p == "rules" || strings.HasPrefix(p, "rules/") || p == "conns/quick-rule") {
+		a.rulesWriteMu.Lock()
+		defer a.rulesWriteMu.Unlock()
+	}
+
 	q := r.URL.Query()
 	post := r.Method == http.MethodPost
 	ok := map[string]any{"ok": true}
@@ -576,14 +582,14 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 	case p == "repair" && post:
 		// Быстрое действие «Починить соединение»: сбрасывает статистику ошибок DPI (auto-tune),
 		// очищает кэш DNS/маршрутов и перезапускает активный каскад WARP + Psiphon.
-		theObfs.resetScores()
+		obfs.reset()
 		theDNS.clear()
 		a.router.InvalidateRules()
 		a.cfg.mu.Lock()
 		warpOn := a.cfg.Warp.Enabled
 		a.cfg.mu.Unlock()
 		if warpOn && a.warp != nil {
-			go a.warp.Restart()
+			go a.warp.Reconnect()
 		}
 		if a.psi != nil {
 			go a.psi.Restart()
@@ -630,6 +636,7 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		a.cfg.mu.Lock()
+		rollback := a.snapshotRuleSettingsLocked()
 		if b.Default != "" {
 			a.cfg.Routing.Default = b.Default
 		}
@@ -646,8 +653,13 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 			b.Rules = []Rule{}
 		}
 		a.cfg.Routing.Rules = b.Rules
+		if err := a.cfg.saveLocked(); err != nil {
+			rollback()
+			a.cfg.mu.Unlock()
+			writeErr(w, 500, "не удалось сохранить правила: "+err.Error())
+			return
+		}
 		a.cfg.mu.Unlock()
-		_ = a.cfg.save()
 		a.onRulesChanged()
 		a.lists.Refresh()
 		writeJSON(w, ok)
@@ -661,6 +673,7 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.cfg.mu.Lock()
+		rollback := a.snapshotRuleSettingsLocked()
 		if b.Index < 0 || b.Index >= len(a.cfg.Routing.Rules) {
 			a.cfg.mu.Unlock()
 			writeErr(w, 400, "правило не найдено")
@@ -672,8 +685,13 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 			a.cfg.Routing.Rules[b.Index].Disabled = !a.cfg.Routing.Rules[b.Index].Disabled
 		}
 		disabled := a.cfg.Routing.Rules[b.Index].Disabled
+		if err := a.cfg.saveLocked(); err != nil {
+			rollback()
+			a.cfg.mu.Unlock()
+			writeErr(w, 500, "не удалось сохранить правила: "+err.Error())
+			return
+		}
 		a.cfg.mu.Unlock()
-		_ = a.cfg.save()
 		a.onRulesChanged()
 		writeJSON(w, map[string]any{"ok": true, "disabled": disabled})
 	case p == "rules/delete" && post:
@@ -685,6 +703,7 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.cfg.mu.Lock()
+		rollback := a.snapshotRuleSettingsLocked()
 		if b.Index < 0 || b.Index >= len(a.cfg.Routing.Rules) {
 			a.cfg.mu.Unlock()
 			writeErr(w, 400, "правило не найдено")
@@ -692,8 +711,13 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 		}
 		name := a.cfg.Routing.Rules[b.Index].Name
 		a.cfg.Routing.Rules = append(a.cfg.Routing.Rules[:b.Index], a.cfg.Routing.Rules[b.Index+1:]...)
+		if err := a.cfg.saveLocked(); err != nil {
+			rollback()
+			a.cfg.mu.Unlock()
+			writeErr(w, 500, "не удалось сохранить правила: "+err.Error())
+			return
+		}
 		a.cfg.mu.Unlock()
-		_ = a.cfg.save()
 		a.onRulesChanged()
 		logf("info", "Правило удалено: %s", name)
 		writeJSON(w, ok)
@@ -707,13 +731,19 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.cfg.mu.Lock()
+		rollback := a.snapshotRuleSettingsLocked()
 		n := len(a.cfg.Routing.Rules)
 		target := b.Index + b.Dir
 		if b.Index >= 0 && b.Index < n && target >= 0 && target < n {
 			a.cfg.Routing.Rules[b.Index], a.cfg.Routing.Rules[target] = a.cfg.Routing.Rules[target], a.cfg.Routing.Rules[b.Index]
 		}
+		if err := a.cfg.saveLocked(); err != nil {
+			rollback()
+			a.cfg.mu.Unlock()
+			writeErr(w, 500, "не удалось сохранить правила: "+err.Error())
+			return
+		}
 		a.cfg.mu.Unlock()
-		_ = a.cfg.save()
 		a.onRulesChanged()
 		writeJSON(w, ok)
 	case p == "rules/preset" && post:
@@ -1073,22 +1103,23 @@ func (a *App) listsAPI(w http.ResponseWriter, r *http.Request, p string) {
 func (a *App) rulesAddAPI(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	var body struct {
-		Index      *int     `json:"index,omitempty"`
-		Tokens     string   `json:"tokens,omitempty"`
-		Hosts      []string `json:"hosts"`
-		Domains    []string `json:"domains,omitempty"`
-		Keywords   []string `json:"keywords,omitempty"`
-		CIDR       []string `json:"cidr,omitempty"`
-		Lists      []string `json:"lists,omitempty"`
-		Outbound   string   `json:"outbound"`
-		Name       string   `json:"name"`
-		Apps       []string `json:"apps,omitempty"`
-		Proto      string   `json:"proto,omitempty"`
-		Ports      []int    `json:"ports,omitempty"`
-		PortRanges []string `json:"port_ranges,omitempty"`
-		Always     *bool    `json:"always,omitempty"`
-		Disabled   bool     `json:"disabled,omitempty"`
-		Smart      bool     `json:"smart,omitempty"`
+		Index        *int     `json:"index,omitempty"`
+		Tokens       string   `json:"tokens,omitempty"`
+		Hosts        []string `json:"hosts"`
+		Domains      []string `json:"domains,omitempty"`
+		Keywords     []string `json:"keywords,omitempty"`
+		CIDR         []string `json:"cidr,omitempty"`
+		Lists        []string `json:"lists,omitempty"`
+		Outbound     string   `json:"outbound"`
+		Name         string   `json:"name"`
+		Apps         []string `json:"apps,omitempty"`
+		Proto        string   `json:"proto,omitempty"`
+		Ports        []int    `json:"ports,omitempty"`
+		PortRanges   []string `json:"port_ranges,omitempty"`
+		Always       *bool    `json:"always,omitempty"`
+		Disabled     bool     `json:"disabled,omitempty"`
+		Smart        bool     `json:"smart,omitempty"`
+		ExactDomains []string `json:"exact_domains,omitempty"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	ob := q.Get("outbound")
@@ -1120,15 +1151,14 @@ func (a *App) rulesAddAPI(w http.ResponseWriter, r *http.Request) {
 
 	rawTokens := append([]string(nil), body.Hosts...)
 	rawTokens = append(rawTokens, body.Domains...)
+	for _, domain := range body.ExactDomains {
+		addUnique(&hosts, strings.TrimSpace(domain))
+	}
 	if strings.TrimSpace(body.Tokens) != "" {
 		rawTokens = append(rawTokens, body.Tokens)
 	}
 	for _, raw := range rawTokens {
-		for _, tok := range strings.FieldsFunc(raw, func(c rune) bool { return c == ',' || c == ';' || c == '\n' || c == '\r' }) {
-			tok = sanitizeRuleToken(tok)
-			if tok == "" {
-				continue
-			}
+		for _, tok := range splitRuleInput(raw) {
 			classifySmartRuleToken(tok, &hosts, &cidr, &lists, &keywords, &apps, &ports, &portRanges, &proto)
 		}
 	}
@@ -1202,6 +1232,7 @@ func (a *App) rulesAddAPI(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.cfg.mu.Lock()
+	rollback := a.snapshotRuleSettingsLocked()
 	if body.Index != nil && *body.Index >= 0 && *body.Index < len(a.cfg.Routing.Rules) {
 		a.cfg.Routing.Rules[*body.Index] = newRule
 	} else {
@@ -1221,8 +1252,13 @@ func (a *App) rulesAddAPI(w http.ResponseWriter, r *http.Request) {
 			a.cfg.Routing.Rules = append(a.cfg.Routing.Rules, newRule)
 		}
 	}
+	if err := a.cfg.saveLocked(); err != nil {
+		rollback()
+		a.cfg.mu.Unlock()
+		writeErr(w, 500, "не удалось сохранить правила: "+err.Error())
+		return
+	}
 	a.cfg.mu.Unlock()
-	_ = a.cfg.save()
 	if len(lists) > 0 {
 		a.lists.Refresh()
 	}
@@ -1291,6 +1327,10 @@ func classifySmartRuleToken(tok string, hosts, cidr, lists, keywords, apps *[]st
 	}
 	if rest, ok := strings.CutPrefix(low, "ip:"); ok {
 		addUnique(cidr, strings.TrimSpace(rest))
+		return
+	}
+	if rest, ok := strings.CutPrefix(tok, "domain:"); ok {
+		addUnique(hosts, strings.TrimSpace(rest))
 		return
 	}
 	if rest, ok := strings.CutPrefix(low, "country:"); ok {
@@ -1459,6 +1499,7 @@ func (a *App) addQuickRulePreset(preset, ob string) error {
 	}
 
 	a.cfg.mu.Lock()
+	rollback := a.snapshotRuleSettingsLocked()
 	rules := a.cfg.Routing.Rules
 	for _, nr := range newRules {
 		idx := slices.IndexFunc(rules, func(x Rule) bool { return strings.EqualFold(x.Name, nr.Name) })
@@ -1469,8 +1510,12 @@ func (a *App) addQuickRulePreset(preset, ob string) error {
 		}
 	}
 	a.cfg.Routing.Rules = rules
+	if err := a.cfg.saveLocked(); err != nil {
+		rollback()
+		a.cfg.mu.Unlock()
+		return err
+	}
 	a.cfg.mu.Unlock()
-	_ = a.cfg.save()
 	a.onRulesChanged()
 	a.lists.Refresh()
 	logf("info", "Добавлен шаблон правил «%s» → %s", preset, ob)
@@ -1711,9 +1756,15 @@ func (a *App) rulesBatchAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.cfg.mu.Lock()
+	rollback := a.snapshotRuleSettingsLocked()
 	a.cfg.Routing.Rules = append([]Rule{nr}, a.cfg.Routing.Rules...)
+	if err := a.cfg.saveLocked(); err != nil {
+		rollback()
+		a.cfg.mu.Unlock()
+		writeErr(w, 500, "не удалось сохранить правила: "+err.Error())
+		return
+	}
 	a.cfg.mu.Unlock()
-	_ = a.cfg.save()
 	for _, h := range hosts {
 		a.router.forget(strings.TrimPrefix(h, "!"))
 	}
@@ -1798,12 +1849,26 @@ func (a *App) quickConnRuleAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.cfg.mu.Lock()
+	rollback := a.snapshotRuleSettingsLocked()
 	a.cfg.Routing.Rules = append([]Rule{nr}, a.cfg.Routing.Rules...)
+	if err := a.cfg.saveLocked(); err != nil {
+		rollback()
+		a.cfg.mu.Unlock()
+		writeErr(w, 500, "не удалось сохранить правила: "+err.Error())
+		return
+	}
 	a.cfg.mu.Unlock()
-	_ = a.cfg.save()
 	for _, d := range hosts {
 		a.router.forget(d)
 	}
 	a.onRulesChanged()
 	writeJSON(w, map[string]any{"ok": true, "rule": nr})
+}
+
+// snapshotRuleSettingsLocked is called under cfg.mu; rollback runs before unlock.
+func (a *App) snapshotRuleSettingsLocked() func() {
+	old := a.cfg.Routing
+	old.Rules = cloneRules(old.Rules)
+	old.Chain = append([]string(nil), old.Chain...)
+	return func() { a.cfg.Routing = old }
 }

@@ -304,10 +304,10 @@ func dnsFakeIPResponse(q []byte, fakeAddr netip.Addr) []byte {
 // ---------- Encrypted ClientHello (ECH) DNS HTTPS (RRType 65) + DNS TXT Fallback ----------
 
 const (
-	dnsTypeHTTPS        uint16 = 65
-	svcParamKeyECH      uint16 = 5
-	echCacheMaxEntries         = 1024
-	echCacheTTL                = 15 * time.Minute
+	dnsTypeHTTPS       uint16 = 65
+	svcParamKeyECH     uint16 = 5
+	echCacheMaxEntries        = 1024
+	echCacheTTL               = 15 * time.Minute
 )
 
 type echEntry struct {
@@ -354,13 +354,13 @@ func buildSyntheticECHConfigList(publicName string, cfgID byte) []byte {
 		pubKey[i] = byte(0x21 + i*7)
 	}
 	var content []byte
-	content = append(content, cfgID)              // config_id
-	content = append(content, 0x00, 0x20)         // kem_id = DHKEM(X25519, HKDF-SHA256)
-	content = append(content, 0x00, 0x20)         // public_key length = 32
-	content = append(content, pubKey...)          // 32-byte X25519 public key
-	content = append(content, 0x00, 0x04)         // cipher_suites length = 4
+	content = append(content, cfgID)                  // config_id
+	content = append(content, 0x00, 0x20)             // kem_id = DHKEM(X25519, HKDF-SHA256)
+	content = append(content, 0x00, 0x20)             // public_key length = 32
+	content = append(content, pubKey...)              // 32-byte X25519 public key
+	content = append(content, 0x00, 0x04)             // cipher_suites length = 4
 	content = append(content, 0x00, 0x01, 0x00, 0x01) // KDF=HKDF-SHA256(1), AEAD=AES-128-GCM(1)
-	content = append(content, 0x00)               // maximum_name_length = 0
+	content = append(content, 0x00)                   // maximum_name_length = 0
 	content = append(content, byte(len(publicName)))
 	content = append(content, publicName...)
 	content = append(content, 0x00, 0x00) // extensions length = 0
@@ -411,8 +411,9 @@ func validateECHConfigList(b []byte) bool {
 	return totalLen > 4 && totalLen+2 <= len(b) && b[2] == 0xfe && b[3] == 0x0d
 }
 
-// parseECHFromTXT extracts and validates an ECHConfigList from DNS TXT records
-// (supporting signed payloads "sig=...;data=<b64>", "ech=<b64>", or raw base64).
+// parseECHFromTXT accepts only authenticated custom TXT payloads. The verified
+// data may contain base64 or an ech=/psiroute-ech: prefix. Standard HTTPS DNS
+// records use parseECHFromDNS and do not require this custom signature.
 func parseECHFromTXT(txts []string, pubKeyHex string) ([]byte, bool) {
 	assembled := assembleChunkedTXTRecords(txts)
 	candidates := append([]string{assembled}, txts...)
@@ -421,9 +422,11 @@ func parseECHFromTXT(txts []string, pubKeyHex string) ([]byte, bool) {
 		if raw == "" {
 			continue
 		}
-		if verified, ok := verifySignedBootstrapPayload(raw, pubKeyHex); ok {
-			raw = verified
+		verified, ok := verifySignedBootstrapPayload(raw, pubKeyHex)
+		if !ok {
+			continue
 		}
+		raw = verified
 		if rest, ok := strings.CutPrefix(raw, "ech="); ok {
 			raw = strings.TrimSpace(rest)
 		} else if rest, ok := strings.CutPrefix(raw, "psiroute-ech:"); ok {

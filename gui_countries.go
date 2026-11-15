@@ -25,8 +25,8 @@ func (ui *gioUI) layoutCountriesDPITab(gtx layout.Context) layout.Dimensions {
 
 	masks := [5]struct{ id, title string }{
 		{"auto", "Авто (перебор)"},
-		{"quic", "QUIC v1 + ECH"},
-		{"masque", "MASQUE HTTP/3"},
+		{"quic", "QUIC-приманка"},
+		{"masque", "HTTP/3-приманка"},
 		{"bwg", "bash-warp-generator"},
 		{"dns", "DNS-запрос (EDNS0)"},
 	}

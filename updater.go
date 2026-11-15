@@ -11,6 +11,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -148,4 +150,61 @@ func (a *App) CheckUpdateViaTunnel(ctx context.Context, manifestURL, pubKeyHex s
 		return nil, err
 	}
 	return &m, nil
+}
+
+const maxUpdateBinaryBytes = 256 << 20
+
+// DownloadUpdateViaTunnel stages an authenticated release without replacing the
+// running executable. On failure the destination is preserved and temp removed.
+func (a *App) DownloadUpdateViaTunnel(ctx context.Context, manifest *UpdateManifest, pubKeyHex, destination string) error {
+	if err := manifest.VerifyManifestSignature(pubKeyHex); err != nil {
+		return err
+	}
+	if strings.TrimSpace(destination) == "" {
+		return errors.New("update staging destination is required")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, manifest.URL, nil)
+	if err != nil {
+		return err
+	}
+	client := a.tunnelHTTPClient(5 * time.Minute)
+	defer client.CloseIdleConnections()
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("update download HTTP %d", resp.StatusCode)
+	}
+	if resp.ContentLength > maxUpdateBinaryBytes {
+		return errors.New("update binary exceeds size limit")
+	}
+	file, err := os.CreateTemp(filepath.Dir(destination), ".psiroute-update-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	defer file.Close()
+	hash := sha256.New()
+	size, err := io.Copy(io.MultiWriter(file, hash), io.LimitReader(resp.Body, maxUpdateBinaryBytes+1))
+	if err != nil {
+		return err
+	}
+	if size == 0 || size > maxUpdateBinaryBytes {
+		return errors.New("invalid update binary size")
+	}
+	if hex.EncodeToString(hash.Sum(nil)) != strings.ToLower(strings.TrimSpace(manifest.SHA256)) {
+		return errors.New("update SHA-256 mismatch")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(file.Name(), destination)
 }

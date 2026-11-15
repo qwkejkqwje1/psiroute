@@ -74,7 +74,7 @@ func openTunDevice(a *App, mtu int, v6 bool) (tunDevice, error) {
 func setTunAdapterMTU(dev tunDevice, mtu int, v6 bool) error {
 	nt, ok := dev.(*tun.NativeTun)
 	if !ok || nt == nil {
-		return nil
+		return fmt.Errorf("TUN: unsupported adapter type %T", dev)
 	}
 	luid := winipcfg.LUID(nt.LUID())
 	fams := []winipcfg.AddressFamily{windows.AF_INET}
@@ -84,7 +84,7 @@ func setTunAdapterMTU(dev tunDevice, mtu int, v6 bool) error {
 	for _, f := range fams {
 		ipi, err := luid.IPInterface(f)
 		if err != nil {
-			continue
+			return fmt.Errorf("TUN: read IP interface family %d: %w", f, err)
 		}
 		if ipi.NLMTU == uint32(mtu) {
 			continue

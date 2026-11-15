@@ -79,3 +79,11 @@ func listRunningProcesses() []runningProc {
 
 func installBackgroundService() error   { return errTunUnsupported }
 func uninstallBackgroundService() error { return errTunUnsupported }
+
+func isRunningTests() bool {
+	if len(os.Args) == 0 {
+		return false
+	}
+	base := strings.ToLower(filepath.Base(os.Args[0]))
+	return strings.HasSuffix(base, ".test.exe") || strings.HasSuffix(base, ".test")
+}

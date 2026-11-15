@@ -67,7 +67,7 @@ func (ui *gioUI) subCard(gtx layout.Context, bg, borderCol color.NRGBA, inset un
 }
 
 func (ui *gioUI) label(gtx layout.Context, size unit.Sp, col color.NRGBA, weight font.Weight, txt string) layout.Dimensions {
-	l := material.Label(ui.th, size, txt)
+	l := material.Label(ui.th, size, privacyDisplay(txt, ui.privacyMode))
 	l.Color = col
 	l.Font.Weight = weight
 	return l.Layout(gtx)
@@ -111,7 +111,7 @@ func (ui *gioUI) flagButton(gtx layout.Context, btn *widget.Clickable, cc, txt s
 						}),
 						layout.Rigid(layout.Spacer{Width: unit.Dp(6)}.Layout),
 						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-							return ui.label(gtx, fontBody, fg, font.Medium, txt)
+							return ui.labelLine(gtx, fontBody, fg, font.Medium, txt)
 						}),
 					)
 				})
@@ -170,7 +170,7 @@ func (ui *gioUI) iconButton(gtx layout.Context, btn *widget.Clickable, icon, txt
 						return drawIcon(gtx, icon, unit.Dp(15), fg)
 					}
 					lbl := func(gtx layout.Context) layout.Dimensions {
-						return ui.label(gtx, fontBody, fg, font.Medium, txt)
+						return ui.labelLine(gtx, fontBody, fg, font.Medium, txt)
 					}
 					if icon == "" {
 						return lbl(gtx)
@@ -248,10 +248,10 @@ func (ui *gioUI) focusBtn(keyID string) *widget.Clickable {
 }
 
 // editorBox оборачивает любое поле ввода material.Editor (Раздел 1.2 ТЗ):
-// - клик по рамке/отступам контейнера ставит фокус в поле ввода (key.FocusCmd{Tag: ed});
-// - при активном фокусе рамка подсвечивается цветом акцента (ui.pal.acc);
-// - справа выводится компактная кнопка «Вставить» (чтение из Win32 буфера обмена + фокус),
-//   гарантирующая вставку текста при любой раскладке клавиатуры.
+//   - клик по рамке/отступам контейнера ставит фокус в поле ввода (key.FocusCmd{Tag: ed});
+//   - при активном фокусе рамка подсвечивается цветом акцента (ui.pal.acc);
+//   - справа выводится компактная кнопка «Вставить» (чтение из Win32 буфера обмена + фокус),
+//     гарантирующая вставку текста при любой раскладке клавиатуры.
 func (ui *gioUI) editorBox(gtx layout.Context, keyID string, ed *widget.Editor, hint string) layout.Dimensions {
 	pBtn := ui.pasteBtn(keyID)
 	fBtn := ui.focusBtn(keyID)
@@ -474,7 +474,7 @@ func (ui *gioUI) grid(gtx layout.Context, minCell unit.Dp, maxCols int, items []
 // twoCol places two columns side by side, or stacks the right column under the
 // left column when the window width is under 900dp (content width < 820dp).
 func (ui *gioUI) twoCol(gtx layout.Context, lw, rw float32, left, right layout.Widget) layout.Dimensions {
-	if ui.narrowWindow || gtx.Constraints.Max.X < gtx.Dp(600) {
+	if gtx.Constraints.Max.X < gtx.Dp(600) {
 		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 			layout.Rigid(left),
 			layout.Rigid(layout.Spacer{Height: space2}.Layout),
@@ -506,7 +506,7 @@ func dotWidget(gtx layout.Context, d unit.Dp, col color.NRGBA) layout.Dimensions
 }
 
 func (ui *gioUI) labelLine(gtx layout.Context, size unit.Sp, col color.NRGBA, weight font.Weight, txt string) layout.Dimensions {
-	l := material.Label(ui.th, size, txt)
+	l := material.Label(ui.th, size, privacyDisplay(txt, ui.privacyMode))
 	l.Color = col
 	l.Font.Weight = weight
 	l.MaxLines = 1
@@ -514,7 +514,7 @@ func (ui *gioUI) labelLine(gtx layout.Context, size unit.Sp, col color.NRGBA, we
 }
 
 func (ui *gioUI) monoLabel(gtx layout.Context, size unit.Sp, col color.NRGBA, txt string) layout.Dimensions {
-	l := material.Label(ui.th, size, txt)
+	l := material.Label(ui.th, size, privacyDisplay(txt, ui.privacyMode))
 	l.Color = col
 	l.Font.Typeface = "Go Mono"
 	l.MaxLines = 1
@@ -1152,7 +1152,7 @@ func (ui *gioUI) maintenanceButtons(gtx layout.Context, withQuit bool) layout.Di
 // ---------- Main Layout & Responsive Sidebar ----------
 
 func (ui *gioUI) Layout(gtx layout.Context) layout.Dimensions {
-	ui.narrowWindow = gtx.Constraints.Max.X < gtx.Dp(760)
+	ui.narrowWindow = gtx.Constraints.Max.X < gtx.Dp(1120)
 	paint.Fill(gtx.Ops, ui.pal.bg)
 
 	// ВАЖНО (Исправление бага с неработающими кликами в Gio v0.9):
@@ -1530,6 +1530,9 @@ func (ui *gioUI) layoutToastBanner(gtx layout.Context) layout.Dimensions {
 				}),
 				layout.Rigid(layout.Spacer{Width: space1}.Layout),
 				layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+					if ui.tab == 0 {
+						return ui.labelLine(gtx, fontSmall, fg, font.SemiBold, msg)
+					}
 					return ui.label(gtx, fontBody, fg, font.SemiBold, msg)
 				}),
 			)

@@ -548,17 +548,14 @@ func (a *App) tunnelAppAddr(c net.Conn, br *bufio.Reader, host, dstIP string, po
 	blackhole16K := is16KBBlackholeBlock(downB, upB, elapsed, err, clientFirst)
 	if (ob == obDirect || ob == obDesync) && (port == 443 || blackhole16K) && upB > 0 && elapsed < 30*time.Second && ((blocked && downB == 0) || blackhole16K) {
 		next := obPsiphon
-		reason := fmt.Sprintf("%s: сброс соединения (DPI)", ob)
+		reason := fmt.Sprintf("%s: соединение прервано до ответа", ob)
 		if blackhole16K {
-			// Блокировка ТСПУ на 16–32 КБ: DPI пропускает TLS Handshake, но глушит поток после 16 КБ.
-			// Сразу переводим домен в туннель (WARP или Psiphon) и уведомляем авто-тюнер DPI.
-			obfs.record(host, a.dpiMode(), false)
 			a.cfg.mu.Lock()
 			if a.cfg.Warp.Enabled {
 				next = obWarp
 			}
 			a.cfg.mu.Unlock()
-			reason = fmt.Sprintf("блокировка ТСПУ на 16–32 КБ (%d Б)", downB)
+			reason = fmt.Sprintf("прерывание передачи после %d Б", downB)
 		} else if ob == obDirect {
 			a.cfg.mu.Lock()
 			if a.cfg.Desync.Enabled {
@@ -612,37 +609,14 @@ func (a *App) relay(c net.Conn, br *bufio.Reader, up net.Conn, t *tracked) (erro
 			if n > 0 {
 				if first {
 					first = false
-					// Защита узкого канала Psiphon от торрентов (BitTorrent protocol / tracker announce):
-					// автоматически переводим P2P-трафик в Direct (или блокируем при включённом Kill Switch).
+					// P2P must not escape the selected tunnel through an implicit
+					// direct connection. Explicit direct routes remain usable.
 					if isBitTorrentTCP(buf[:n]) && t != nil {
-						_, host, port, _, curOb := a.stats.routeAndHost(t)
+						_, _, _, _, curOb := a.stats.routeAndHost(t)
 						if curOb == obPsiphon || isCountryOb(curOb) {
-							a.cfg.mu.Lock()
-							ks := a.cfg.Routing.KillSwitch
-							a.cfg.mu.Unlock()
-							if ks {
-								_ = curUp.Close()
-								errc <- res{false, errBlocked}
-								return
-							}
-							rctx, rcancel := context.WithTimeout(a.ctx, 8*time.Second)
-							if directConn, derr := dialDirect(rctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port))); derr == nil {
-								rcancel()
-								a.stats.setRoute(t, obDirect, "P2P/BitTorrent → Напрямую")
-								newCounted := &countConn{Conn: directConn, s: a.stats, t: t}
-								t.addCloser(newCounted)
-								upMu.Lock()
-								activeUp = newCounted
-								upMu.Unlock()
-								select {
-								case switchedUpCh <- newCounted:
-								default:
-								}
-								_ = curUp.Close()
-								curUp = newCounted
-							} else {
-								rcancel()
-							}
+							errc <- res{false, errBlocked}
+							_ = curUp.Close()
+							return
 						}
 					}
 					if s := parseSNI(buf[:n]); s != "" {
@@ -678,6 +652,9 @@ func (a *App) relay(c net.Conn, br *bufio.Reader, up net.Conn, t *tracked) (erro
 										curUp = newCounted
 									} else {
 										rcancel()
+										_ = curUp.Close()
+										errc <- res{false, derr}
+										return
 									}
 								}
 							}
@@ -820,14 +797,13 @@ func dialHappyEyeballs(ctx context.Context, dial dialFunc, addrs []string) (net.
 	return nil, lastErr
 }
 
-// is16KBBlackholeBlock распознаёт характерную блокировку ТСПУ («16KB block»),
-// когда после успешного TLS Handshake сервер передаёт 14–36 КБ данных и соединение
-// обрывается или зависает по таймауту без закрытия со стороны клиента.
+// is16KBBlackholeBlock identifies an interrupted transfer in a size window.
+// This is a recovery hint, not evidence of DPI; normal EOF is not a failure.
 func is16KBBlackholeBlock(downBytes, upBytes int64, elapsed time.Duration, err error, clientClosedFirst bool) bool {
 	if upBytes <= 0 || downBytes < 14*1024 || downBytes > 36*1024 || elapsed > 30*time.Second {
 		return false
 	}
-	return !clientClosedFirst || isConnReset(err) || isTimeout(err)
+	return !clientClosedFirst && (isConnReset(err) || isTimeout(err))
 }
 
 // isBitTorrentTCP определяет сигнатуру протокола BitTorrent (\x13BitTorrent protocol)
