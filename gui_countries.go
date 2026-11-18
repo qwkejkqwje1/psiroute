@@ -22,6 +22,10 @@ func (ui *gioUI) layoutCountriesDPITab(gtx layout.Context) layout.Dimensions {
 	dpiMode, _ := obfsMap["mode"].(string)
 	singleProc, _ := st["single_process_countries"].(bool)
 	probeRun, _ := st["probe_running"].(bool)
+	warpMask, _ := st["warp_mask"].(string)
+	if warpMask == "" {
+		warpMask = "auto"
+	}
 
 	masks := [5]struct{ id, title string }{
 		{"auto", "Авто (перебор)"},
@@ -107,8 +111,9 @@ func (ui *gioUI) layoutCountriesDPITab(gtx layout.Context) layout.Dimensions {
 						var ws []layout.Widget
 						for i := range masks {
 							idx := i
+							active := warpMask == masks[idx].id
 							ws = append(ws, func(gtx layout.Context) layout.Dimensions {
-								return ui.pillButton(gtx, &ui.warpMaskBtns[idx], masks[idx].title, false, "")
+								return ui.pillButton(gtx, &ui.warpMaskBtns[idx], masks[idx].title, active, "warn")
 							})
 						}
 						return flowWrap(gtx, space1, space1, ws...)

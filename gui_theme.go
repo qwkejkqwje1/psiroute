@@ -89,28 +89,28 @@ func paletteByTheme(theme string) gioPalette {
 			tealSoft: rgba(0x14B8A6, 36),
 		}
 	default:
-		// Tactical Minimal / Obsidian Dark (#090B10 bg, #11151F card, #161C28 card2)
+		// Obsidian Pro v2.2 (#080B12 bg, #0B0F18 side, #111623 card, #161D2E card2)
 		return gioPalette{
 			dark:     true,
 			themeID:  "obsidian",
-			bg:       rgb(0x090B10),
-			side:     rgb(0x0C0F17),
-			card:     rgb(0x11151F),
-			card2:    rgb(0x161C28),
-			hover:    rgb(0x1E2638),
-			border:   rgb(0x1F293D),
+			bg:       rgb(0x080B12),
+			side:     rgb(0x0B0F18),
+			card:     rgb(0x111623),
+			card2:    rgb(0x161D2E),
+			hover:    rgb(0x1E273D),
+			border:   rgb(0x232E47),
 			borderHi: rgb(0x6366F1),
-			text:     rgb(0xE2E8F0),
+			text:     rgb(0xEDF2F7),
 			mut:      rgb(0x94A3B8),
 			dim:      rgb(0x64748B),
 			acc:      rgb(0x6366F1),
-			accSoft:  rgba(0x6366F1, 38),
+			accSoft:  rgba(0x6366F1, 40),
 			ok:       rgb(0x10B981),
 			okSoft:   rgba(0x10B981, 36),
 			warn:     rgb(0xF59E0B),
 			warnSoft: rgba(0xF59E0B, 36),
-			err:      rgb(0xEF4444),
-			errSoft:  rgba(0xEF4444, 36),
+			err:      rgb(0xF43F5E),
+			errSoft:  rgba(0xF43F5E, 36),
 			vio:      rgb(0x8B5CF6),
 			vioSoft:  rgba(0x8B5CF6, 40),
 			teal:     rgb(0x06B6D4),
@@ -199,6 +199,8 @@ func (ui *gioUI) statusColor(pState string) color.NRGBA {
 		return ui.pal.ok
 	case "connecting", "reconnecting":
 		return ui.pal.warn
+	case "stopping":
+		return ui.pal.err
 	case "error":
 		return ui.pal.err
 	}
@@ -280,6 +282,8 @@ func stateTitle(s string) string {
 		return "Подключение…"
 	case "reconnecting":
 		return "Переподключение…"
+	case "stopping":
+		return "Отключение…"
 	case "error":
 		return "Ошибка связи"
 	}

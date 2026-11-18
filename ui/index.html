@@ -86,7 +86,7 @@ code{background:var(--card2);border:1px solid var(--line);padding:1px 6px;border
 .st-connecting .power,.st-reconnecting .power{border-color:var(--acc)}
 .st-connecting .power svg,.st-reconnecting .power svg{stroke:var(--acc)}
 .st-connecting .ring,.st-reconnecting .ring{border-color:var(--acc) transparent transparent transparent;animation:spin 1s linear infinite}
-.st-error .power{border-color:var(--err);box-shadow:0 0 0 9px var(--err-s)}.st-error .power svg{stroke:var(--err)}
+.st-stopping .power,.st-error .power{border-color:var(--err);box-shadow:0 0 0 9px var(--err-s)}.st-stopping .power svg,.st-error .power svg{stroke:var(--err)}
 @keyframes spin{to{transform:rotate(360deg)}}
 .state{font-size:30px;line-height:1.2;font-weight:700;margin:0;letter-spacing:-.4px}
 .st-connected .state{color:var(--ok)}.st-error .state{color:var(--err)}
@@ -827,9 +827,23 @@ $('sAuto').onchange = async () => { const j = await post('/api/autostart/' + ($(
 function psi(a) { return post('/api/psiphon/' + a); }
 qa('[data-psi]').forEach(b => b.onclick = async () => { const j = await psi(b.dataset.psi); if (j && j.wait) { toast('Подождите ' + j.wait + ' с: каждое нажатие обрывает текущую попытку'); return; } toast({ next: 'Пробую другой способ подключения', restart: 'Psiphon переподключается', stop: 'Psiphon отключён', start: 'Подключаюсь' }[b.dataset.psi] || 'Готово'); });
 qa('[data-go]').forEach(b => b.onclick = () => go(b.dataset.go));
-$('power').onclick = () => {
-  const st = S && S.psiphon ? S.psiphon.state : 'stopped';
-  if (st === 'stopped' || st === 'error') { psi('start'); toast('Подключаюсь к Psiphon…'); } else { psi('stop'); toast('Psiphon отключён'); }
+let powerBusy = false;
+$('power').onclick = async () => {
+  if (powerBusy) return;
+  powerBusy = true;
+  try {
+    const st = S && S.psiphon ? S.psiphon.state : 'stopped';
+    if (st === 'stopped' || st === 'error') {
+      toast('Подключаюсь к Psiphon VPN…');
+      await psi('start');
+    } else {
+      toast('Отключаю VPN-соединение…');
+      await psi('stop');
+      toast('VPN-соединение отключено', 'ok');
+    }
+  } finally {
+    powerBusy = false;
+  }
 };
 async function newNode() { const j = await psi('newnode'); if (j && j.wait) { toast('Подождите ' + j.wait + ' с: узел только что менялся'); return; } toast('Меняю узел — трафик пока идёт через запасной туннель', 'ok'); }
 $('hNewNode').onclick = newNode; $('nNew').onclick = newNode;

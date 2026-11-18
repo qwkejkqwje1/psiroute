@@ -422,10 +422,7 @@ func (ui *gioUI) layoutListsCatalogCard(gtx layout.Context) layout.Dimensions {
 						res, err := ui.apiCall("GET", "/api/lists/"+url.PathEscape(listID)+"/content", nil)
 						if err == nil && res != nil {
 							if txt, ok := res["content"].(string); ok {
-								ui.listContentEditor.SetText(txt)
-								if ui.w != nil {
-									ui.w.Invalidate()
-								}
+								ui.queueEditorText(&ui.listContentEditor, txt)
 							}
 						}
 					}()

@@ -695,9 +695,9 @@ func (d *desktop) command(id int) {
 		openBrowser(d.a.uiURL())
 	case menuConnect:
 		if d.a.psi.running() {
-			d.a.psi.Stop()
+			go d.a.DisconnectVPN()
 		} else {
-			d.a.psi.Start()
+			d.a.ConnectVPN()
 		}
 	case menuPause5:
 		d.a.SetPause(5)

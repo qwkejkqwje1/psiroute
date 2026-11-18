@@ -1038,16 +1038,16 @@ func (ui *gioUI) favoriteCountryChips(gtx layout.Context, cfgReg string) layout.
 	var ws []layout.Widget
 	ws = append(ws, func(gtx layout.Context) layout.Dimensions {
 		active := cfgReg == "" || strings.EqualFold(cfgReg, "auto")
-		return ui.flagButton(gtx, &ui.countryBtns[0], "", "Авто (лучшая)", active, "")
+		return ui.flagButton(gtx, &ui.favCountryBtns[0], "", "Авто (лучшая)", active, "")
 	})
 	for _, cc := range favs {
 		idx := nativeCountryIndex(cc)
-		if idx <= 0 || idx >= len(ui.countryBtns) {
+		if idx <= 0 || idx >= len(ui.favCountryBtns) {
 			continue
 		}
 		active := strings.EqualFold(cfgReg, cc)
 		ws = append(ws, func(gtx layout.Context) layout.Dimensions {
-			return ui.flagButton(gtx, &ui.countryBtns[idx], cc, "★ "+nativeCountryNames[idx], active, "")
+			return ui.flagButton(gtx, &ui.favCountryBtns[idx], cc, "★ "+nativeCountryNames[idx], active, "")
 		})
 	}
 	return flowWrap(gtx, space1, space1, ws...)
@@ -1059,7 +1059,7 @@ func (ui *gioUI) compactCountryRow(gtx layout.Context, cfgReg string) layout.Dim
 	var ws []layout.Widget
 	ws = append(ws, func(gtx layout.Context) layout.Dimensions {
 		active := cfgReg == "" || strings.EqualFold(cfgReg, "auto")
-		return ui.flagButton(gtx, &ui.countryBtns[0], "", "Авто (лучшая)", active, "")
+		return ui.flagButton(gtx, &ui.favCountryBtns[0], "", "Авто (лучшая)", active, "")
 	})
 	shown := 0
 	for _, cc := range favs {
@@ -1067,14 +1067,14 @@ func (ui *gioUI) compactCountryRow(gtx layout.Context, cfgReg string) layout.Dim
 			break
 		}
 		idx := nativeCountryIndex(cc)
-		if idx <= 0 || idx >= len(ui.countryBtns) {
+		if idx <= 0 || idx >= len(ui.favCountryBtns) {
 			continue
 		}
 		shown++
 		lbl := cnameShort(cc)
 		active := strings.EqualFold(cfgReg, cc)
 		ws = append(ws, func(gtx layout.Context) layout.Dimensions {
-			return ui.flagButton(gtx, &ui.countryBtns[idx], cc, lbl, active, "")
+			return ui.flagButton(gtx, &ui.favCountryBtns[idx], cc, lbl, active, "")
 		})
 	}
 	ws = append(ws, func(gtx layout.Context) layout.Dimensions {
@@ -1187,7 +1187,8 @@ func (ui *gioUI) maintenanceButtons(gtx layout.Context, withQuit bool) layout.Di
 // ---------- Main Layout & Responsive Sidebar ----------
 
 func (ui *gioUI) Layout(gtx layout.Context) layout.Dimensions {
-	ui.narrowWindow = gtx.Constraints.Max.X < gtx.Dp(1120)
+	ui.applyPendingUIUpdates()
+	ui.narrowWindow = gtx.Constraints.Max.X < gtx.Dp(1020)
 	paint.Fill(gtx.Ops, ui.pal.bg)
 
 	// ВАЖНО (Исправление бага с неработающими кликами в Gio v0.9):
@@ -1602,21 +1603,23 @@ func (ui *gioUI) layoutToastBanner(gtx layout.Context) layout.Dimensions {
 	})
 }
 
-// layoutSubTabBar рисует компактный переключатель подвкладок внутри 4 основных разделов меню.
+// layoutSubTabBar рисует современный сегмент-переключатель подвкладок внутри рельсы card2.
 func (ui *gioUI) layoutSubTabBar(gtx layout.Context, tabIdx int, titles []string) layout.Dimensions {
 	return layout.Inset{Bottom: unit.Dp(10)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		var children []layout.FlexChild
-		for i, t := range titles {
-			idx := i
-			title := t
-			active := ui.subTabs[tabIdx] == idx
-			if i > 0 {
-				children = append(children, layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout))
+		return ui.subCard(gtx, ui.pal.card, ui.pal.border, unit.Dp(4), func(gtx layout.Context) layout.Dimensions {
+			var children []layout.FlexChild
+			for i, t := range titles {
+				idx := i
+				title := t
+				active := ui.subTabs[tabIdx] == idx
+				if i > 0 {
+					children = append(children, layout.Rigid(layout.Spacer{Width: unit.Dp(4)}.Layout))
+				}
+				children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return ui.segRouteButton(gtx, &ui.subTabBtns[tabIdx][idx], title, active, "primary")
+				}))
 			}
-			children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return ui.pillButton(gtx, &ui.subTabBtns[tabIdx][idx], title, active, "primary")
-			}))
-		}
-		return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx, children...)
+			return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx, children...)
+		})
 	})
 }

@@ -47,9 +47,12 @@ type gioUI struct {
 	rulesData    map[string]any
 	diagRes      map[string]any
 	psiStatsData map[string]any
-	statusToast  string
-	toastErr     bool
-	toastUntil   time.Time
+	statusToast       string
+	toastErr          bool
+	toastUntil        time.Time
+	pendingTheme      string
+	pendingEditorText map[*widget.Editor]string
+	powerBusy         atomic.Bool
 
 	// Navigation tabs (5 разделов):
 	// 0=Главная, 1=Маршруты, 2=Потоки (активна только при клике), 3=Сеть, 4=Журнал и Система
@@ -133,6 +136,7 @@ type gioUI struct {
 	pipePsiBtn       widget.Clickable
 	pipePopup        int // 0=none, 1=capture selector, 2=country selector
 	captureModeBtns  [3]widget.Clickable
+	tunBannerBtn     widget.Clickable
 	repairConnBtn    widget.Clickable
 	pause5Btn        widget.Clickable
 	pause15Btn       widget.Clickable
@@ -152,6 +156,8 @@ type gioUI struct {
 	liveAppBtns      [4]widget.Clickable
 	liveAppNames     [4]string
 	liveAppRoutes    [4]string
+	liveAppHosts     [4]string
+	liveAppAlerts    [4]bool
 	resetStatsBtn    widget.Clickable
 
 	// Rules Constructor
@@ -217,8 +223,9 @@ type gioUI struct {
 	listTrustCancelBtn     widget.Clickable
 
 	// Countries, DPI & WARP Mask
-	countryBtns  [28]widget.Clickable
-	favStarBtns  [28]widget.Clickable
+	countryBtns    [28]widget.Clickable
+	favCountryBtns [28]widget.Clickable
+	favStarBtns    [28]widget.Clickable
 	dpiModeBtns  [7]widget.Clickable
 	warpMaskBtns [5]widget.Clickable
 
@@ -328,7 +335,8 @@ func runGioWindow(dataDir, uiURL string, parentPID int) {
 		selectedRuleOb: obPsiphon,
 		ruleAlways:     true,
 		editingRuleIdx: -1,
-		appActionBtns:  map[string]*widget.Clickable{},
+		pendingEditorText: map[*widget.Editor]string{},
+		appActionBtns:     map[string]*widget.Clickable{},
 		listUseBtns:    map[string]*widget.Clickable{},
 		listActionBtns: map[string]*widget.Clickable{},
 		ruleToggleBtns: map[int]*widget.Clickable{},
@@ -376,7 +384,7 @@ func runGioWindow(dataDir, uiURL string, parentPID int) {
 		w := new(app.Window)
 		w.Option(
 			app.Title(windowTitle),
-			app.Size(unit.Dp(1040), unit.Dp(680)),
+			app.Size(unit.Dp(1080), unit.Dp(700)),
 			app.MinSize(unit.Dp(960), unit.Dp(640)),
 		)
 		ui.w = w
@@ -472,8 +480,8 @@ func (ui *gioUI) fetchAll(full bool) {
 			st["log"] = ui.cachedLogs
 		}
 		ui.state = st
-		if thm, ok := st["ui_theme"].(string); ok && thm != "" && thm != ui.pal.themeID {
-			ui.pal = paletteByTheme(thm)
+		if thm, ok := st["ui_theme"].(string); ok && thm != "" {
+			ui.pendingTheme = thm
 		}
 		psiMap, _ := st["psiphon"].(map[string]any)
 		pState, _ := psiMap["state"].(string)
@@ -565,15 +573,18 @@ func (ui *gioUI) apiCall(method, path string, body any) (map[string]any, error) 
 		bodyBytes, _ = json.Marshal(body)
 	}
 	doOnce := func() (*http.Response, error) {
+		ui.mu.Lock()
+		base, tok := ui.apiBase, ui.token
+		ui.mu.Unlock()
 		var rd io.Reader
 		if bodyBytes != nil {
 			rd = bytes.NewReader(bodyBytes)
 		}
-		req, err := http.NewRequest(method, ui.apiBase+path, rd)
+		req, err := http.NewRequest(method, base+path, rd)
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("X-Psiroute", ui.token)
+		req.Header.Set("X-Psiroute", tok)
 		if bodyBytes != nil {
 			req.Header.Set("Content-Type", "application/json")
 		}
@@ -585,9 +596,14 @@ func (ui *gioUI) apiCall(method, path string, body any) (map[string]any, error) 
 			resp.Body.Close()
 		}
 		// Перечитываем актуальный адрес и токен из psiroute.instance (на случай перезапуска ядра или UAC-эскалации)
-		if newBase, newTok := resolveAPIConfig(ui.dataDir, ui.apiBase); newTok != "" {
+		ui.mu.Lock()
+		curBase := ui.apiBase
+		ui.mu.Unlock()
+		if newBase, newTok := resolveAPIConfig(ui.dataDir, curBase); newTok != "" {
+			ui.mu.Lock()
 			ui.apiBase = newBase
 			ui.token = newTok
+			ui.mu.Unlock()
 			resp, err = doOnce()
 		}
 	}
@@ -632,9 +648,80 @@ func (ui *gioUI) setToast(msg string, isErr bool) {
 	}
 }
 
+func (ui *gioUI) queueEditorText(ed *widget.Editor, txt string) {
+	if ed == nil {
+		return
+	}
+	ui.mu.Lock()
+	if ui.pendingEditorText == nil {
+		ui.pendingEditorText = map[*widget.Editor]string{}
+	}
+	ui.pendingEditorText[ed] = txt
+	ui.mu.Unlock()
+	if ui.w != nil {
+		ui.w.Invalidate()
+	}
+}
+
+func (ui *gioUI) applyPendingUIUpdates() {
+	ui.mu.Lock()
+	thm := ui.pendingTheme
+	ui.pendingTheme = ""
+	var edUpdates map[*widget.Editor]string
+	if len(ui.pendingEditorText) > 0 {
+		edUpdates = ui.pendingEditorText
+		ui.pendingEditorText = map[*widget.Editor]string{}
+	}
+	ui.mu.Unlock()
+	if thm != "" && thm != ui.pal.themeID {
+		ui.pal = paletteByTheme(thm)
+	}
+	for ed, txt := range edUpdates {
+		ed.SetText(txt)
+	}
+}
+
+func (ui *gioUI) togglePower(pState string) {
+	if !ui.powerBusy.CompareAndSwap(false, true) {
+		return
+	}
+	act := "stop"
+	toastStart := "Отключаю VPN-соединение…"
+	toastDone := "VPN-соединение отключено"
+	if pState == "stopped" || pState == "error" || pState == "" {
+		act = "start"
+		toastStart = "Подключаюсь к Psiphon VPN…"
+		toastDone = ""
+	}
+	ui.setToast(toastStart, false)
+	go func() {
+		defer ui.powerBusy.Store(false)
+		res, err := ui.apiCall("POST", "/api/psiphon/"+act, nil)
+		if err != nil {
+			ui.setToast("Ошибка: "+err.Error(), true)
+		} else if res != nil {
+			if ok, _ := res["ok"].(bool); !ok {
+				if errMsg, _ := res["error"].(string); errMsg != "" {
+					ui.setToast(errMsg, true)
+				}
+			} else if toastDone != "" {
+				ui.setToast(toastDone, false)
+			}
+		}
+		ui.fetchAll(true)
+	}()
+}
+
 func (ui *gioUI) appBtn(key string) *widget.Clickable {
 	ui.mu.Lock()
 	defer ui.mu.Unlock()
+	if len(ui.appActionBtns) > 600 {
+		for k := range ui.appActionBtns {
+			if strings.HasPrefix(k, "strm|") {
+				delete(ui.appActionBtns, k)
+			}
+		}
+	}
 	b := ui.appActionBtns[key]
 	if b == nil {
 		b = new(widget.Clickable)
@@ -688,8 +775,6 @@ func (ui *gioUI) handleHotkeys(gtx layout.Context, pState string) {
 			key.Filter{Name: "3", Required: key.ModCtrl},
 			key.Filter{Name: "4", Required: key.ModCtrl},
 			key.Filter{Name: "5", Required: key.ModCtrl},
-			key.Filter{Name: "6", Required: key.ModCtrl},
-			key.Filter{Name: "7", Required: key.ModCtrl},
 		)
 		if !ok {
 			break
@@ -699,30 +784,33 @@ func (ui *gioUI) handleHotkeys(gtx layout.Context, pState string) {
 			continue
 		}
 		switch ke.Name {
-		case "1", "2", "3", "4", "5", "6", "7":
+		case "1", "2", "3", "4", "5":
 			idx := int(ke.Name[0] - '1')
 			if idx >= 0 && idx < len(navTitles) {
 				ui.tab = idx
 				go ui.fetchAll(true)
 			}
 		case key.NameReturn, key.NameEnter:
-			act := "stop"
-			if pState == "stopped" || pState == "error" || pState == "" {
-				act = "start"
-			}
-			ui.doAsync("Psiphon: "+act, func() (map[string]any, error) {
-				return ui.apiCall("POST", "/api/psiphon/"+act, nil)
-			})
+			ui.togglePower(pState)
 		case "F", "f":
 			switch ui.tab {
 			case 0:
 				gtx.Execute(key.FocusCmd{Tag: &ui.homeRuleEditor})
 			case 1:
-				gtx.Execute(key.FocusCmd{Tag: &ui.listSearchEditor})
+				switch ui.subTabs[1] {
+				case 1:
+					gtx.Execute(key.FocusCmd{Tag: &ui.appSearch})
+				case 2:
+					gtx.Execute(key.FocusCmd{Tag: &ui.listSearchEditor})
+				default:
+					gtx.Execute(key.FocusCmd{Tag: &ui.ruleFilterEditor})
+				}
 			case 2:
-				gtx.Execute(key.FocusCmd{Tag: &ui.appSearch})
-			case 5:
-				gtx.Execute(key.FocusCmd{Tag: &ui.diagEditor})
+				gtx.Execute(key.FocusCmd{Tag: &ui.streamSearchEditor})
+			case 4:
+				if ui.subTabs[4] == 2 {
+					gtx.Execute(key.FocusCmd{Tag: &ui.diagEditor})
+				}
 			}
 		}
 	}
@@ -782,10 +870,10 @@ func (ui *gioUI) submitListForm(confirmTrust bool) {
 		ui.listPreviewData = nil
 		ui.listTrustConfirmHost = ""
 		ui.mu.Unlock()
-		ui.listIDEditor.SetText("")
-		ui.listTitleEditor.SetText("")
-		ui.listURLEditor.SetText("")
-		ui.listContentEditor.SetText("")
+		ui.queueEditorText(&ui.listIDEditor, "")
+		ui.queueEditorText(&ui.listTitleEditor, "")
+		ui.queueEditorText(&ui.listURLEditor, "")
+		ui.queueEditorText(&ui.listContentEditor, "")
 		ui.setToast("Список сохранён", false)
 		ui.fetchAll(true)
 	}()
@@ -847,7 +935,7 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 	// Кнопки выбора режима перехвата трафика из визуального пайплайна (Весь ПК [TUN] / Только браузеры / Ручной прокси).
 	// ВАЖНО (Аудит 2): переключение способа захвата меняет ТОЛЬКО состояние TUN и Системного прокси
 	// и НИКОГДА не сбрасывает выбранный пользователем глобальный сценарий Routing.Mode (например, "rules").
-	if ui.captureModeBtns[0].Clicked(gtx) {
+	if ui.captureModeBtns[0].Clicked(gtx) || ui.tunBannerBtn.Clicked(gtx) {
 		ui.pipePopup = 0
 		ui.doAsync("Перехват: Весь ПК (режим TUN)", func() (map[string]any, error) {
 			_, _ = ui.apiCall("POST", "/api/sysproxy/off", nil)
@@ -916,12 +1004,20 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 			}
 		}
 	}
-	// Клик по активному процессу в нижней полосе Главной в 1 клик переключает его маршрут
+	// Клик по элементу в нижней полосе Главной:
+	//   - ТСПУ-дроп -> добавляет точечное правило для домена (host -> psiphon), не трогая весь браузер .exe
+	//   - Активный процесс -> циклически переключает его маршрут
 	for i := range ui.liveAppBtns {
 		if ui.liveAppBtns[i].Clicked(gtx) {
 			exe := ui.liveAppNames[i]
 			cur := ui.liveAppRoutes[i]
-			if exe != "" {
+			host := ui.liveAppHosts[i]
+			isAlert := ui.liveAppAlerts[i]
+			if isAlert && host != "" {
+				ui.doAsync(fmt.Sprintf("Правило %s → Psiphon VPN", host), func() (map[string]any, error) {
+					return ui.apiCall("POST", "/api/rules/add", map[string]any{"tokens": host, "outbound": obPsiphon, "always": true})
+				})
+			} else if exe != "" {
 				nextOb := obPsiphon
 				switch cur {
 				case "", obAuto:
@@ -959,13 +1055,7 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 	}
 
 	if ui.powerBtn.Clicked(gtx) {
-		act := "stop"
-		if pState == "stopped" || pState == "error" || pState == "" {
-			act = "start"
-		}
-		ui.doAsync("Psiphon: "+act, func() (map[string]any, error) {
-			return ui.apiCall("POST", "/api/psiphon/"+act, nil)
-		})
+		ui.togglePower(pState)
 	}
 	if ui.newNodeBtn.Clicked(gtx) {
 		ui.doAsync("Меняю сервер Psiphon…", func() (map[string]any, error) {
@@ -1454,7 +1544,9 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 
 	// Countries, DPI & WARP Mask events
 	for i := range ui.countryBtns {
-		if i < len(nativeCountries) && ui.countryBtns[i].Clicked(gtx) {
+		clicked := ui.countryBtns[i].Clicked(gtx) || ui.favCountryBtns[i].Clicked(gtx)
+		if i < len(nativeCountries) && clicked {
+			ui.pipePopup = 0
 			reg := nativeCountries[i]
 			ui.doAsync("Страна выхода: "+nativeCountryNames[i], func() (map[string]any, error) {
 				return ui.apiCall("POST", "/api/psi/region", map[string]any{"region": reg})
@@ -1511,7 +1603,7 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 			ui.doAsync("Проверяю и импортирую записи серверов Psiphon…", func() (map[string]any, error) {
 				res, err := ui.apiCall("POST", "/api/psiphon/server-entries", map[string]any{"data": raw})
 				if err == nil && res != nil && res["ok"] == true {
-					ui.serverEntriesEditor.SetText("")
+					ui.queueEditorText(&ui.serverEntriesEditor, "")
 					addF, _ := res["added"].(float64)
 					dupF, _ := res["duplicates"].(float64)
 					badF, _ := res["invalid"].(float64)

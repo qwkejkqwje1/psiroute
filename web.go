@@ -353,9 +353,9 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		case "start":
-			a.psi.Start()
+			a.ConnectVPN()
 		case "stop":
-			a.psi.Stop()
+			a.DisconnectVPN()
 		case "restart":
 			go a.psi.Restart()
 		case "next":
@@ -1543,9 +1543,9 @@ func (a *App) processesAPI(w http.ResponseWriter, r *http.Request) {
 	case "psiphon":
 		switch req.Action {
 		case "start":
-			a.psi.Start()
+			a.ConnectVPN()
 		case "stop":
-			a.psi.Stop()
+			a.DisconnectVPN()
 		case "restart":
 			go a.psi.Restart()
 		case "newnode":

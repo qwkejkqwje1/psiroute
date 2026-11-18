@@ -210,6 +210,7 @@ type Psi struct {
 	confirmedEgress     string
 	cur                 atomic.Pointer[psiphon.Controller]
 	standby             atomic.Pointer[psiphon.Controller]
+	userStopped         atomic.Bool
 	dialFails           atomic.Int32
 	lastCheck           atomic.Int64
 	notes               chan psiNotice
@@ -317,9 +318,14 @@ func (p *Psi) set(f func()) {
 
 // ---- control ----
 
+func (p *Psi) isUserStopped() bool {
+	return p != nil && p.userStopped.Load()
+}
+
 func (p *Psi) Start() {
 	p.opMu.Lock()
 	defer p.opMu.Unlock()
+	p.userStopped.Store(false)
 	p.mu.Lock()
 	if p.cancel != nil {
 		p.mu.Unlock()
@@ -351,20 +357,41 @@ func (p *Psi) Start() {
 }
 
 func (p *Psi) Stop() {
+	p.stopInternal(true)
+}
+
+func (p *Psi) stopInternal(manual bool) {
 	p.opMu.Lock()
 	defer p.opMu.Unlock()
+	if manual {
+		p.userStopped.Store(true)
+	}
+	p.cur.Store(nil)
+	p.standby.Store(nil)
 	p.mu.Lock()
 	cancel, done := p.cancel, p.done
 	p.cancel = nil
+	if cancel != nil {
+		p.state = "stopping"
+	} else {
+		p.state = "stopped"
+		p.tunnels = 0
+		p.since = time.Time{}
+	}
 	p.mu.Unlock()
 	if cancel == nil {
+		if p.app != nil {
+			p.app.tun.refresh()
+		}
 		return
 	}
 	cancel()
 	select {
 	case <-done:
-	case <-time.After(10 * time.Second):
+	case <-time.After(5 * time.Second):
 	}
+	p.cur.Store(nil)
+	p.standby.Store(nil)
 	p.mu.Lock()
 	if p.desyncLn != nil {
 		_ = p.desyncLn.Close()
@@ -425,7 +452,7 @@ func (p *Psi) ensureLocalDesyncProxy() string {
 func (p *Psi) Restart() {
 	p.restartMu.Lock()
 	defer p.restartMu.Unlock()
-	p.Stop()
+	p.stopInternal(false)
 	p.Start()
 }
 
@@ -843,13 +870,21 @@ func (p *Psi) attemptOnce(ctx context.Context, s strategyDef, timeout int) (conn
 		close(runDone)
 	}()
 	defer func() {
-		// Graceful handover: keep standby reference briefly if another controller takes over
-		p.standby.Store(ctl)
+		// Graceful handover only on automatic rotation; manual Stop drops standby immediately.
+		if !p.isUserStopped() {
+			p.standby.Store(ctl)
+		} else {
+			p.standby.CompareAndSwap(ctl, nil)
+		}
 		p.cur.CompareAndSwap(ctl, nil)
 		cancel()
+		waitDur := 8 * time.Second
+		if p.isUserStopped() {
+			waitDur = 3 * time.Second
+		}
 		select {
 		case <-runDone:
-		case <-time.After(8 * time.Second):
+		case <-time.After(waitDur):
 		}
 		p.standby.CompareAndSwap(ctl, nil)
 		p.set(func() { p.tunnels = 0 })
@@ -1826,6 +1861,7 @@ func (p *Psi) view() map[string]any {
 		"network_id":       netID,
 		"imported_entries": p.importedServerEntriesCount(),
 		"balanced_dials":   p.balancedDials.Load(),
+		"user_stopped":     p.isUserStopped(),
 	}
 }
 

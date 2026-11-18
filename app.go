@@ -559,6 +559,55 @@ func (a *App) setSysProxy(on bool) error {
 	return nil
 }
 
+// ConnectVPN запускает Psiphon VPN по кнопке Пуск, снимая ручную остановку и паузу.
+func (a *App) ConnectVPN() {
+	if a == nil {
+		return
+	}
+	if a.IsPaused() {
+		a.SetPause(0)
+	}
+	if a.psi != nil {
+		a.psi.Start()
+	}
+	if a.router != nil {
+		a.router.InvalidateRules()
+	}
+}
+
+// DisconnectVPN полностью отключает VPN-соединение по кнопке Пуск:
+// останавливает основной Psiphon и фоновые процессы стран, запрещает авто-рестарт
+// из роутера (userStopped=true), сбрасывает кэш маршрутов и немедленно закрывает
+// активные VPN-сессии.
+func (a *App) DisconnectVPN() int {
+	if a == nil {
+		return 0
+	}
+	if a.psi != nil {
+		a.psi.Stop()
+	}
+	if a.countries != nil {
+		a.countries.StopAll()
+	}
+	if a.router != nil {
+		a.router.InvalidateRules()
+	}
+	closed := 0
+	if a.stats != nil {
+		closed = a.stats.closeAffectedSessions(func(t *tracked) bool {
+			if t == nil {
+				return false
+			}
+			_, _, _, _, curOb := a.stats.routeAndHost(t)
+			return curOb == obPsiphon || isCountryOb(curOb)
+		})
+	}
+	if closed > 0 {
+		logf("info", "VPN отключён по кнопке Пуск (закрыто активных VPN-сессий: %d)", closed)
+	}
+	return closed
+}
+
 // onRulesChanged принудительно сбрасывает кэш маршрутных решений (routeCache),
 // кэш прямых A/AAAA ответов (сохраняя таблицу FakeIP и RevDNS!) и немедленно
 // закрывает активные TCP/UDP соединения, чей маршрут изменился или заблокирован.
@@ -624,6 +673,7 @@ func (a *App) stateCompact(compact bool) map[string]any {
 	dnsOn := a.cfg.DNS.Enabled
 	localDNSAddr := a.cfg.DNS.LocalAddr
 	warpOn := a.cfg.Warp.Enabled
+	warpMask := a.cfg.Warp.Mask
 	uiMode := a.cfg.General.UIMode
 	uiTheme := a.cfg.General.UITheme
 	favCountries := append([]string(nil), a.cfg.Psiphon.FavoriteCountries...)
@@ -652,7 +702,7 @@ func (a *App) stateCompact(compact bool) map[string]any {
 	return map[string]any{
 		"version": version, "mode": mode, "listen": listen, "ui": ui, "sysproxy": sys,
 		"share_on": shareOn, "dns_on": dnsOn, "local_dns_on": localDNSOn, "local_dns_addr": localDNSAddr,
-		"warp_on": warpOn, "bypass_lan": bypassLAN, "block_quic": blockQUIC,
+		"warp_on": warpOn, "warp_mask": warpMask, "bypass_lan": bypassLAN, "block_quic": blockQUIC,
 		"kill_switch": killSwitch, "block_stun": blockSTUN, "fake_ip": fakeIP,
 		"single_process_countries": singleCountry, "fakeip_count": theFakeIP.count(), "ui_mode": uiMode, "ui_theme": uiTheme,
 		"psiphon": a.psi.view(), "psiphon_slots": a.psi.slots(), "warp": a.warp.view(),

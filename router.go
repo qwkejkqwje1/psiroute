@@ -965,9 +965,10 @@ func (r *Router) planForProtoWithStage(proto, host, dstIP string, port int, app 
 	if r.a != nil && r.a.IsPaused() {
 		return []string{obDirect}, "пауза защиты", 1
 	}
+	userStopped := r.a != nil && r.a.psi != nil && r.a.psi.isUserStopped()
 
-	cacheKey := fmt.Sprintf("%d|%s|%s|%s|%d|%s|%s|%s|%t|%t|%t|%d",
-		generation, proto, cleanH, dstIP, port, normAppFullPath(app), mode, def, failover, bypassLAN, blockSTUN, rulesLen)
+	cacheKey := fmt.Sprintf("%d|%s|%s|%s|%d|%s|%s|%s|%t|%t|%t|%t|%d",
+		generation, proto, cleanH, dstIP, port, normAppFullPath(app), mode, def, failover, bypassLAN, blockSTUN, userStopped, rulesLen)
 	if !killSwitch && mode != "auto" && len(theDNS.cachedIPs(cleanH)) == 0 {
 		if addr, err := netip.ParseAddr(cleanH); err != nil || theRevDNS.get(addr) == "" {
 			r.cacheMu.RLock()
@@ -1039,6 +1040,9 @@ func (r *Router) planForProtoWithStage(proto, host, dstIP string, port int, app 
 			if killSwitch && !r.isVPNUp(obPsiphon) {
 				return []string{obBlock}, "Kill Switch: Psiphon отключён", 7
 			}
+			if userStopped {
+				return []string{obDirect}, "VPN отключён вручную", 7
+			}
 			return []string{obPsiphon}, "всё через Psiphon", 7
 		case "rules":
 			// Kill Switch важнее умолчания: если маршрут по умолчанию — VPN (Psiphon/страна),
@@ -1092,6 +1096,21 @@ func (r *Router) planForProtoWithStage(proto, host, dstIP string, port int, app 
 				return []string{obBlock}, "Kill Switch: VPN отключён (" + matchedName + ")"
 			}
 			return vpnOut, matchedName
+		}
+		// Если пользователь вручную отключил VPN кнопкой «Пуск» (и Kill Switch выключен),
+		// не отправляем трафик в остановленный Psiphon и не добавляем скрытый failover на VPN.
+		if userStopped {
+			filtered := make([]string, 0, len(out))
+			for _, o := range out {
+				if o == obPsiphon || isCountryOb(o) {
+					continue
+				}
+				filtered = append(filtered, o)
+			}
+			if len(filtered) == 0 {
+				return []string{obDirect}, "VPN отключён вручную"
+			}
+			return filtered, matchedName
 		}
 		// В режиме «По правилам» не добавляем скрытый откат на Psiphon к чужим маршрутам (например, к DPI или WARP),
 		// а также не добавляем Failover для UDP-потоков вне режима psiphon (звонки Telegram).
@@ -1374,8 +1393,11 @@ func (r *Router) dialer(outbound string) dialFunc {
 	default:
 		// Priority 6: Use DialBalanced so when Psiphon.Parallel >= 2 and a 2nd
 		// tunnel slot is active, downloads balance across both tunnels.
-		// Auto-start Psiphon if a rule routes traffic to VPN while Psiphon was stopped.
+		// Auto-start Psiphon ONLY if it was not explicitly stopped by the user.
 		return func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if r.a != nil && r.a.psi != nil && r.a.psi.isUserStopped() {
+				return nil, errors.New("VPN отключён пользователем")
+			}
 			if r.a != nil && !r.a.IsPaused() && r.a.psi != nil && !r.a.psi.running() && r.a.psi.cur.Load() == nil && r.a.psi.primaryDialHook == nil {
 				r.a.psi.Start()
 			}
