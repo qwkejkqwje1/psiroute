@@ -12,19 +12,24 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// Encrypted DNS: direct connections resolve names over DoH (Cloudflare / Google
-// by IP) so DNS spoofing by the ISP does not break them. Falls back to the
-// system resolver. Also provides DNS TXT lookup over DoH/wire-format and
-// Ed25519 signature verification for emergency bootstrap of Psiphon server
-// entries and ECH configs during network shutdowns (Priority 4).
+// Encrypted & Direct Physical DNS:
+//   - Direct connections resolve names via parallel physical-adapter UDP/TCP DNS
+//     (77.88.8.8, 77.88.8.1, 8.8.8.8, 1.1.1.1 bound via tunDialBound / IP_UNICAST_IF)
+//     raced alongside parallel DoH, so Wintun FakeIP (172.19.0.2 -> 198.18.x.y)
+//     and TSPU blocking of 1.1.1.1:443 never break direct websites in "rules" mode.
+//   - Also provides DNS TXT lookup over DoH/wire-format and Ed25519 signature
+//     verification for emergency bootstrap of Psiphon server entries and ECH configs.
 
 const dnsTypeTXT uint16 = 16
 
@@ -71,6 +76,17 @@ func (d *dnsCache) clear() {
 	theRevDNS.clear()
 	theFakeIP.clear()
 	theECHCache.clear()
+	flushWindowsDNSCache()
+}
+
+// clearLookupCache сбрасывает только кэш прямых DNS-ответов при изменении правил,
+// сохраняя таблицу FakeIP (198.18.0.0/15) и карту обратного DNS (theRevDNS), чтобы
+// уже открытые вкладки браузера не теряли привязку FakeIP -> домен.
+func (d *dnsCache) clearLookupCache() {
+	d.mu.Lock()
+	d.m = map[string]dnsEntry{}
+	d.mu.Unlock()
+	theDoHWire.clear()
 }
 
 func (d *dnsCache) prune() {
@@ -106,66 +122,239 @@ func (d *dnsCache) cachedIPs(host string) []net.IP {
 }
 
 var dohClient = &http.Client{
-	Timeout: 6 * time.Second,
+	Timeout: 2500 * time.Millisecond,
 	Transport: &http.Transport{
 		DialContext:         dialDesync,
 		ForceAttemptHTTP2:   true,
-		MaxIdleConns:        4,
+		MaxIdleConns:        8,
 		MaxIdleConnsPerHost: 2,
 		IdleConnTimeout:     45 * time.Second,
 	},
 }
 
 var dohJSONEndpoints = []string{
+	"https://common.dot.dns.yandex.net/dns-query",
 	"https://1.1.1.1/dns-query",
-	"https://1.0.0.1/dns-query",
 	"https://8.8.8.8/resolve",
+	"https://1.0.0.1/dns-query",
+}
+
+// directDNSServers перечисляет быстрые публичные DNS-серверы (включая Яндекс DNS 77.88.8.8/77.88.8.1,
+// доступные внутри РФ за 3–10 мс без блокировок ТСПУ). Запросы к ним отправляются через tunDialBound
+// (привязанный к физическому сетевому адаптеру physIdx4 в обход Wintun 172.19.0.2).
+var directDNSServers = []string{
+	"77.88.8.8:53",
+	"77.88.8.1:53",
+	"8.8.8.8:53",
+	"1.1.1.1:53",
+	"9.9.9.9:53",
+}
+
+var dnsTxCounter atomic.Uint32
+
+// directWireExchange выполняет быстрый параллельный DNS-запрос в wire-формате (RFC 1035)
+// напрямую через физический сетевой адаптер (tunDialBound с IP_UNICAST_IF), гарантированно
+// минуя виртуальный интерфейс Wintun (172.19.0.2) и его пул FakeIP (198.18.0.0/15).
+func directWireExchange(ctx context.Context, q []byte) ([]byte, error) {
+	if len(q) < 12 {
+		return nil, errDNSShort
+	}
+	qctx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+	defer cancel()
+
+	type wireRes struct {
+		msg []byte
+		err error
+	}
+	ch := make(chan wireRes, len(directDNSServers)*2)
+	id0, id1 := q[0], q[1]
+
+	queryUDP := func(srv string) {
+		tx := uint16(dnsTxCounter.Add(1))
+		req := append([]byte(nil), q...)
+		req[0], req[1] = byte(tx>>8), byte(tx)
+		c, err := tunDialBound(qctx, "udp", srv)
+		if err != nil {
+			ch <- wireRes{nil, err}
+			return
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(1200 * time.Millisecond))
+		if _, err := c.Write(req); err != nil {
+			ch <- wireRes{nil, err}
+			return
+		}
+		buf := make([]byte, 2048)
+		n, err := c.Read(buf)
+		if err != nil || n < 12 {
+			if err == nil {
+				err = errDNSShort
+			}
+			ch <- wireRes{nil, err}
+			return
+		}
+		resp := buf[:n]
+		if resp[0] != req[0] || resp[1] != req[1] {
+			ch <- wireRes{nil, errors.New("DNS: несовпадение TXID")}
+			return
+		}
+		// Проверяем, что ответ не содержит FakeIP (на случай перехвата роутером)
+		if ips, aerr := dnsAnswers(resp); aerr == nil && len(ips) > 0 {
+			hasReal := false
+			for _, ip := range ips {
+				if a, ok := netip.AddrFromSlice(ip); ok && !isFakeIP(a.Unmap()) {
+					hasReal = true
+					break
+				}
+			}
+			if !hasReal {
+				ch <- wireRes{nil, errors.New("DNS: получен FakeIP")}
+				return
+			}
+		}
+		resp[0], resp[1] = id0, id1
+		ch <- wireRes{resp, nil}
+	}
+
+	for _, srv := range directDNSServers {
+		go queryUDP(srv)
+	}
+
+	var lastErr error
+	var emptyNoErr []byte
+	for range len(directDNSServers) {
+		select {
+		case r := <-ch:
+			if r.err == nil && len(r.msg) >= 12 {
+				if ips, aerr := dnsAnswers(r.msg); aerr == nil && len(ips) > 0 {
+					return r.msg, nil
+				}
+				if r.msg[3]&0x0f == 0 && emptyNoErr == nil {
+					emptyNoErr = r.msg
+				}
+			} else if r.err != nil {
+				lastErr = r.err
+			}
+		case <-qctx.Done():
+			if emptyNoErr != nil {
+				return emptyNoErr, nil
+			}
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, qctx.Err()
+		}
+	}
+	if emptyNoErr != nil {
+		return emptyNoErr, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("DNS: нет ответа от прямых серверов")
+	}
+	return nil, lastErr
+}
+
+// directWireLookup резолвит IPv4-адреса (A) домена напрямую через физический адаптер за 5–15 мс.
+func directWireLookup(ctx context.Context, host string) ([]string, error) {
+	tx := uint16(dnsTxCounter.Add(1))
+	q := dnsQuery(tx, host, 1)
+	resp, err := directWireExchange(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	rawIPs, err := dnsAnswers(resp)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, ip := range rawIPs {
+		if a, ok := netip.AddrFromSlice(ip); ok {
+			a = a.Unmap()
+			if !isFakeIP(a) && !a.IsLoopback() && !a.IsUnspecified() {
+				s := a.String()
+				if !slices.Contains(out, s) {
+					out = append(out, s)
+				}
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil, errors.New("DNS: нет прямых A-записей")
+	}
+	return out, nil
 }
 
 func dohLookup(ctx context.Context, host string) ([]string, error) {
-	var lastErr error
+	qctx, cancel := context.WithTimeout(ctx, 2000*time.Millisecond)
+	defer cancel()
+
+	type res struct {
+		ips []string
+		err error
+	}
+	ch := make(chan res, len(dohJSONEndpoints))
 	for _, base := range dohJSONEndpoints {
-		u := base + "?name=" + url.QueryEscape(host) + "&type=A"
-		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("accept", "application/dns-json")
-		resp, err := dohClient.Do(req)
-		if err != nil {
-			lastErr = err
-			if ctx.Err() != nil {
-				break
+		base := base
+		go func() {
+			u := base + "?name=" + url.QueryEscape(host) + "&type=A"
+			req, err := http.NewRequestWithContext(qctx, "GET", u, nil)
+			if err != nil {
+				ch <- res{nil, err}
+				return
 			}
-			continue
-		}
-		if resp.StatusCode != http.StatusOK {
+			req.Header.Set("accept", "application/dns-json")
+			resp, err := dohClient.Do(req)
+			if err != nil {
+				ch <- res{nil, err}
+				return
+			}
+			if resp.StatusCode != http.StatusOK {
+				resp.Body.Close()
+				ch <- res{nil, fmt.Errorf("DoH: HTTP %d", resp.StatusCode)}
+				return
+			}
+			var r struct {
+				Answer []struct {
+					Type int    `json:"type"`
+					Data string `json:"data"`
+				} `json:"Answer"`
+			}
+			err = json.NewDecoder(io.LimitReader(resp.Body, 32<<10)).Decode(&r)
 			resp.Body.Close()
-			lastErr = fmt.Errorf("DoH: HTTP %d", resp.StatusCode)
-			continue
-		}
-		var r struct {
-			Answer []struct {
-				Type int    `json:"type"`
-				Data string `json:"data"`
-			} `json:"Answer"`
-		}
-		err = json.NewDecoder(io.LimitReader(resp.Body, 32<<10)).Decode(&r)
-		resp.Body.Close()
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		var ips []string
-		for _, a := range r.Answer {
-			if a.Type == 1 && net.ParseIP(a.Data) != nil {
-				ips = append(ips, strings.Clone(a.Data))
+			if err != nil {
+				ch <- res{nil, err}
+				return
 			}
+			var ips []string
+			for _, a := range r.Answer {
+				if a.Type == 1 && net.ParseIP(a.Data) != nil && !isFakeIPStr(a.Data) {
+					ips = append(ips, strings.Clone(a.Data))
+				}
+			}
+			if len(ips) > 0 {
+				ch <- res{ips, nil}
+				return
+			}
+			ch <- res{nil, errors.New("DoH: нет адресов")}
+		}()
+	}
+
+	var lastErr error
+	for range len(dohJSONEndpoints) {
+		select {
+		case r := <-ch:
+			if len(r.ips) > 0 {
+				return r.ips, nil
+			}
+			if r.err != nil {
+				lastErr = r.err
+			}
+		case <-qctx.Done():
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, qctx.Err()
 		}
-		if len(ips) > 0 {
-			return ips, nil
-		}
-		lastErr = errors.New("DoH: нет адресов")
 	}
 	if lastErr == nil {
 		lastErr = errors.New("DoH: нет адресов")
@@ -446,24 +635,82 @@ func resolve(ctx context.Context, host string, useDoH bool) ([]string, error) {
 		}
 		return e.ips, nil
 	}
+
+	type lookupRes struct {
+		ips []string
+		err error
+	}
+	rctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Запускаем прямой аппаратный UDP DNS-резолвинг (в обход Wintun 172.19.0.2 FakeIP!)
+	// и (если включён DoH) параллельный DoH-резолвинг одновременно, чтобы блокировка
+	// 1.1.1.1:443 со стороны ТСПУ или подмена системного DNS на 172.19.0.2 в режиме TUN
+	// никогда не приводили к ошибке «адрес не найден» или 18-секундным зависаниям.
+	totalWorkers := 1
+	if useDoH {
+		totalWorkers = 2
+	}
+	ch := make(chan lookupRes, totalWorkers)
+	go func() {
+		resIPs, lerr := directWireLookup(rctx, cleanH)
+		ch <- lookupRes{resIPs, lerr}
+	}()
+	if useDoH {
+		go func() {
+			resIPs, derr := dohLookup(rctx, cleanH)
+			ch <- lookupRes{resIPs, derr}
+		}()
+	}
+
 	var ips []string
 	var err error
-	if useDoH {
-		ips, err = dohLookup(ctx, cleanH)
-		if err != nil {
-			logf("debug", "DoH для %s не ответил (%v) — системный DNS", cleanH, err)
+	for range totalWorkers {
+		select {
+		case r := <-ch:
+			if len(r.ips) > 0 {
+				ips = r.ips
+				err = nil
+				cancel()
+				break
+			}
+			if r.err != nil {
+				err = r.err
+			}
+		case <-ctx.Done():
+			err = ctx.Err()
+			break
+		}
+		if len(ips) > 0 || ctx.Err() != nil {
+			break
 		}
 	}
-	if len(ips) == 0 {
-		ips, err = net.DefaultResolver.LookupHost(ctx, cleanH)
+
+	// Резервный системный резолвер (только если прямые сокеты и DoH не дали ответа).
+	// Любые синтетические адреса из пула FakeIP (198.18.0.0/15, fc00::/7) строго отфильтровываются.
+	if len(ips) == 0 && ctx.Err() == nil {
+		sctx, scancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+		rawIPs, lerr := net.DefaultResolver.LookupHost(sctx, cleanH)
+		scancel()
+		if lerr != nil && err == nil {
+			err = lerr
+		}
+		for _, s := range rawIPs {
+			if !isFakeIPStr(s) {
+				ips = append(ips, s)
+			}
+		}
 	}
-	if err == nil && len(ips) == 0 {
+
+	if len(ips) > 0 {
+		err = nil
+	} else if err == nil {
 		err = errors.New("адрес не найден")
 	}
 	if err != nil {
-		if ctx.Err() == nil { // negative cache: do not hammer DNS for dead names
+		if ctx.Err() == nil { // короткий негативный кэш (3 с), чтобы случайный сбой сети не блокировал сайт
 			theDNS.mu.Lock()
-			theDNS.m[cleanH] = dnsEntry{exp: time.Now().Add(30 * time.Second)}
+			theDNS.m[cleanH] = dnsEntry{exp: time.Now().Add(3 * time.Second)}
 			theDNS.mu.Unlock()
 		}
 		return nil, err

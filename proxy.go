@@ -11,7 +11,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -461,6 +463,45 @@ func (a *App) directAddrs(ctx context.Context, host string, port int) ([]string,
 	return out, nil
 }
 
+func isEarlySNIPort(port int) bool {
+	switch port {
+	case 80, 443, 8080, 8443, 2053, 2083, 2087, 2096:
+		return true
+	}
+	return false
+}
+
+// sniffBufferedConn вычитывает первые байты TLS ClientHello / HTTP Host из буферизованного
+// клиентского соединения с коротким дедлайном (до 250 мс) и возвращает новый *bufio.Reader,
+// который сначала отдаёт вычитанный буфер, а затем продолжает чтение из исходного потока.
+func sniffBufferedConn(c net.Conn, br *bufio.Reader, wait time.Duration) (*bufio.Reader, string) {
+	if n := br.Buffered(); n > 0 {
+		peek, _ := br.Peek(n)
+		return br, sniffHost(peek)
+	}
+	var buf []byte
+	tmpPtr := getSmallBuf()
+	tmp := *tmpPtr
+	_ = c.SetReadDeadline(time.Now().Add(wait))
+	for len(buf) < len(tmp) {
+		n, err := br.Read(tmp[:len(tmp)-len(buf)])
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+		}
+		if err != nil || !sniffWantMore(buf) {
+			break
+		}
+	}
+	putSmallBuf(tmpPtr)
+	_ = c.SetReadDeadline(time.Time{})
+	host := sniffHost(buf)
+	if len(buf) > 0 {
+		br = bufio.NewReaderSize(io.MultiReader(bytes.NewReader(buf), br), 8<<10)
+		_, _ = br.Peek(min(len(buf), 8<<10))
+	}
+	return br, host
+}
+
 // tunnel dials the destination using the router plan and relays data.
 func (a *App) tunnel(c net.Conn, br *bufio.Reader, host string, port int, reply func(up net.Conn, err error) error) {
 	a.tunnelApp(c, br, host, port, appForConn(c.RemoteAddr()), reply)
@@ -471,12 +512,55 @@ func (a *App) tunnelApp(c net.Conn, br *bufio.Reader, host string, port int, app
 }
 
 func (a *App) tunnelAppAddr(c net.Conn, br *bufio.Reader, host, dstIP string, port int, app string, reply func(up net.Conn, err error) error) {
+	fromProxy := dstIP == "" && !isFakeIPStr(host)
 	if fdom := theFakeIP.LookupString(host); fdom != "" {
 		host = fdom
 		if isFakeIPStr(dstIP) {
 			dstIP = ""
 		}
+	} else if addr, err := netip.ParseAddr(cleanHostKey(host)); err == nil {
+		if dstIP == "" {
+			dstIP = addr.Unmap().String()
+		}
+		if rev := theRevDNS.get(addr); rev != "" {
+			host = rev
+		}
 	}
+
+	repliedEarly := false
+	// Находка 10: Если клиент (например, Discord или браузер с DoH) стучится по сырому публичному IP
+	// на TLS/HTTP порт (443, 80, 8443 и т.д.), а домен ещё неизвестен в theFakeIP / theRevDNS,
+	// прямое подключение к заблокированной ТСПУ подсети (162.159.x.x и др.) зависнет на TCP SYN blackhole
+	// до того, как клиент пришлёт ClientHello.
+	// Чтобы исключить двойное ожидание 550 мс между tun.go (300 мс) и proxy.go (250 мс):
+	// - если br.Buffered() > 0 (соединение пришло из tun.go после e.sniff), мгновенно без ожидания
+	//   читаем уже буферизованные байты через br.Peek(br.Buffered()) и извлекаем sniffHost(peek);
+	// - только когда br.Buffered() == 0 и fromProxy == true (соединение пришло напрямую в SOCKS5/HTTP прокси),
+	//   подтверждаем рукопожатие и запускаем sniffBufferedConn(c, br, 250*time.Millisecond).
+	if addr, err := netip.ParseAddr(cleanHostKey(host)); err == nil && !addr.IsLoopback() && isEarlySNIPort(port) {
+		preOrder, _, preStage := a.router.planForProtoWithStage("tcp", host, dstIP, port, app)
+		if len(preOrder) == 0 || preOrder[0] != obBlock {
+			// Если для этого IP ещё нет точного CIDR/App правила (Stage 7 или Auto), читаем SNI до dial
+			if preStage >= 6 || (len(preOrder) > 0 && preOrder[0] == obDirect) {
+				var sni string
+				if buffered := br.Buffered(); buffered > 0 {
+					peek, _ := br.Peek(buffered)
+					sni = sniffHost(peek)
+				} else if fromProxy {
+					if err := reply(nil, nil); err != nil {
+						return
+					}
+					repliedEarly = true
+					br, sni = sniffBufferedConn(c, br, 250*time.Millisecond)
+				}
+				if sni != "" {
+					theRevDNS.put(net.IP(addr.AsSlice()), sni, 10*time.Minute)
+					host = sni
+				}
+			}
+		}
+	}
+
 	order, rule := a.router.planForProto("tcp", host, dstIP, port, app)
 	ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
 	var up net.Conn
@@ -496,6 +580,27 @@ func (a *App) tunnelAppAddr(c net.Conn, br *bufio.Reader, host, dstIP string, po
 				if resolveErr != nil && dstIP != "" {
 					resolved, resolveErr = []string{net.JoinHostPort(dstIP, strconv.Itoa(port))}, nil
 				}
+				// Если провайдер заблокировал все прямые DNS-серверы, а соединение пришло по FakeIP (dstIP == ""),
+				// пробуем получить реальный IP через активный туннель (Psiphon/WARP) и подключиться к нему напрямую.
+				if resolveErr != nil && dstIP == "" && net.ParseIP(host) == nil {
+					for _, tunOb := range []string{obWarp, obPsiphon} {
+						if tunOb == obWarp && (a.warp == nil || !a.warp.connected()) {
+							continue
+						}
+						if tunOb == obPsiphon && (a.psi == nil || !a.psi.running()) {
+							continue
+						}
+						tctx, tcancel := context.WithTimeout(ctx, 3*time.Second)
+						tip, terr := a.tunnelLookup(tctx, tunOb, host)
+						tcancel()
+						if terr == nil && tip != nil && !isFakeIPStr(tip.String()) {
+							theRevDNS.put(tip, cleanHostKey(host), 10*time.Minute)
+							resolved = []string{net.JoinHostPort(tip.String(), strconv.Itoa(port))}
+							resolveErr = nil
+							break
+						}
+					}
+				}
 			}
 			if resolveErr != nil {
 				lastErr = resolveErr
@@ -509,6 +614,19 @@ func (a *App) tunnelAppAddr(c net.Conn, br *bufio.Reader, host, dstIP string, po
 			dctx, dcancel = context.WithTimeout(ctx, 7*time.Second)
 		}
 		dial := a.router.dialer(o)
+		if o == obDesync {
+			origDial := dial
+			domainKey := cleanHostKey(host)
+			dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				conn, err := origDial(ctx, network, addr)
+				if err == nil && conn != nil {
+					if oc, ok := conn.(*obfsConn); ok && domainKey != "" && net.ParseIP(domainKey) == nil {
+						oc.host = domainKey
+					}
+				}
+				return conn, err
+			}
+		}
 		up, lastErr = dialHappyEyeballs(dctx, dial, addrs)
 		dcancel()
 		if lastErr == nil {
@@ -518,13 +636,18 @@ func (a *App) tunnelAppAddr(c net.Conn, br *bufio.Reader, host, dstIP string, po
 	}
 	cancel()
 	if up == nil {
-		last := order[len(order)-1]
+		last := obDirect
+		if len(order) > 0 {
+			last = order[len(order)-1]
+		}
 		t := a.stats.open(app, host, "", port, last, rule)
 		if lastErr == nil {
 			lastErr = errors.New("нет маршрута")
 		}
 		a.stats.close(t, lastErr)
-		_ = reply(nil, lastErr)
+		if !repliedEarly {
+			_ = reply(nil, lastErr)
+		}
 		return
 	}
 	if ob != order[0] {
@@ -534,9 +657,11 @@ func (a *App) tunnelAppAddr(c net.Conn, br *bufio.Reader, host, dstIP string, po
 	t := a.stats.open(app, host, "", port, ob, rule)
 	cc := &countConn{Conn: up, s: a.stats, t: t}
 	defer func() { _ = cc.Close() }()
-	if err := reply(cc, nil); err != nil {
-		a.stats.close(t, err)
-		return
+	if !repliedEarly {
+		if err := reply(cc, nil); err != nil {
+			a.stats.close(t, err)
+			return
+		}
 	}
 	_ = c.SetReadDeadline(time.Time{})
 	started := time.Now()
@@ -619,7 +744,7 @@ func (a *App) relay(c net.Conn, br *bufio.Reader, up net.Conn, t *tracked) (erro
 							return
 						}
 					}
-					if s := parseSNI(buf[:n]); s != "" {
+					if s := sniffHost(buf[:n]); s != "" {
 						a.stats.setSNI(t, s)
 						_, host, port, app, curOb := a.stats.routeAndHost(t)
 						if ip := net.ParseIP(host); ip != nil {
@@ -630,15 +755,82 @@ func (a *App) relay(c net.Conn, br *bufio.Reader, up net.Conn, t *tracked) (erro
 									errc <- res{false, errBlocked}
 									return
 								}
-								if ord[0] != curOb {
-									rctx, rcancel := context.WithTimeout(a.ctx, 8*time.Second)
-									targetAddr := net.JoinHostPort(s, strconv.Itoa(port))
-									if ord[0] == obDirect || ord[0] == obDesync {
-										targetAddr = net.JoinHostPort(host, strconv.Itoa(port))
+								// Переподключаем апстрим, если маршрут по домену s отличается от curOb,
+								// ЛИБО если соединение изначально было открыто по сырому (возможно отравленному ТСПУ) IP
+								// внутрь туннеля (Psiphon/WARP) — чтобы туннель открыл соединение именно по доменному имени s:port!
+								needTunnelDomainRebind := host != s && (ord[0] == obPsiphon || isCountryOb(ord[0]) || ord[0] == obWarp)
+								if ord[0] != curOb || needTunnelDomainRebind {
+									rctx, rcancel := context.WithTimeout(a.ctx, 15*time.Second)
+									var newConn net.Conn
+									var chosenOb string
+									var lastErr error
+									var resolved []string
+									var resolveErr error
+									rawHostAddr := net.JoinHostPort(host, strconv.Itoa(port))
+									domainAddr := net.JoinHostPort(s, strconv.Itoa(port))
+									for i, o := range ord {
+										if o == obBlock {
+											lastErr = errBlocked
+											break
+										}
+										dctx := rctx
+										var dcancel context.CancelFunc = func() {}
+										if i < len(ord)-1 && o != obPsiphon {
+											dctx, dcancel = context.WithTimeout(rctx, 7*time.Second)
+										}
+										dial := a.router.dialer(o)
+										switch o {
+										case obDirect:
+											if resolved == nil && resolveErr == nil {
+												resolved, resolveErr = a.directAddrs(dctx, s, port)
+												if resolveErr != nil || len(resolved) == 0 {
+													resolved, resolveErr = []string{rawHostAddr}, nil
+												} else if host != "" && !slices.Contains(resolved, rawHostAddr) {
+													resolved = append(resolved, rawHostAddr)
+												}
+											}
+											newConn, lastErr = dialHappyEyeballs(dctx, dial, resolved)
+										case obDesync:
+											if resolved == nil && resolveErr == nil {
+												resolved, resolveErr = a.directAddrs(dctx, s, port)
+												if resolveErr != nil || len(resolved) == 0 {
+													resolved, resolveErr = []string{rawHostAddr}, nil
+												} else if host != "" && !slices.Contains(resolved, rawHostAddr) {
+													resolved = append(resolved, rawHostAddr)
+												}
+											}
+											// Сохраняем ключ домена s в obfsConn, чтобы dialObfs кэшировал стратегию
+											// обхода DPI по домену s (psiroute-obfs.json), а при ошибке directAddrs
+											// откатываемся на s:port и сырой host:port.
+											desyncDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+												conn, err := dial(ctx, network, addr)
+												if err == nil && conn != nil {
+													if oc, ok := conn.(*obfsConn); ok {
+														oc.host = cleanHostKey(s)
+													}
+												}
+												return conn, err
+											}
+											newConn, lastErr = dialHappyEyeballs(dctx, desyncDial, resolved)
+											if lastErr != nil {
+												newConn, lastErr = desyncDial(dctx, "tcp", domainAddr)
+											}
+										default:
+											newConn, lastErr = dial(dctx, "tcp", domainAddr)
+										}
+										dcancel()
+										if lastErr == nil && newConn != nil {
+											chosenOb = o
+											break
+										}
 									}
-									if newConn, derr := a.router.dialer(ord[0])(rctx, "tcp", targetAddr); derr == nil {
-										rcancel()
-										a.stats.setRoute(t, ord[0], newRule)
+									rcancel()
+									if newConn != nil && lastErr == nil {
+										if chosenOb != ord[0] {
+											newRule = "запасной (" + ord[0] + " не ответил)"
+											a.router.remember(s, chosenOb, ord[0]+" не подключился", true)
+										}
+										a.stats.setRoute(t, chosenOb, newRule)
 										newCounted := &countConn{Conn: newConn, s: a.stats, t: t}
 										t.addCloser(newCounted)
 										upMu.Lock()
@@ -651,9 +843,11 @@ func (a *App) relay(c net.Conn, br *bufio.Reader, up net.Conn, t *tracked) (erro
 										_ = curUp.Close()
 										curUp = newCounted
 									} else {
-										rcancel()
 										_ = curUp.Close()
-										errc <- res{false, derr}
+										if lastErr == nil {
+											lastErr = errors.New("нет маршрута")
+										}
+										errc <- res{false, lastErr}
 										return
 									}
 								}

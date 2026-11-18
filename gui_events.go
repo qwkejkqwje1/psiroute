@@ -51,12 +51,23 @@ type gioUI struct {
 	toastErr     bool
 	toastUntil   time.Time
 
-	// Navigation tabs (сокращено с 7 до 4 смысловых разделов):
-	// 0=Главная, 1=Маршруты, 2=Сеть и Обход, 3=Система и Логи
-	tab        int
-	navBtns    [4]widget.Clickable
-	subTabs    [4]int
-	subTabBtns [4][3]widget.Clickable
+	// Navigation tabs (5 разделов):
+	// 0=Главная, 1=Маршруты, 2=Потоки (активна только при клике), 3=Сеть, 4=Журнал и Система
+	tab                 int
+	navBtns             [5]widget.Clickable
+	subTabs             [5]int
+	subTabBtns          [5][3]widget.Clickable
+	rulesTemplatesOpen  bool
+	streamsPaused       bool
+	streamRuleForApp    bool
+	streamSearchEditor  widget.Editor
+	recentStreams       []map[string]any
+	frozenLiveStreams   []map[string]any
+	frozenRecentStreams []map[string]any
+	cachedLogs          []map[string]any
+	logLevelFilter      int
+	lastIconState       string
+	lastIconCC          string
 	webBtn     widget.Clickable
 	quitBtn    widget.Clickable
 	keyTag     bool
@@ -135,38 +146,45 @@ type gioUI struct {
 	homeRuleAddBtn   widget.Clickable
 	homeCheckBtn     widget.Clickable
 	homeRoutePreview string
+	lastHomeQuery    string
+	lastHomeCheckAt  time.Time
+	themeToggleBtn   widget.Clickable
 	liveAppBtns      [4]widget.Clickable
 	liveAppNames     [4]string
 	liveAppRoutes    [4]string
 	resetStatsBtn    widget.Clickable
 
 	// Rules Constructor
-	ruleFilterEditor    widget.Editor
-	batchRuleEditor     widget.Editor
-	batchImportBtn      widget.Clickable
-	ruleNameEditor      widget.Editor
-	hostEditor          widget.Editor
-	selectedRuleOb      string
-	selectedProto       string
-	ruleAlways          bool
-	editingRuleIdx      int
-	ruleObBtns          [10]widget.Clickable
-	ruleProtoBtns       [3]widget.Clickable
-	ruleAlwaysBtn       widget.Clickable
-	ruleCancelBtn       widget.Clickable
-	checkRouteBtn       widget.Clickable
-	addRuleBtn          widget.Clickable
-	presetRuleBtns      [8]widget.Clickable
-	listPickBtns        [12]widget.Clickable
-	listUseBtns         map[string]*widget.Clickable
-	profileBtns         [5]widget.Clickable
-	undoProfileBtn      widget.Clickable
-	ruleToggleBtns      map[int]*widget.Clickable
-	ruleDeleteBtns      map[int]*widget.Clickable
-	ruleEditBtns        map[int]*widget.Clickable
-	editingRuleOriginal map[string]any
-	ruleUpBtns          map[int]*widget.Clickable
-	ruleDownBtns        map[int]*widget.Clickable
+	ruleFilterEditor      widget.Editor
+	batchRuleEditor       widget.Editor
+	batchImportBtn        widget.Clickable
+	ruleNameEditor        widget.Editor
+	hostEditor            widget.Editor
+	selectedRuleOb        string
+	selectedProto         string
+	ruleAlways            bool
+	editingRuleIdx        int
+	ruleObBtns            [10]widget.Clickable
+	ruleProtoBtns         [3]widget.Clickable
+	ruleAlwaysBtn         widget.Clickable
+	ruleCancelBtn         widget.Clickable
+	checkRouteBtn         widget.Clickable
+	lastRuleCheckQuery    string
+	lastRuleCheckAt       time.Time
+	ruleInspectorPreview  string
+	ruleInspectorConflict string
+	addRuleBtn            widget.Clickable
+	presetRuleBtns        [8]widget.Clickable
+	listPickBtns          [12]widget.Clickable
+	listUseBtns           map[string]*widget.Clickable
+	profileBtns           [5]widget.Clickable
+	undoProfileBtn        widget.Clickable
+	ruleToggleBtns        map[int]*widget.Clickable
+	ruleDeleteBtns        map[int]*widget.Clickable
+	ruleEditBtns          map[int]*widget.Clickable
+	editingRuleOriginal   map[string]any
+	ruleUpBtns            map[int]*widget.Clickable
+	ruleDownBtns          map[int]*widget.Clickable
 
 	// Lists Manager (Stage 1 & Stage 3)
 	listActionBtns         map[string]*widget.Clickable
@@ -207,6 +225,8 @@ type gioUI struct {
 	// Diagnostics, Psiphon Stats & Server Entries Import
 	diagEditor          widget.Editor
 	diagRunBtn          widget.Clickable
+	diagConnFilter      int
+	diagFilterBtns      [3]widget.Clickable
 	serverEntriesEditor widget.Editor
 	importEntriesBtn    widget.Clickable
 	connPsiBtns         map[string]*widget.Clickable
@@ -220,18 +240,20 @@ type gioUI struct {
 	shareInfo map[string]any
 }
 
-var navTitles = [4]string{
+var navTitles = [5]string{
 	"Главная",
 	"Маршруты",
+	"Потоки",
 	"Сеть",
-	"Система",
+	"Журнал",
 }
 
-var navHints = [4]string{
-	"Командный центр: питание, живая цепочка канала, глобальный сценарий, быстрое правило и активные процессы",
-	"Единый конвейер приоритетов (1–7): программы (Split Tunneling), списки доменов/подсетей и личные правила",
-	"Настройка обхода ТСПУ/DPI, авто-тюнинг стратегий, параметры Cloudflare WARP, выбор стран и раздача в LAN",
-	"Настройки запуска, шифрованный DNS/FakeIP, самопроверка selftest, потребление ОЗУ и живой журнал",
+var navHints = [5]string{
+	"Командный центр: питание (с флагом страны), схема захвата, глобальный сценарий и живой омнибокс",
+	"Умные маршруты по 4 уровням приоритета ядра, раздельное туннелирование программ (.exe) и каталог списков",
+	"Живые потоки и подключения (вкладка активна только когда открыта) — назначение правил в 1 клик",
+	"Выбор страны выхода Psiphon, авто-тюнинг обхода DPI, параметры Cloudflare WARP и раздача в LAN",
+	"Полноэкранный живой журнал событий (без обрезки), настройки DNS/FakeIP и глубокая диагностика",
 }
 
 // loadWindowsSystemFonts загружает системные шрифты Windows (Segoe UI / Consolas) напрямую с диска,
@@ -340,6 +362,7 @@ func runGioWindow(dataDir, uiURL string, parentPID int) {
 	ui.diagEditor.SingleLine = true
 	ui.diagEditor.SetText("www.youtube.com")
 	ui.serverEntriesEditor.SingleLine = true
+	ui.streamSearchEditor.SingleLine = true
 
 	// Lists editors: multiline for listContentEditor, single-line for metadata
 	ui.listSearchEditor.SingleLine = true
@@ -433,16 +456,38 @@ func (ui *gioUI) pollLoop(stop <-chan struct{}) {
 func (ui *gioUI) fetchAll(full bool) {
 	ui.mu.Lock()
 	curTab := ui.tab
+	streamsPaused := ui.streamsPaused
 	ui.mu.Unlock()
 	statePath := "/api/state?compact=1"
-	if full || curTab == 5 || curTab == 6 {
+	if full || curTab == 4 {
 		statePath = "/api/state"
 	}
 	st, err := ui.apiCall("GET", statePath, nil)
 	if err == nil && st != nil {
 		ui.mu.Lock()
+		newLogs := toMapSlice(st["log"])
+		if len(newLogs) > 0 {
+			ui.cachedLogs = newLogs
+		} else if len(ui.cachedLogs) > 0 {
+			st["log"] = ui.cachedLogs
+		}
 		ui.state = st
+		if thm, ok := st["ui_theme"].(string); ok && thm != "" && thm != ui.pal.themeID {
+			ui.pal = paletteByTheme(thm)
+		}
+		psiMap, _ := st["psiphon"].(map[string]any)
+		pState, _ := psiMap["state"].(string)
+		cc, _ := psiMap["egress_region"].(string)
+		if cc == "" {
+			cc, _ = psiMap["region"].(string)
+		}
+		iconChanged := pState != ui.lastIconState || cc != ui.lastIconCC
+		ui.lastIconState = pState
+		ui.lastIconCC = cc
 		ui.mu.Unlock()
+		if iconChanged {
+			setWindowIconState(pState, cc)
+		}
 	}
 	ui.mu.Lock()
 	tab := ui.tab
@@ -464,7 +509,15 @@ func (ui *gioUI) fetchAll(full bool) {
 			ui.mu.Unlock()
 		}
 	}
-	if tab == 3 || (full && !havePsiStats) {
+	// Вкладка «Потоки» (tab == 2) запрашивает расширенный список потоков ТОЛЬКО когда она открыта!
+	if tab == 2 && !streamsPaused {
+		if rc, err := ui.apiCall("GET", "/api/conns/recent", nil); err == nil && rc != nil {
+			ui.mu.Lock()
+			ui.recentStreams = toMapSlice(rc["recent"])
+			ui.mu.Unlock()
+		}
+	}
+	if tab == 4 || (full && !havePsiStats) {
 		if ps, err := ui.apiCall("GET", "/api/psiphon/stats", nil); err == nil && ps != nil {
 			ui.mu.Lock()
 			ui.psiStatsData = ps
@@ -480,7 +533,7 @@ func (ui *gioUI) fetchAll(full bool) {
 		}
 	}
 	ui.mu.Unlock()
-	if (tab == 2 || tab == 3) && (full || !haveShare) {
+	if (tab == 3 || tab == 4) && (full || !haveShare) {
 		if sh, err := ui.apiCall("GET", "/api/share", nil); err == nil && sh != nil {
 			ui.mu.Lock()
 			ui.shareInfo = sh
@@ -608,6 +661,7 @@ func (ui *gioUI) anyEditorFocused(gtx layout.Context) bool {
 		&ui.listContentEditor,
 		&ui.diagEditor,
 		&ui.serverEntriesEditor,
+		&ui.streamSearchEditor,
 	}
 	for _, ed := range editors {
 		if gtx.Focused(ed) {
@@ -760,8 +814,8 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 		}
 	}
 	if ui.allCountriesBtn.Clicked(gtx) {
-		ui.tab = 2
-		ui.subTabs[2] = 0
+		ui.tab = 3
+		ui.subTabs[3] = 0
 		ui.pipePopup = 0
 		go ui.fetchAll(true)
 	}
@@ -790,7 +844,9 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 			ui.pipePopup = 2
 		}
 	}
-	// Кнопки выбора режима перехвата трафика из визуального пайплайна (Весь ПК [TUN] / Только браузеры / Ручной прокси)
+	// Кнопки выбора режима перехвата трафика из визуального пайплайна (Весь ПК [TUN] / Только браузеры / Ручной прокси).
+	// ВАЖНО (Аудит 2): переключение способа захвата меняет ТОЛЬКО состояние TUN и Системного прокси
+	// и НИКОГДА не сбрасывает выбранный пользователем глобальный сценарий Routing.Mode (например, "rules").
 	if ui.captureModeBtns[0].Clicked(gtx) {
 		ui.pipePopup = 0
 		ui.doAsync("Перехват: Весь ПК (режим TUN)", func() (map[string]any, error) {
@@ -831,6 +887,18 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 	if ui.pauseResumeBtn.Clicked(gtx) {
 		ui.doAsync("Пауза снята — защита возобновлена", func() (map[string]any, error) {
 			return ui.apiCall("POST", "/api/pause", map[string]any{"minutes": 0})
+		})
+	}
+	if ui.themeToggleBtn.Clicked(gtx) {
+		nextTheme := "cyber-amber"
+		title := "Cyber-Amber (Терминал СССР)"
+		if ui.pal.themeID == "cyber-amber" {
+			nextTheme = "obsidian"
+			title = "Tactical Glass (Obsidian Dark)"
+		}
+		ui.pal = paletteByTheme(nextTheme)
+		ui.doAsync("Тема оформления: "+title, func() (map[string]any, error) {
+			return ui.apiCall("POST", "/api/settings", map[string]any{"general.ui_theme": nextTheme})
 		})
 	}
 	if ui.privacyBtn.Clicked(gtx) {
@@ -948,8 +1016,13 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 				res, err := ui.apiCall("GET", q, nil)
 				if err == nil && res != nil {
 					badge, _ := res["badge"].(string)
+					conflict, _ := res["conflict"].(string)
+					msg := "Текущий маршрут: " + badge
+					if conflict != "" {
+						msg += "  ⚠ " + conflict
+					}
 					ui.mu.Lock()
-					ui.homeRoutePreview = badge
+					ui.homeRoutePreview = msg
 					ui.mu.Unlock()
 					if ui.w != nil {
 						ui.w.Invalidate()
@@ -966,6 +1039,7 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 		}
 		if raw != "" {
 			ui.homeRuleEditor.SetText("")
+			ui.lastHomeQuery = ""
 			ui.mu.Lock()
 			ui.homeRoutePreview = ""
 			ui.mu.Unlock()
@@ -975,11 +1049,11 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 				if !strings.HasSuffix(lower, ".exe") {
 					exe += ".exe"
 				}
-				ui.doAsync(fmt.Sprintf("Маршрут программы %s → %s (Приоритет 2)", exe, routeShortRu(ob)), func() (map[string]any, error) {
+				ui.doAsync(fmt.Sprintf("Маршрут программы %s → %s (Приоритет 3)", exe, routeShortRu(ob)), func() (map[string]any, error) {
 					return ui.apiCall("POST", "/api/apps", map[string]any{"exe": exe, "outbound": ob})
 				})
 			} else {
-				ui.doAsync(fmt.Sprintf("Личное правило %s → %s (Приоритет 3)", raw, routeShortRu(ob)), func() (map[string]any, error) {
+				ui.doAsync(fmt.Sprintf("Личное правило %s → %s (Приоритет 2)", raw, routeShortRu(ob)), func() (map[string]any, error) {
 					return ui.apiCall("POST", "/api/rules/add", map[string]any{"tokens": raw, "outbound": ob, "always": true})
 				})
 			}
@@ -996,6 +1070,8 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 		}
 	}
 
+	// Включение/выключение Системного прокси и TUN изменяет только режим перехвата трафика,
+	// не затрагивая Routing.Mode.
 	if ui.sysProxyBtn.Clicked(gtx) {
 		on, _ := st["sysproxy"].(bool)
 		act := "on"
@@ -1335,6 +1411,7 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 			ui.ruleAlways = true
 			ui.ruleNameEditor.SetText("")
 			ui.hostEditor.SetText("")
+			ui.lastRuleCheckQuery = ""
 			ui.doAsync(fmt.Sprintf("Правило сохранено → %s", ob), func() (map[string]any, error) {
 				body := ruleEditRequest(original, target, name, ob, proto, alw)
 				if editIdx >= 0 {

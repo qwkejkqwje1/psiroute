@@ -10,8 +10,10 @@ import (
 	"gioui.org/unit"
 )
 
-// Дизайн-система PsiRoute 2.0.3 (Obsidian Dark / Porcelain Light).
-// Типографская шкала и модульная сетка отступов, кратная 8dp.
+// Дизайн-система PsiRoute 2.0.5:
+//   - По умолчанию: "obsidian" (Tactical Glass / Obsidian Dark — глубокий графит #0B0E14, индиго #6366F1, бирюза #06B6D4)
+//   - Опциональный переключатель: "cyber-amber" (USSR Retrofuturism / Cyber-Amber Terminal HUD — угольный #0D0F0E, янтарный люминофор #FFB000)
+//   - Единая модульная сетка кратно 8dp и контраст текста >= 7:1.
 const (
 	fontMicro = unit.Sp(10.5)
 	fontSmall = unit.Sp(11.5)
@@ -28,6 +30,7 @@ const (
 
 type gioPalette struct {
 	dark     bool
+	themeID  string
 	bg       color.NRGBA // основной фон рабочей области
 	side     color.NRGBA // фон боковой панели
 	card     color.NRGBA // основная поверхность карточек
@@ -38,11 +41,11 @@ type gioPalette struct {
 	text     color.NRGBA // основной текст (WCAG >= 7:1)
 	mut      color.NRGBA // вторичный текст
 	dim      color.NRGBA // третичный текст / подписи
-	acc      color.NRGBA // основной акцент (Electric Indigo)
+	acc      color.NRGBA // основной акцент
 	accSoft  color.NRGBA
 	ok       color.NRGBA // успех / прямое / подключено (Emerald)
 	okSoft   color.NRGBA
-	warn     color.NRGBA // предупреждение / подключение / WARP (Amber)
+	warn     color.NRGBA // предупреждение / WARP / Янтарь (Amber)
 	warnSoft color.NRGBA
 	err      color.NRGBA // ошибка / блокировка (Coral Rose)
 	errSoft  color.NRGBA
@@ -53,30 +56,66 @@ type gioPalette struct {
 }
 
 func paletteFor(_ bool) gioPalette {
-	return gioPalette{
-		dark:     true,
-		bg:       rgb(0x090B10),
-		side:     rgb(0x0D1017),
-		card:     rgb(0x131822),
-		card2:    rgb(0x1A202D),
-		hover:    rgb(0x222938),
-		border:   rgb(0x232B3B),
-		borderHi: rgb(0x36435C),
-		text:     rgb(0xF1F5F9),
-		mut:      rgb(0x94A3B8),
-		dim:      rgb(0x64748B),
-		acc:      rgb(0x5B7CFA),
-		accSoft:  rgba(0x5B7CFA, 38),
-		ok:       rgb(0x10B981),
-		okSoft:   rgba(0x10B981, 34),
-		warn:     rgb(0xF59E0B),
-		warnSoft: rgba(0xF59E0B, 34),
-		err:      rgb(0xF43F5E),
-		errSoft:  rgba(0xF43F5E, 34),
-		vio:      rgb(0xA855F7),
-		vioSoft:  rgba(0xA855F7, 38),
-		teal:     rgb(0x06B6D4),
-		tealSoft: rgba(0x06B6D4, 34),
+	return paletteByTheme("obsidian")
+}
+
+func paletteByTheme(theme string) gioPalette {
+	switch strings.ToLower(strings.TrimSpace(theme)) {
+	case "cyber-amber", "amber", "ussr", "retro":
+		return gioPalette{
+			dark:     true,
+			themeID:  "cyber-amber",
+			bg:       rgb(0x0B0D0C),
+			side:     rgb(0x101412),
+			card:     rgb(0x151A17),
+			card2:    rgb(0x1C231F),
+			hover:    rgb(0x252E29),
+			border:   rgb(0x2B3630),
+			borderHi: rgb(0xFFB000),
+			text:     rgb(0xF6F3E8),
+			mut:      rgb(0xB5B09C),
+			dim:      rgb(0x787566),
+			acc:      rgb(0xFFB000),
+			accSoft:  rgba(0xFFB000, 38),
+			ok:       rgb(0x22C55E),
+			okSoft:   rgba(0x22C55E, 36),
+			warn:     rgb(0xF59E0B),
+			warnSoft: rgba(0xF59E0B, 36),
+			err:      rgb(0xEF4444),
+			errSoft:  rgba(0xEF4444, 36),
+			vio:      rgb(0xFFB000),
+			vioSoft:  rgba(0xFFB000, 38),
+			teal:     rgb(0x14B8A6),
+			tealSoft: rgba(0x14B8A6, 36),
+		}
+	default:
+		// Tactical Minimal / Obsidian Dark (#090B10 bg, #11151F card, #161C28 card2)
+		return gioPalette{
+			dark:     true,
+			themeID:  "obsidian",
+			bg:       rgb(0x090B10),
+			side:     rgb(0x0C0F17),
+			card:     rgb(0x11151F),
+			card2:    rgb(0x161C28),
+			hover:    rgb(0x1E2638),
+			border:   rgb(0x1F293D),
+			borderHi: rgb(0x6366F1),
+			text:     rgb(0xE2E8F0),
+			mut:      rgb(0x94A3B8),
+			dim:      rgb(0x64748B),
+			acc:      rgb(0x6366F1),
+			accSoft:  rgba(0x6366F1, 38),
+			ok:       rgb(0x10B981),
+			okSoft:   rgba(0x10B981, 36),
+			warn:     rgb(0xF59E0B),
+			warnSoft: rgba(0xF59E0B, 36),
+			err:      rgb(0xEF4444),
+			errSoft:  rgba(0xEF4444, 36),
+			vio:      rgb(0x8B5CF6),
+			vioSoft:  rgba(0x8B5CF6, 40),
+			teal:     rgb(0x06B6D4),
+			tealSoft: rgba(0x06B6D4, 36),
+		}
 	}
 }
 
@@ -166,12 +205,12 @@ func (ui *gioUI) statusColor(pState string) color.NRGBA {
 	return ui.pal.acc
 }
 
-// routeColor реализует единую цветовую кодировку 5 типов выхода (Раздел 2 ТЗ):
+// routeColor реализует единую семантическую кодировку маршрутов (Часть 3.1):
 //   - Изумрудный (ok)     — Direct (Напрямую)
-//   - Голубой (teal)      — Direct-DPI (Обход DPI)
-//   - Фиолетовый (vio)    — WARP (Быстрый туннель Cloudflare)
-//   - Янтарный (warn)     — Psiphon / Psiphon:CC (VPN со сменой страны)
-//   - Красный (err)       — Block (Блокировать)
+//   - Бирюзовый (teal)    — Direct-DPI (Обход ТСПУ)
+//   - Янтарный (warn)     — Cloudflare WARP (UDP/MASQUE)
+//   - Фиолетовый (vio)    — Psiphon / Psiphon:CC (VPN со сменой страны)
+//   - Рубиновый (err)     — Block (Блокировать)
 func (ui *gioUI) routeColor(ob string) color.NRGBA {
 	switch {
 	case ob == obDirect || ob == "tun-exclude":
@@ -179,9 +218,9 @@ func (ui *gioUI) routeColor(ob string) color.NRGBA {
 	case ob == obDesync:
 		return ui.pal.teal
 	case ob == obWarp:
-		return ui.pal.vio
-	case ob == obPsiphon || strings.HasPrefix(ob, obPsiphon+":"):
 		return ui.pal.warn
+	case ob == obPsiphon || strings.HasPrefix(ob, obPsiphon+":"):
+		return ui.pal.vio
 	case ob == obBlock:
 		return ui.pal.err
 	case ob == obAuto:
@@ -192,20 +231,22 @@ func (ui *gioUI) routeColor(ob string) color.NRGBA {
 
 func routeShortRu(ob string) string {
 	switch {
-	case ob == obDirect || ob == "tun-exclude":
+	case ob == obDirect:
 		return "Напрямую"
+	case ob == "tun-exclude":
+		return "Вне TUN"
 	case ob == obDesync:
 		return "Обход DPI"
 	case ob == obWarp:
 		return "WARP"
 	case ob == obPsiphon:
-		return "VPN"
+		return "Psiphon VPN"
 	case strings.HasPrefix(ob, obPsiphon+":"):
 		return "VPN " + strings.ToUpper(strings.TrimPrefix(ob, obPsiphon+":"))
 	case ob == obBlock:
 		return "Блок"
 	case ob == obAuto || ob == "":
-		return "Умный"
+		return "Авто"
 	}
 	return ob
 }
@@ -245,8 +286,6 @@ func stateTitle(s string) string {
 	return "Отключено"
 }
 
-// maskSensitive скрывает чувствительные данные (реальный IP провайдера и посещённые домены)
-// под звёздочками в режиме «Чистый экран» (для безопасных скриншотов и стримов в Discord).
 func (ui *gioUI) maskSensitive(s string) string {
 	if !ui.privacyMode || strings.TrimSpace(s) == "" {
 		return s

@@ -4,23 +4,21 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"slices"
 	"sort"
 	"strings"
 )
 
-// Split Tunneling / Application Routing Manager (1.1.0+).
+// Split Tunneling / Application Routing Manager (2.0.5).
 //
 // Allows routing individual programs through Psiphon VPN, WARP, DPI-bypass,
-// Direct (bypassing VPN), or Blocking them — either by picking from the live
-// list of running processes on the computer or from a built-in catalog of
-// popular browsers, messengers, voice apps and games.
+// Direct (without breaking domain rules inside browsers), TUN-Exclude (full
+// Wintun bypass for anti-cheat games), or Blocking them.
 
 type appPreset struct {
 	Exe      string `json:"exe"`
 	Title    string `json:"title"`
 	Category string `json:"category"`
-	Rec      string `json:"recommended"` // recommended outbound
+	Rec      string `json:"recommended"`
 }
 
 var popularApps = []appPreset{
@@ -51,8 +49,16 @@ var popularApps = []appPreset{
 	{Exe: "Cursor.exe", Title: "Cursor IDE", Category: "Разработка и ИИ", Rec: obPsiphon},
 }
 
-// systemNoiseProcs are Windows background/system processes hidden from the
-// user-facing application picker so the list stays clean and relevant.
+var browserExeSet = map[string]bool{
+	"chrome": true, "msedge": true, "firefox": true, "browser": true,
+	"brave": true, "opera": true, "vivaldi": true, "yandex": true,
+	"waterfox": true, "librewolf": true, "zen": true, "arc": true, "tor": true,
+}
+
+func isBrowserApp(exe string) bool {
+	return browserExeSet[normAppName(exe)]
+}
+
 var systemNoiseProcs = map[string]bool{
 	"system": true, "registry": true, "smss": true, "csrss": true, "wininit": true,
 	"services": true, "lsass": true, "svchost": true, "fontdrvhost": true, "winlogon": true,
@@ -86,7 +92,17 @@ func presetForApp(exe string) (appPreset, bool) {
 	return appPreset{}, false
 }
 
-// appCurrentRoute inspects Config.Routing.Rules and Config.Tun.Exclude to
+func isPureAppRule(ru Rule) bool {
+	return len(ru.Domains) == 0 &&
+		len(ru.Keywords) == 0 &&
+		len(ru.CIDR) == 0 &&
+		len(ru.Lists) == 0 &&
+		len(ru.Ports) == 0 &&
+		len(ru.PortRanges) == 0 &&
+		ru.Proto == ""
+}
+
+// appCurrentRoute inspects Config.Tun.Exclude and Config.Routing.Rules to
 // report how connections from exe are currently routed.
 func (a *App) appCurrentRoute(exe string) string {
 	n := normAppName(exe)
@@ -95,8 +111,11 @@ func (a *App) appCurrentRoute(exe string) string {
 	}
 	a.cfg.mu.Lock()
 	defer a.cfg.mu.Unlock()
+	if tunAppMatch(exe, a.cfg.Tun.Exclude) {
+		return "tun-exclude"
+	}
 	for _, ru := range a.cfg.Routing.Rules {
-		if ru.Disabled || len(ru.Domains) > 0 || len(ru.Keywords) > 0 || len(ru.CIDR) > 0 || len(ru.Lists) > 0 || len(ru.Ports) > 0 || len(ru.PortRanges) > 0 {
+		if ru.Disabled || !isPureAppRule(ru) {
 			continue
 		}
 		for _, ap := range ru.Apps {
@@ -105,16 +124,13 @@ func (a *App) appCurrentRoute(exe string) string {
 			}
 		}
 	}
-	if tunAppMatch(exe, a.cfg.Tun.Exclude) {
-		return "tun-exclude"
-	}
 	return ""
 }
 
-// SetAppRoute configures or removes a per-application routing rule (Split
-// Tunneling). Outbound values:
+// SetAppRoute configures or removes a per-application routing rule.
 //   - "psiphon", "direct", "direct-dpi", "warp", "block", "auto", "psiphon:XX"
-//   - "tun-exclude": always direct + added to TUN excluded apps
+//   - "tun-exclude": bypasses TUN adapter completely + direct rule
+//   - "voice-vpn" / "voice-warp": creates combo UDP 50000-65535 + app rule for voice/chat
 //   - "default" or "": removes per-app overrides so general rules apply
 func (a *App) SetAppRoute(exe, outbound string) error {
 	exe = strings.TrimSpace(exe)
@@ -132,16 +148,18 @@ func (a *App) SetAppRoute(exe, outbound string) error {
 	if outbound == "default" {
 		outbound = ""
 	}
-	if outbound != "" && outbound != "tun-exclude" && !validOutbound(outbound) {
+	isVoiceProfile := outbound == "voice-vpn" || outbound == "voice-warp"
+	if outbound != "" && outbound != "tun-exclude" && !isVoiceProfile && !validOutbound(outbound) {
 		return errors.New("неизвестный маршрут: " + outbound)
 	}
 
+	a.rulesWriteMu.Lock()
+	defer a.rulesWriteMu.Unlock()
+
 	a.cfg.mu.Lock()
-	// 1. Remove exe from existing pure app rules
 	var kept []Rule
 	for _, ru := range a.cfg.Routing.Rules {
-		isPureAppRule := len(ru.Domains) == 0 && len(ru.Keywords) == 0 && len(ru.CIDR) == 0 && len(ru.Lists) == 0 && len(ru.Ports) == 0 && len(ru.PortRanges) == 0 && ru.Proto == ""
-		if isPureAppRule && len(ru.Apps) > 0 {
+		if isPureAppRule(ru) && len(ru.Apps) > 0 {
 			var remApps []string
 			for _, ap := range ru.Apps {
 				if strings.HasPrefix(strings.TrimSpace(ap), "!") || normAppName(ap) != n {
@@ -153,38 +171,65 @@ func (a *App) SetAppRoute(exe, outbound string) error {
 			}
 			ru.Apps = remApps
 		}
+		// Remove previous auto-generated voice profile rule for this app when changing route
+		if strings.HasPrefix(ru.Name, "Голос и чат: ") && len(ru.Apps) == 1 && normAppName(ru.Apps[0]) == n {
+			continue
+		}
 		kept = append(kept, ru)
 	}
-	// 2. Remove from Tun.Exclude unless outbound is "tun-exclude" or "direct"
+
+	tunExcludeChanged := false
 	var cleanEx []string
 	for _, ex := range a.cfg.Tun.Exclude {
 		if normAppName(ex) != n {
 			cleanEx = append(cleanEx, ex)
+		} else {
+			tunExcludeChanged = true
 		}
 	}
 	a.cfg.Tun.Exclude = cleanEx
 
-	if outbound == "tun-exclude" {
+	ruleName := "Приложение: " + exe
+	if pr, ok := presetForApp(exe); ok {
+		ruleName = pr.Title + " (" + exe + ")"
+	}
+
+	switch {
+	case outbound == "tun-exclude":
+		// В Tun.Exclude попадают ТОЛЬКО программы с явным маршрутом "tun-exclude" (например, игры с античитом).
 		a.cfg.Tun.Exclude = append(a.cfg.Tun.Exclude, exe)
-		ruleName := "Приложение: " + exe
-		if pr, ok := presetForApp(exe); ok {
-			ruleName = pr.Title + " (" + exe + ")"
-		}
+		tunExcludeChanged = true
 		kept = append([]Rule{{Name: ruleName, Outbound: obDirect, Apps: []string{exe}, Always: true}}, kept...)
-	} else if outbound != "" {
-		if outbound == obDirect && a.cfg.Tun.Enabled && !slices.Contains(a.cfg.Tun.Exclude, exe) {
-			a.cfg.Tun.Exclude = append(a.cfg.Tun.Exclude, exe)
+	case isVoiceProfile:
+		voiceOb := obPsiphon
+		if outbound == "voice-warp" {
+			voiceOb = obWarp
 		}
-		ruleName := "Приложение: " + exe
-		if pr, ok := presetForApp(exe); ok {
-			ruleName = pr.Title + " (" + exe + ")"
+		voiceRule := Rule{
+			Name:       "Голос и чат: " + exe + " (UDP 50000-65535)",
+			Outbound:   voiceOb,
+			Proto:      "udp",
+			PortRanges: []string{"443", "596-599", "1400", "3478", "10000-65535", "50000-65535"},
+			Apps:       []string{exe},
+			Always:     true,
 		}
+		appRule := Rule{Name: ruleName, Outbound: voiceOb, Apps: []string{exe}, Always: true}
+		kept = append([]Rule{voiceRule, appRule}, kept...)
+	case outbound != "":
+		// Для обычного outbound == obDirect НЕ добавляем программу в Tun.Exclude,
+		// чтобы внутри неё (особенно в браузерах) продолжали работать FakeIP и доменные правила Приоритета 1 и 2!
 		kept = append([]Rule{{Name: ruleName, Outbound: outbound, Apps: []string{exe}, Always: true}}, kept...)
 	}
 	a.cfg.Routing.Rules = kept
+	_ = a.cfg.saveLocked()
+	nowTun := a.cfg.Tun.Enabled
 	a.cfg.mu.Unlock()
-	_ = a.cfg.save()
+
+	if tunExcludeChanged && nowTun {
+		a.tun.refresh()
+	}
 	a.onRulesChanged()
+
 	if outbound == "" {
 		logf("info", "Маршрут для %s сброшен (применяются общие правила)", exe)
 	} else {
@@ -194,13 +239,26 @@ func (a *App) SetAppRoute(exe, outbound string) error {
 }
 
 // appsView returns the combined list of running processes, active network apps,
-// configured per-app rules, and the popular app catalog. Includes both
-// ("apps"/"presets", "app"/"route") for Gio UI and ("running"/"catalog",
-// "exe"/"outbound") aliases for Web UI and API tests.
+// configured per-app rules, and the popular app catalog, enriched with live
+// socket counts, traffic bytes, and the last accessed domain per process.
 func (a *App) appsView() map[string]any {
 	osProcs := listRunningProcesses()
 	snap := a.stats.snapshot()
 	statApps, _ := snap["apps"].([]map[string]any)
+	recentConns := a.stats.recentList()
+
+	lastHostByApp := map[string]string{}
+	lastRuleByApp := map[string]string{}
+	for _, rc := range recentConns {
+		if rc.App == "" || rc.Host == "" {
+			continue
+		}
+		na := normAppName(rc.App)
+		if na != "" && lastHostByApp[na] == "" {
+			lastHostByApp[na] = rc.Host
+			lastRuleByApp[na] = rc.Rule
+		}
+	}
 
 	type entry struct {
 		exe      string
@@ -210,7 +268,12 @@ func (a *App) appsView() map[string]any {
 		pids     int
 		conns    int
 		bytes    int64
+		up       int64
+		down     int64
 		route    string
+		lastHost string
+		lastRule string
+		browser  bool
 	}
 	byNorm := map[string]*entry{}
 	getOrMake := func(rawExe string) *entry {
@@ -229,7 +292,15 @@ func (a *App) appsView() map[string]any {
 		if pr, ok := presetForApp(exe); ok {
 			exe, title, cat = pr.Exe, pr.Title, pr.Category
 		}
-		e := &entry{exe: exe, title: title, category: cat, route: a.appCurrentRoute(exe)}
+		e := &entry{
+			exe:      exe,
+			title:    title,
+			category: cat,
+			route:    a.appCurrentRoute(exe),
+			lastHost: lastHostByApp[n],
+			lastRule: lastRuleByApp[n],
+			browser:  isBrowserApp(exe),
+		}
 		byNorm[n] = e
 		return e
 	}
@@ -256,6 +327,8 @@ func (a *App) appsView() map[string]any {
 			u, _ := sa["up"].(int64)
 			d, _ := sa["down"].(int64)
 			e.conns += c
+			e.up += u
+			e.down += d
 			e.bytes += u + d
 		}
 	}
@@ -279,16 +352,21 @@ func (a *App) appsView() map[string]any {
 	list := make([]map[string]any, 0, len(byNorm))
 	for _, e := range byNorm {
 		list = append(list, map[string]any{
-			"app":      e.exe,
-			"exe":      e.exe,
-			"title":    e.title,
-			"category": e.category,
-			"running":  e.running,
-			"pids":     e.pids,
-			"conns":    e.conns,
-			"bytes":    e.bytes,
-			"route":    e.route,
-			"outbound": e.route,
+			"app":       e.exe,
+			"exe":       e.exe,
+			"title":     e.title,
+			"category":  e.category,
+			"running":   e.running,
+			"pids":      e.pids,
+			"conns":     e.conns,
+			"bytes":     e.bytes,
+			"up":        e.up,
+			"down":      e.down,
+			"route":     e.route,
+			"outbound":  e.route,
+			"last_host": e.lastHost,
+			"last_rule": e.lastRule,
+			"browser":   e.browser,
 		})
 	}
 	sort.Slice(list, func(i, j int) bool {
@@ -309,8 +387,18 @@ func (a *App) appsView() map[string]any {
 
 	presets := make([]map[string]any, 0, len(popularApps))
 	for _, p := range popularApps {
+		n := normAppName(p.Exe)
 		rt := a.appCurrentRoute(p.Exe)
-		_, isRun := byNorm[normAppName(p.Exe)]
+		e := byNorm[n]
+		isRun := e != nil && e.running
+		var conns int
+		var bytes int64
+		var lastHost string
+		if e != nil {
+			conns = e.conns
+			bytes = e.bytes
+			lastHost = e.lastHost
+		}
 		presets = append(presets, map[string]any{
 			"app":         p.Exe,
 			"exe":         p.Exe,
@@ -318,6 +406,10 @@ func (a *App) appsView() map[string]any {
 			"category":    p.Category,
 			"recommended": p.Rec,
 			"running":     isRun,
+			"conns":       conns,
+			"bytes":       bytes,
+			"last_host":   lastHost,
+			"browser":     isBrowserApp(p.Exe),
 			"route":       rt,
 			"outbound":    rt,
 		})

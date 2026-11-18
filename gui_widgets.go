@@ -77,6 +77,41 @@ func (ui *gioUI) pillButton(gtx layout.Context, btn *widget.Clickable, txt strin
 	return ui.iconButton(gtx, btn, "", txt, active, style)
 }
 
+// segRouteButton рисует компактную кнопку внутри сегмент-переключателя маршрута (Tactical Minimal):
+// неактивные варианты отображаются спокойным приглушённым текстом без рамок, а выбранный маршрут
+// или кнопка при наведении подсвечивается своим фирменным семантическим цветом.
+func (ui *gioUI) segRouteButton(gtx layout.Context, btn *widget.Clickable, txt string, active bool, style string) layout.Dimensions {
+	_, fg, _, solid := ui.styleColors(style)
+	bg := color.NRGBA{}
+	textCol := ui.pal.mut
+	weight := font.Medium
+	if active {
+		bg = solid
+		textCol = rgb(0xFFFFFF)
+		weight = font.Bold
+	} else if btn.Hovered() {
+		bg = tint(solid, 38)
+		textCol = fg
+	}
+	return btn.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		pointer.CursorPointer.Add(gtx.Ops)
+		return layout.Background{}.Layout(gtx,
+			func(gtx layout.Context) layout.Dimensions {
+				if bg.A > 0 {
+					fillRect(gtx, gtx.Constraints.Min, gtx.Dp(6), bg)
+				}
+				return layout.Dimensions{Size: gtx.Constraints.Min}
+			},
+			func(gtx layout.Context) layout.Dimensions {
+				return layout.Inset{Top: unit.Dp(4), Bottom: unit.Dp(4), Left: unit.Dp(8), Right: unit.Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					return ui.labelLine(gtx, fontSmall, textCol, weight, txt)
+				})
+			},
+		)
+	})
+}
+
+
 func (ui *gioUI) flagButton(gtx layout.Context, btn *widget.Clickable, cc, txt string, active bool, style string) layout.Dimensions {
 	bg, fg, bdr, solid := ui.styleColors(style)
 	if active {
@@ -347,10 +382,10 @@ func (ui *gioUI) routeBadge(gtx layout.Context, ob string) layout.Dimensions {
 		bg, fg = ui.pal.tealSoft, ui.pal.teal
 		title = "Обход DPI"
 	case ob == obWarp:
-		bg, fg = ui.pal.vioSoft, ui.pal.vio
+		bg, fg = ui.pal.warnSoft, ui.pal.warn
 		title = "WARP"
 	case ob == obPsiphon || strings.HasPrefix(ob, "psiphon:"):
-		bg, fg = ui.pal.warnSoft, ui.pal.warn
+		bg, fg = ui.pal.vioSoft, ui.pal.vio
 		if ob == obPsiphon {
 			title = "Psiphon VPN"
 		} else {
@@ -1193,22 +1228,29 @@ func (ui *gioUI) Layout(gtx layout.Context) layout.Dimensions {
 						case 1:
 							return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-									return ui.layoutSubTabBar(gtx, 1, []string{"Правила, списки и конвейер (1–7)", "Программы (Split Tunneling)"})
+									return ui.layoutSubTabBar(gtx, 1, []string{"Умные правила (Приоритеты 1–4)", "Программы (Split Tunneling)", "Каталог списков и пресетов"})
 								}),
 								layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-									if ui.subTabs[1] == 1 {
+									switch ui.subTabs[1] {
+									case 1:
 										return ui.layoutAppsTab(gtx)
+									case 2:
+										return ui.layoutListsStandaloneTab(gtx)
+									default:
+										return ui.layoutRulesTab(gtx)
 									}
-									return ui.layoutRulesTab(gtx)
 								}),
 							)
 						case 2:
+							// Вкладка «Потоки» активна ТОЛЬКО когда пользователь нажал на неё (ui.tab == 2)
+							return ui.layoutStreamsTab(gtx)
+						case 3:
 							return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-									return ui.layoutSubTabBar(gtx, 2, []string{"Страны, обход DPI и WARP", "Раздача в LAN и устройства"})
+									return ui.layoutSubTabBar(gtx, 3, []string{"Страны, обход DPI и WARP", "Раздача в LAN и устройства"})
 								}),
 								layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-									if ui.subTabs[2] == 1 {
+									if ui.subTabs[3] == 1 {
 										return ui.layoutDevicesTab(gtx)
 									}
 									return ui.layoutCountriesDPITab(gtx)
@@ -1217,13 +1259,17 @@ func (ui *gioUI) Layout(gtx layout.Context) layout.Dimensions {
 						default:
 							return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-									return ui.layoutSubTabBar(gtx, 3, []string{"Настройки запуска, DNS/FakeIP и живой журнал", "Самопроверка (Selftest) и диагностика"})
+									return ui.layoutSubTabBar(gtx, 4, []string{"Живой журнал событий", "Настройки сети, DNS и защиты", "Самопроверка и диагностика сайта"})
 								}),
 								layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-									if ui.subTabs[3] == 1 {
+									switch ui.subTabs[4] {
+									case 1:
+										return ui.layoutSettingsOnlyTab(gtx)
+									case 2:
 										return ui.layoutTrafficDiagTab(gtx)
+									default:
+										return ui.layoutLiveLogOnlyTab(gtx)
 									}
-									return ui.layoutSettingsLogTab(gtx)
 								}),
 							)
 						}
@@ -1263,11 +1309,27 @@ func (ui *gioUI) layoutPageHeader(gtx layout.Context) layout.Dimensions {
 				)
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return ui.subCard(gtx, ui.pal.accSoft, tint(ui.pal.acc, 90), unit.Dp(6), func(gtx layout.Context) layout.Dimensions {
+					return ui.monoLabel(gtx, fontSmall, ui.pal.acc, "PsiRoute v"+version)
+				})
+			}),
+			layout.Rigid(layout.Spacer{Width: space1}.Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return ui.statusPill(gtx, pState)
 			}),
 			layout.Rigid(layout.Spacer{Width: space1}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return ui.copyChip(gtx, "hdr", "Прокси", host+":"+port)
+			}),
+			layout.Rigid(layout.Spacer{Width: space1}.Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				thmLbl := "Тема: Obsidian"
+				thmStyle := ""
+				if ui.pal.themeID == "cyber-amber" {
+					thmLbl = "Тема: Cyber-Amber"
+					thmStyle = "warn"
+				}
+				return ui.pillButton(gtx, &ui.themeToggleBtn, thmLbl, ui.pal.themeID == "cyber-amber", thmStyle)
 			}),
 			layout.Rigid(layout.Spacer{Width: space1}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
@@ -1327,8 +1389,8 @@ func (ui *gioUI) layoutSidebar(gtx layout.Context, collapsed bool) layout.Dimens
 		tabs  []int
 	}{
 		{"КОМАНДНЫЙ ЦЕНТР", []int{0}},
-		{"МАРШРУТЫ И ОБХОД", []int{1, 2}},
-		{"СИСТЕМА", []int{3}},
+		{"МАРШРУТИЗАЦИЯ", []int{1, 2}},
+		{"СЕТЬ И СИСТЕМА", []int{3, 4}},
 	}
 
 	renderNavItem := func(idx int) layout.FlexChild {
@@ -1434,7 +1496,7 @@ func (ui *gioUI) layoutSidebar(gtx layout.Context, collapsed bool) layout.Dimens
 										return ui.labelLine(gtx, fontTitle, ui.pal.text, font.Bold, "PsiRoute")
 									}),
 									layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-										return ui.labelLine(gtx, fontMicro, ui.pal.dim, font.SemiBold, "v"+version+" · PORTABLE")
+										return ui.labelLine(gtx, fontSmall, ui.pal.acc, font.Bold, "Версия v"+version+" · PORTABLE")
 									}),
 								)
 							})

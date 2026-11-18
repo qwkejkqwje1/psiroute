@@ -145,7 +145,6 @@ func setSystemProxy(addr string, on bool) error {
 		return mock(addr, on)
 	}
 	if isRunningTests() {
-		// Ни при каких условиях не изменяем системный прокси реального Windows во время тестов!
 		return nil
 	}
 	k, err := registry.OpenKey(registry.CURRENT_USER, inetKey, registry.SET_VALUE|registry.QUERY_VALUE)
@@ -170,8 +169,6 @@ func setSystemProxy(addr string, on bool) error {
 	return nil
 }
 
-// saveUserProxy remembers the current settings unless they are already ours
-// (or already saved), so repeated enables never save our own values.
 func saveUserProxy(k registry.Key, ours string) {
 	if sk, err := registry.OpenKey(registry.CURRENT_USER, savedKey, registry.QUERY_VALUE); err == nil {
 		sk.Close()
@@ -217,7 +214,6 @@ func restoreUserProxy(k registry.Key) bool {
 	return true
 }
 
-// isOurProxy reports whether a ProxyServer value points at one of our addrs.
 func isOurProxy(srv string, ours ...string) bool {
 	for _, o := range ours {
 		if o != "" && (srv == o || strings.Contains(srv, "="+o)) {
@@ -227,7 +223,6 @@ func isOurProxy(srv string, ours ...string) bool {
 	return false
 }
 
-// systemProxyOwnedBy reports an enabled system proxy pointing at us.
 func systemProxyOwnedBy(addrs ...string) bool {
 	k, err := registry.OpenKey(registry.CURRENT_USER, inetKey, registry.QUERY_VALUE)
 	if err != nil {
@@ -263,10 +258,6 @@ func autostartEnabled() bool {
 	return err == nil
 }
 
-// setAutostart регистрирует чистый автозапуск без всплывающих окон UAC:
-// если программа запущена с правами администратора (для режима TUN), создаётся задание
-// в Планировщике заданий Windows (Task Scheduler) с флагом /RL HIGHEST (Run with highest privileges),
-// а также запись в реестре HKCU\...\Run в качестве резерва.
 func setAutostart(on bool) error {
 	sysProxyMu.Lock()
 	mock := autostartMockFn
@@ -309,8 +300,6 @@ func setAutostart(on bool) error {
 	return nil
 }
 
-// installBackgroundService регистрирует сетевое ядро PsiRoute как системное задание/службу
-// с наивысшими привилегиями (NT AUTHORITY\SYSTEM / RL HIGHEST), чтобы режим TUN работал без запросов UAC.
 func installBackgroundService() error {
 	exe, err := os.Executable()
 	if err != nil {
@@ -339,8 +328,8 @@ type pidName struct {
 
 var pidNames sync.Map // uint32 -> pidName; entries expire, PIDs get reused
 
-// appForConn finds which program opened a local connection (by its source
-// port in the TCP table). LAN-share clients are shown by IP.
+// appForConn определяет процесс локального подключения по порту источника в таблице TCP Windows
+// (включая IPv6 loopback и мгновенное обновление кэша, если сокет открылся меньше 500 мс назад — Баг 4).
 func appForConn(remote net.Addr) string {
 	ta, ok := remote.(*net.TCPAddr)
 	if !ok {
@@ -349,10 +338,15 @@ func appForConn(remote net.Addr) string {
 	if !ta.IP.IsLoopback() {
 		return ta.IP.String()
 	}
+	var pid uint32
 	if ta.IP.To4() == nil {
-		return "" // IPv6 loopback: the IPv4 table does not have it
+		pid = ownerPID("tcp", true, uint16(ta.Port))
+	} else {
+		pid = pidForPort(ta.Port)
+		if pid == 0 {
+			pid = ownerPID("tcp", false, uint16(ta.Port))
+		}
 	}
-	pid := pidForPort(ta.Port)
 	if pid == 0 {
 		return ""
 	}
@@ -364,8 +358,6 @@ func appForConn(remote net.Addr) string {
 	return name
 }
 
-// The TCP table is fetched at most every 500 ms and shared by all new
-// connections (it was fetched once per connection before).
 var tcpTab struct {
 	mu   sync.Mutex
 	at   time.Time
@@ -375,7 +367,7 @@ var tcpTab struct {
 func pidForPort(port int) uint32 {
 	tcpTab.mu.Lock()
 	defer tcpTab.mu.Unlock()
-	if pid, ok := tcpTab.map_[port]; ok && time.Since(tcpTab.at) < 500*time.Millisecond {
+	if pid, ok := tcpTab.map_[port]; ok && pid != 0 && time.Since(tcpTab.at) < 500*time.Millisecond {
 		return pid
 	}
 	tcpTab.map_ = loadTCPTable()

@@ -561,3 +561,18 @@ func (ui *gioUI) loadFileIntoListEditor() {
 	ui.listContentEditor.SetText(string(b))
 	ui.setToast("Файл загружен в редактор — нажмите «Предпросмотр» или «Сохранить список»", false)
 }
+
+
+func (ui *gioUI) layoutListsStandaloneTab(gtx layout.Context) layout.Dimensions {
+	sections := []layout.Widget{
+		ui.layoutListsCatalogCard,
+	}
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+			return ui.mainList.Layout(gtx, len(sections), func(gtx layout.Context, i int) layout.Dimensions {
+				gtx.Constraints.Min.X = gtx.Constraints.Max.X
+				return sections[i](gtx)
+			})
+		}),
+	)
+}

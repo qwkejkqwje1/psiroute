@@ -463,6 +463,13 @@ func makeHIcon(size int, rgb uint32) uintptr {
 	return h
 }
 
+func makeHIconFlag(size int, rgb uint32, cc string) uintptr {
+	img := iconFlagImage(size, rgb, cc)
+	h, _, _ := dtCreateIconFromResourceEx.Call(uintptr(unsafe.Pointer(&img[0])), uintptr(len(img)),
+		1, 0x00030000, uintptr(size), uintptr(size), 0)
+	return h
+}
+
 // ---- the core's desktop side: tray + window process ----
 
 const (
@@ -935,6 +942,10 @@ func focusWindow(h uintptr) {
 
 // setWindowIcon gives our window (title bar, taskbar, Alt+Tab) the drawn icon.
 func setWindowIcon() {
+	setWindowIconState("", "")
+}
+
+func setWindowIconState(state, cc string) {
 	h := findAppWindow()
 	if h == 0 {
 		return
@@ -944,10 +955,23 @@ func setWindowIcon() {
 	if pid != uint32(os.Getpid()) {
 		return
 	}
-	if big := makeHIcon(48, iconBrand); big != 0 {
+	var big, small uintptr
+	if state == "connected" && cc != "" && cc != "auto" {
+		col := iconColor("connected")
+		big = makeHIconFlag(48, col, cc)
+		small = makeHIconFlag(trayIconSize(), col, cc)
+	} else {
+		col := uint32(iconBrand)
+		if state == "connected" {
+			col = iconColor("connected")
+		}
+		big = makeHIcon(48, col)
+		small = makeHIcon(trayIconSize(), col)
+	}
+	if big != 0 {
 		dtSendMessageW.Call(h, wmSetIcon, 1, big) // ICON_BIG
 	}
-	if small := makeHIcon(trayIconSize(), iconBrand); small != 0 {
+	if small != 0 {
 		dtSendMessageW.Call(h, wmSetIcon, 0, small) // ICON_SMALL
 	}
 }

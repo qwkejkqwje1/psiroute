@@ -210,6 +210,22 @@ func (a *App) dohExchange(ctx context.Context, ob string, q []byte) ([]byte, err
 	if cached := theDoHWire.get(key, q[0], q[1]); cached != nil {
 		return cached, nil
 	}
+	// Для прямого маршрута (obDirect) в условиях блокировки 1.1.1.1:443 / 8.8.8.8:443 со стороны ТСПУ
+	// сначала выполняем быстрый прямой обмен через физический адаптер (directWireExchange за 5–15 мс),
+	// если не активен тестовый TLS-перехватчик dohTestTLS.
+	if ob == obDirect && dohTestTLS == nil {
+		if b, err := directWireExchange(ctx, q); err == nil && len(b) >= 12 {
+			theDoHWire.put(key, b, 2*time.Minute)
+			if qname != "" {
+				if ips, err := dnsAnswers(b); err == nil {
+					for _, ip := range ips {
+						theRevDNS.put(ip, qname, 10*time.Minute)
+					}
+				}
+			}
+			return b, nil
+		}
+	}
 	cl := a.dohClient(ob)
 	var lastErr error
 	for _, u := range dohEndpoints {

@@ -41,6 +41,19 @@ const (
 
 func isElevated() bool { return windows.GetCurrentProcessToken().IsElevated() }
 
+var (
+	tunDnsapi                 = windows.NewLazySystemDLL("dnsapi.dll")
+	procDnsFlushResolverCache = tunDnsapi.NewProc("DnsFlushResolverCache")
+)
+
+// flushWindowsDNSCache сбрасывает системный DNS-кэш Windows (аналог ipconfig /flushdns без окна консоли),
+// чтобы браузеры сразу забывали отравленные провайдером IP-адреса заглушек и получали FakeIP (198.18.x.y).
+func flushWindowsDNSCache() {
+	if procDnsFlushResolverCache.Find() == nil {
+		_, _, _ = procDnsFlushResolverCache.Call()
+	}
+}
+
 // ---------- adapter ----------
 
 func openTunDevice(a *App, mtu int, v6 bool) (tunDevice, error) {
@@ -121,6 +134,7 @@ func setupAdapter(luid winipcfg.LUID, mtu int, v6 bool) error {
 			return fmt.Errorf("маршрут %s: %w", r, err)
 		}
 	}
+	flushWindowsDNSCache()
 	if err := luid.SetDNS(windows.AF_INET, []netip.Addr{tunDNS4}, nil); err != nil {
 		logf("warn", "TUN: DNS адаптера: %v", err)
 	}
@@ -279,12 +293,16 @@ func tunBestDefault(family winipcfg.AddressFamily) (uint32, string) {
 		if err != nil || ifr.OperStatus != winipcfg.IfOperStatusUp {
 			continue
 		}
+		alias := ifr.Alias()
+		if strings.EqualFold(alias, "Psiroute") {
+			continue
+		}
 		m := r.Metric
 		if ipi, err := r.InterfaceLUID.IPInterface(family); err == nil {
 			m += ipi.Metric
 		}
 		if m < bestMetric {
-			best, bestMetric, name = r.InterfaceIndex, m, ifr.Alias()
+			best, bestMetric, name = r.InterfaceIndex, m, alias
 		}
 	}
 	return best, name
@@ -296,6 +314,10 @@ func tunHtonl(v uint32) uint32 { return v>>24 | v>>8&0xff00 | v<<8&0xff0000 | v<
 // goes back into TUN. Errors for the other address family are ignored.
 func bindPhys(network, address string, c syscall.RawConn) error {
 	i4, i6 := physIdx4.Load(), physIdx6.Load()
+	if i4 == 0 && i6 == 0 {
+		_ = refreshPhys()
+		i4, i6 = physIdx4.Load(), physIdx6.Load()
+	}
 	return c.Control(func(fd uintptr) {
 		h := windows.Handle(fd)
 		if i4 != 0 && !strings.HasSuffix(network, "6") {

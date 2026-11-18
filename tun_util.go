@@ -2,12 +2,16 @@ package main
 
 // Platform-independent helpers for the TUN mode (tun.go): addresses, socket
 // binding to the real adapter, dynamic MTU & TCP MSS clamping for the
-// TUN -> WARP -> Psiphon cascade, traffic sniffing, the reverse DNS map, and
-// reusable packet buffer pools.
+// TUN -> WARP -> Psiphon cascade, traffic sniffing, QUIC Initial SNI parsing,
+// browser DoH IP detection, the reverse DNS map, and reusable packet buffer pools.
 
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"net"
@@ -78,6 +82,81 @@ var (
 	}
 )
 
+// knownPublicDoHIPs содержит публичные IP-адреса встроенных в браузеры и клиенты (Telegram, Chrome)
+// DoH-резолверов (Google, Cloudflare, Quad9, Yandex, AdGuard, OpenDNS, NextDNS). Когда включён
+// перехват DNS в TUN, блокировка прямых обращений к этим IP на порт 443 заставляет приложения
+// мгновенно откатиться на системный DNS (172.19.0.2) и получать FakeIP (Баг 3).
+var knownPublicDoHIPs = map[netip.Addr]struct{}{
+	netip.MustParseAddr("8.8.8.8"):                {},
+	netip.MustParseAddr("8.8.4.4"):                {},
+	netip.MustParseAddr("1.1.1.1"):                {},
+	netip.MustParseAddr("1.0.0.1"):                {},
+	netip.MustParseAddr("1.1.1.2"):                {},
+	netip.MustParseAddr("1.0.0.2"):                {},
+	netip.MustParseAddr("1.1.1.3"):                {},
+	netip.MustParseAddr("1.0.0.3"):                {},
+	netip.MustParseAddr("9.9.9.9"):                {},
+	netip.MustParseAddr("9.9.9.10"):               {},
+	netip.MustParseAddr("9.9.9.11"):               {},
+	netip.MustParseAddr("149.112.112.112"):        {},
+	netip.MustParseAddr("149.112.112.10"):         {},
+	netip.MustParseAddr("149.112.112.11"):         {},
+	netip.MustParseAddr("77.88.8.8"):              {},
+	netip.MustParseAddr("77.88.8.1"):              {},
+	netip.MustParseAddr("77.88.8.2"):              {},
+	netip.MustParseAddr("77.88.8.88"):             {},
+	netip.MustParseAddr("94.140.14.14"):           {},
+	netip.MustParseAddr("94.140.15.15"):           {},
+	netip.MustParseAddr("208.67.222.222"):         {},
+	netip.MustParseAddr("208.67.220.220"):         {},
+	netip.MustParseAddr("45.90.28.0"):             {},
+	netip.MustParseAddr("45.90.30.0"):             {},
+	netip.MustParseAddr("2001:4860:4860::8888"):   {},
+	netip.MustParseAddr("2001:4860:4860::8844"):   {},
+	netip.MustParseAddr("2606:4700:4700::1111"):   {},
+	netip.MustParseAddr("2606:4700:4700::1001"):   {},
+	netip.MustParseAddr("2606:4700:4700::1112"):   {},
+	netip.MustParseAddr("2606:4700:4700::1002"):   {},
+	netip.MustParseAddr("2620:fe::fe"):            {},
+	netip.MustParseAddr("2620:fe::9"):             {},
+	netip.MustParseAddr("2a02:6b8::feed:0ff"):     {},
+	netip.MustParseAddr("2a02:6b8:0:1::feed:0ff"): {},
+	netip.MustParseAddr("2a10:50c0::ad1:ff"):      {},
+	netip.MustParseAddr("2a10:50c0::ad2:ff"):      {},
+	netip.MustParseAddr("2620:119:35::35"):        {},
+	netip.MustParseAddr("2620:119:53::53"):        {},
+}
+
+func isKnownPublicDoHIP(ip netip.Addr) bool {
+	_, ok := knownPublicDoHIPs[ip.Unmap()]
+	return ok
+}
+
+var knownPublicDoHHosts = map[string]struct{}{
+	"dns.google":                  {},
+	"dns.google.com":              {},
+	"8888.google":                 {},
+	"cloudflare-dns.com":          {},
+	"mozilla.cloudflare-dns.com":  {},
+	"one.one.one.one":             {},
+	"1dot1dot1dot1.cloudflare-dns.com": {},
+	"dns.quad9.net":               {},
+	"common.dot.dns.yandex.net":   {},
+	"dns.adguard-dns.com":         {},
+	"dns.adguard.com":             {},
+	"doh.opendns.com":             {},
+	"dns.nextdns.io":              {},
+}
+
+func isKnownPublicDoHHost(host string) bool {
+	h := tunCleanHost(host)
+	if h == "" {
+		return false
+	}
+	_, ok := knownPublicDoHHosts[h]
+	return ok
+}
+
 func getMTUBuf() *[]byte { return mtuBufPool.Get().(*[]byte) }
 func putMTUBuf(b *[]byte) {
 	if b != nil {
@@ -101,11 +180,6 @@ func putUDPBuf(b *[]byte) { udpBufPool.Put(b) }
 
 // ---------- Dynamic MTU & TCP MSS Clamping (Priority 1) ----------
 
-// effectiveTunMTU calculates the optimal interface MTU for the active tunnel
-// cascade (TUN -> WARP -> Psiphon). When WARP is active in the cascade, the
-// inner MTU is capped at 1280 bytes so packets never fragment across WireGuard;
-// when only Psiphon is active with the default 1500 setting, 1380 is used to
-// leave headroom for OSSH/TLS/Meek framing.
 func effectiveTunMTU(configuredMTU int, warpCascade, psiActive bool) int {
 	mtu := configuredMTU
 	if mtu < tunMinMTU || mtu > tunMaxMTU {
@@ -123,10 +197,6 @@ func effectiveTunMTU(configuredMTU int, warpCascade, psiActive bool) int {
 	return mtu
 }
 
-// effectiveTunMSS computes the TCP Maximum Segment Size (MSS) ceiling for IPv4
-// or IPv6 packets traversing the TUN -> WARP -> Psiphon cascade. Clamping MSS
-// on SYN and SYN+ACK packets prevents PMTUD blackholes ("hanging" sites after
-// TLS handshake and dropped large file downloads).
 func effectiveTunMSS(configuredMTU int, isIPv6, warpCascade, psiActive bool) uint16 {
 	effMTU := effectiveTunMTU(configuredMTU, warpCascade, psiActive)
 	overhead := 40 // 20 bytes IPv4 + 20 bytes TCP
@@ -139,7 +209,6 @@ func effectiveTunMSS(configuredMTU int, isIPv6, warpCascade, psiActive bool) uin
 		overhead += tunCascadePsiOverhead
 	}
 	mss := effMTU - overhead
-	// Extra safety ceiling for double encapsulation (TUN -> WARP 1280 -> Psiphon)
 	if warpCascade && psiActive {
 		if !isIPv6 && mss > 1180 {
 			mss = 1180
@@ -159,15 +228,11 @@ func effectiveTunMSS(configuredMTU int, isIPv6, warpCascade, psiActive bool) uin
 	return uint16(mss)
 }
 
-// updateTCPChecksum16 incrementally updates a 16-bit one's complement TCP
-// checksum (RFC 1624) when a 16-bit word in the TCP header changes from oldVal
-// to newVal.
 func updateTCPChecksum16(csumBytes []byte, oldVal, newVal uint16) {
 	if len(csumBytes) < 2 || oldVal == newVal {
 		return
 	}
 	oldCsum := binary.BigEndian.Uint16(csumBytes)
-	// HC' = ~(~HC + ~m + m') in 1's complement arithmetic
 	hc := uint32(^oldCsum)
 	m := uint32(^oldVal)
 	mp := uint32(newVal)
@@ -179,10 +244,6 @@ func updateTCPChecksum16(csumBytes []byte, oldVal, newVal uint16) {
 	binary.BigEndian.PutUint16(csumBytes, newCsum)
 }
 
-// clampTCPMSS inspects a raw IPv4 or IPv6 packet and, if it is a TCP SYN or
-// SYN+ACK segment carrying an MSS option (kind=2, len=4) larger than the
-// allowed ceiling (maxMSS4 / maxMSS6), rewrites the MSS in-place and updates
-// the TCP checksum incrementally. Returns true if the packet was modified.
 func clampTCPMSS(pkt []byte, maxMSS4, maxMSS6 uint16) bool {
 	if len(pkt) < 40 {
 		return false
@@ -198,7 +259,6 @@ func clampTCPMSS(pkt []byte, maxMSS4, maxMSS6 uint16) bool {
 		if ihl < 20 || len(pkt) < ihl+20 || pkt[9] != 6 {
 			return false
 		}
-		// Skip non-initial IPv4 fragments (fragment offset != 0)
 		if binary.BigEndian.Uint16(pkt[6:8])&0x1fff != 0 {
 			return false
 		}
@@ -213,8 +273,6 @@ func clampTCPMSS(pkt []byte, maxMSS4, maxMSS6 uint16) bool {
 		if maxMSS6 == 0 || len(pkt) < 60 {
 			return false
 		}
-		// Jumbograms require parsing a Jumbo Payload option and are not
-		// supported here. Never interpret trailing buffer bytes as TCP data.
 		payloadLen := int(binary.BigEndian.Uint16(pkt[4:6]))
 		if payloadLen < 20 || 40+payloadLen > len(pkt) {
 			return false
@@ -222,7 +280,6 @@ func clampTCPMSS(pkt []byte, maxMSS4, maxMSS6 uint16) bool {
 		pkt = pkt[:40+payloadLen]
 		nxt := pkt[6]
 		off := 40
-		// Skip common IPv6 extension headers (Hop-by-Hop=0, Routing=43, DestOpts=60)
 		for ext := 0; ext < 4 && (nxt == 0 || nxt == 43 || nxt == 60); ext++ {
 			if off+2 > len(pkt) {
 				return false
@@ -241,7 +298,6 @@ func clampTCPMSS(pkt []byte, maxMSS4, maxMSS6 uint16) bool {
 	}
 
 	tcpHdr := pkt[tcpOff:]
-	// Check TCP SYN flag (bit 1 of byte 13)
 	if tcpHdr[13]&0x02 == 0 {
 		return false
 	}
@@ -252,10 +308,10 @@ func clampTCPMSS(pkt []byte, maxMSS4, maxMSS6 uint16) bool {
 	opts := tcpHdr[20:dataOff]
 	for i := 0; i < len(opts); {
 		kind := opts[i]
-		if kind == 0 { // End of Option List
+		if kind == 0 {
 			break
 		}
-		if kind == 1 { // NOP
+		if kind == 1 {
 			i++
 			continue
 		}
@@ -298,9 +354,6 @@ func isLoopbackTargetAddr(address string) bool {
 	return false
 }
 
-// directControl is set as net.Dialer.Control / ListenConfig.Control on every
-// direct outbound socket of Psiroute. Loopback targets (127.0.0.1 / ::1) are
-// never pinned to the physical adapter so local tests and local services work.
 func directControl(network, address string, c syscall.RawConn) error {
 	if !tunActive.Load() || isLoopbackTargetAddr(address) {
 		return nil
@@ -313,7 +366,6 @@ func tunDialBound(ctx context.Context, network, addr string) (net.Conn, error) {
 	return d.DialContext(ctx, network, addr)
 }
 
-// listenUDPDirect replaces net.ListenUDP("udp", nil) for outbound UDP.
 func listenUDPDirect() (*net.UDPConn, error) {
 	lc := net.ListenConfig{Control: directControl}
 	pc, err := lc.ListenPacket(context.Background(), "udp", ":0")
@@ -327,9 +379,6 @@ func listenUDPDirect() (*net.UDPConn, error) {
 	return nil, errors.New("udp: неожиданный тип сокета")
 }
 
-// listenUDPDirectFor opens an outbound UDP socket appropriate for dstIP.
-// When dstIP is loopback (e.g. 127.0.0.1 in tests or local services), it binds
-// without IP_UNICAST_IF so Windows routes loopback datagrams properly.
 func listenUDPDirectFor(dstIP net.IP) (*net.UDPConn, error) {
 	if dstIP != nil && dstIP.IsLoopback() {
 		netw := "udp"
@@ -367,7 +416,6 @@ func tunErrText(err error) string {
 
 func tunInternal(ip netip.Addr) bool { return tunNet4.Contains(ip) || tunNet6.Contains(ip) }
 
-// tunUDPTarget drops multicast and broadcast: they never leave the LAN.
 func tunUDPTarget(ip netip.Addr) bool {
 	if !ip.IsValid() || ip.IsUnspecified() || ip.IsMulticast() {
 		return false
@@ -383,8 +431,6 @@ var tunSelfExe = func() string {
 	return filepath.Base(p)
 }()
 
-// isSelfProc: Psiroute itself, its Psiphon, WARP, country workers and the
-// probe. Their traffic goes straight to the real adapter, never to Psiphon.
 func isSelfProc(pid uint32, name string) bool {
 	if pid == 0 {
 		return false
@@ -439,7 +485,6 @@ func tunCleanHost(h string) string {
 	return h
 }
 
-// sniffHost returns the TLS SNI or the HTTP Host of the first client bytes.
 func sniffHost(b []byte) string {
 	if len(b) == 0 {
 		return ""
@@ -466,7 +511,6 @@ func sniffHost(b []byte) string {
 	return ""
 }
 
-// sniffWantMore: the ClientHello or the HTTP headers are not complete yet.
 func sniffWantMore(b []byte) bool {
 	if len(b) == 0 {
 		return true
@@ -484,14 +528,214 @@ func sniffWantMore(b []byte) bool {
 	return false
 }
 
-// tunServerFirst: protocols where the server speaks first, waiting for the
-// client would only add delay.
 func tunServerFirst(port int) bool {
 	switch port {
 	case 21, 22, 23, 25, 110, 143, 587, 3306:
 		return true
 	}
 	return false
+}
+
+// ---------- QUIC Initial (RFC 9001) SNI Parser ----------
+
+var (
+	quicSaltV2 = []byte{0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb, 0xf9, 0xbd, 0x2e, 0xd9}
+)
+
+func hkdfExtractSHA256(salt, ikm []byte) []byte {
+	mac := hmac.New(sha256.New, salt)
+	mac.Write(ikm)
+	return mac.Sum(nil)
+}
+
+func hkdfExpandLabelSHA256(prk []byte, label string, outLen int) []byte {
+	fullLabel := "tls13 " + label
+	info := make([]byte, 2+1+len(fullLabel)+1)
+	binary.BigEndian.PutUint16(info[0:2], uint16(outLen))
+	info[2] = byte(len(fullLabel))
+	copy(info[3:], fullLabel)
+	info[3+len(fullLabel)] = 0
+
+	var out []byte
+	var prev []byte
+	counter := byte(1)
+	for len(out) < outLen {
+		mac := hmac.New(sha256.New, prk)
+		mac.Write(prev)
+		mac.Write(info)
+		mac.Write([]byte{counter})
+		prev = mac.Sum(nil)
+		out = append(out, prev...)
+		counter++
+	}
+	return out[:outLen]
+}
+
+func readQUICVarInt(b []byte) (uint64, int) {
+	if len(b) == 0 {
+		return 0, 0
+	}
+	prefix := b[0] >> 6
+	length := 1 << prefix
+	if len(b) < length {
+		return 0, 0
+	}
+	val := uint64(b[0] & 0x3f)
+	for i := 1; i < length; i++ {
+		val = (val << 8) | uint64(b[i])
+	}
+	return val, length
+}
+
+// parseQUICInitialSNI расшифровывает первый пакет QUIC Initial (RFC 9001, порт UDP 443)
+// стандартными ключами Initial Secret и извлекает TLS SNI из фрейма CRYPTO (Баг 3).
+func parseQUICInitialSNI(pkt []byte) string {
+	if len(pkt) < 64 || pkt[0]&0xc0 != 0xc0 {
+		return ""
+	}
+	ver := binary.BigEndian.Uint32(pkt[1:5])
+	salt := quicSaltV1
+	keyLabel, ivLabel, hpLabel := "quic key", "quic iv", "quic hp"
+	if ver == 0x6b3343cf { // QUIC v2 (RFC 9369)
+		salt = quicSaltV2
+		keyLabel, ivLabel, hpLabel = "quicv2 key", "quicv2 iv", "quicv2 hp"
+		if (pkt[0]&0x30)>>4 != 0x01 {
+			return ""
+		}
+	} else if ver == 0x00000001 {
+		if (pkt[0]&0x30)>>4 != 0x00 {
+			return ""
+		}
+	} else {
+		return ""
+	}
+	off := 5
+	if off >= len(pkt) {
+		return ""
+	}
+	dcidLen := int(pkt[off])
+	off++
+	if dcidLen > 20 || off+dcidLen >= len(pkt) {
+		return ""
+	}
+	dcid := pkt[off : off+dcidLen]
+	off += dcidLen
+	scidLen := int(pkt[off])
+	off++
+	if scidLen > 20 || off+scidLen >= len(pkt) {
+		return ""
+	}
+	off += scidLen
+
+	tokLen, n := readQUICVarInt(pkt[off:])
+	if n == 0 || off+n+int(tokLen) >= len(pkt) {
+		return ""
+	}
+	off += n + int(tokLen)
+
+	remLen, n := readQUICVarInt(pkt[off:])
+	if n == 0 || remLen < 20 {
+		return ""
+	}
+	off += n
+	pnOffset := off
+	if pnOffset+4+16 > len(pkt) {
+		return ""
+	}
+
+	initialSecret := hkdfExtractSHA256(salt, dcid)
+	clientSecret := hkdfExpandLabelSHA256(initialSecret, "client in", 32)
+	key := hkdfExpandLabelSHA256(clientSecret, keyLabel, 16)
+	iv := hkdfExpandLabelSHA256(clientSecret, ivLabel, 12)
+	hpKey := hkdfExpandLabelSHA256(clientSecret, hpLabel, 16)
+
+	hpBlock, err := aes.NewCipher(hpKey)
+	if err != nil {
+		return ""
+	}
+	var mask [16]byte
+	hpBlock.Encrypt(mask[:], pkt[pnOffset+4:pnOffset+20])
+
+	hdr := append([]byte(nil), pkt[:pnOffset+4]...)
+	hdr[0] ^= mask[0] & 0x0f
+	pnLen := int(hdr[0]&0x03) + 1
+	if pnOffset+pnLen+16 > len(pkt) || int(remLen) < pnLen+16 {
+		return ""
+	}
+	var pn uint64
+	for i := 0; i < pnLen; i++ {
+		hdr[pnOffset+i] ^= mask[1+i]
+		pn = (pn << 8) | uint64(hdr[pnOffset+i])
+	}
+
+	cipherLen := int(remLen) - pnLen
+	if pnOffset+pnLen+cipherLen > len(pkt) {
+		cipherLen = len(pkt) - (pnOffset + pnLen)
+	}
+	if cipherLen < 16 {
+		return ""
+	}
+
+	nonce := append([]byte(nil), iv...)
+	for i := 0; i < 8; i++ {
+		nonce[len(nonce)-1-i] ^= byte(pn >> (8 * i))
+	}
+	aeadBlk, err := aes.NewCipher(key)
+	if err != nil {
+		return ""
+	}
+	aead, err := cipher.NewGCM(aeadBlk)
+	if err != nil {
+		return ""
+	}
+	plain, err := aead.Open(nil, nonce, pkt[pnOffset+pnLen:pnOffset+pnLen+cipherLen], hdr[:pnOffset+pnLen])
+	if err != nil {
+		return ""
+	}
+
+	// Сборка CRYPTO-фреймов (тип 0x06) и передача в parseSNI (обёрнуто в TLS record 0x16)
+	cryptoBuf := make([]byte, 4096)
+	maxEnd := 0
+	for i := 0; i < len(plain); {
+		ft := plain[i]
+		i++
+		if ft == 0x00 || ft == 0x01 { // PADDING or PING
+			continue
+		}
+		if ft == 0x06 { // CRYPTO frame
+			cOff, n1 := readQUICVarInt(plain[i:])
+			if n1 == 0 {
+				break
+			}
+			i += n1
+			cLen, n2 := readQUICVarInt(plain[i:])
+			if n2 == 0 || i+n2+int(cLen) > len(plain) {
+				break
+			}
+			i += n2
+			data := plain[i : i+int(cLen)]
+			i += int(cLen)
+			end := int(cOff) + len(data)
+			if end <= len(cryptoBuf) {
+				copy(cryptoBuf[int(cOff):end], data)
+				if end > maxEnd {
+					maxEnd = end
+				}
+			}
+			continue
+		}
+		break
+	}
+	if maxEnd < 32 || cryptoBuf[0] != 0x01 { // HandshakeType ClientHello = 1
+		return ""
+	}
+	tlsRec := make([]byte, 5+maxEnd)
+	tlsRec[0] = 0x16
+	tlsRec[1] = 0x03
+	tlsRec[2] = 0x01
+	binary.BigEndian.PutUint16(tlsRec[3:5], uint16(maxEnd))
+	copy(tlsRec[5:], cryptoBuf[:maxEnd])
+	return tunCleanHost(parseSNI(tlsRec))
 }
 
 // ---------- reverse DNS map: IP -> domain from our own DNS answers ----------
@@ -564,8 +808,6 @@ func (r *revMap) get(a netip.Addr) string {
 
 // ---------- DNS helpers ----------
 
-// dnsQName returns the first question name and the offset right after the
-// question (end < 0: not a valid query).
 func dnsQName(q []byte) (name string, end int) {
 	if len(q) < 12 || binary.BigEndian.Uint16(q[4:]) == 0 {
 		return "", -1
@@ -596,7 +838,6 @@ func dnsQName(q []byte) (name string, end int) {
 	return strings.ToLower(sb.String()), off + 4
 }
 
-// dnsServfail builds a SERVFAIL answer so programs do not wait for a timeout.
 func dnsServfail(q []byte) []byte {
 	_, end := dnsQName(q)
 	if end < 0 {

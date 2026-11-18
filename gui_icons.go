@@ -257,7 +257,7 @@ func drawIcon(gtx layout.Context, kind string, size unit.Dp, col color.NRGBA) la
 	return layout.Dimensions{Size: image.Pt(s, s)}
 }
 
-var navIcons = [4]string{"home", "route", "shield", "gear"}
+var navIcons = [5]string{"home", "route", "lan", "globe", "chart"}
 
 // ---------- Vector Country Flags (Gio GPU Primitives) ----------
 

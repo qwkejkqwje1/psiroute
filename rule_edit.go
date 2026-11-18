@@ -9,9 +9,20 @@ import (
 func ruleEditableTokens(r map[string]any) string {
 	var parts []string
 	addStrs := func(key, prefix string) {
-		if arr, ok := r[key].([]any); ok {
+		switch arr := r[key].(type) {
+		case []any:
 			for _, it := range arr {
 				if s, ok := it.(string); ok && strings.TrimSpace(s) != "" {
+					if prefix != "" && !strings.HasPrefix(s, prefix) {
+						parts = append(parts, prefix+s)
+					} else {
+						parts = append(parts, s)
+					}
+				}
+			}
+		case []string:
+			for _, s := range arr {
+				if strings.TrimSpace(s) != "" {
 					if prefix != "" && !strings.HasPrefix(s, prefix) {
 						parts = append(parts, prefix+s)
 					} else {
@@ -36,6 +47,11 @@ func ruleEditableTokens(r map[string]any) string {
 			parts = append(parts, "port:"+fmt.Sprint(port))
 		}
 	}
+	if ports, ok := r["ports"].([]int); ok {
+		for _, port := range ports {
+			parts = append(parts, "port:"+strconv.Itoa(port))
+		}
+	}
 	for i, part := range parts {
 		if strings.ContainsAny(part, ",;\n\r#\"") {
 			parts[i] = strconv.Quote(part)
@@ -44,19 +60,25 @@ func ruleEditableTokens(r map[string]any) string {
 	return strings.Join(parts, ", ")
 }
 
-// Preserve the typed original when only metadata is edited: smart token
-// classification cannot losslessly represent regexes, keywords or list names.
+// Preserve the typed original when only metadata (such as outbound or always) is edited:
+// smart token classification cannot losslessly represent regexes, keywords or list names,
+// and exact_domains in rulesAddAPI preserves domain entries verbatim without adding "exact:" prefix.
 func ruleEditRequest(original map[string]any, target, name, outbound, proto string, always bool) map[string]any {
 	body := map[string]any{"name": name, "outbound": outbound, "proto": proto, "always": always}
 	if original != nil {
 		body["disabled"] = original["disabled"]
 	}
 	if original != nil && target == ruleEditableTokens(original) {
-		for _, key := range []string{"domains", "cidr", "keywords", "lists", "apps", "ports", "port_ranges"} {
+		for _, key := range []string{"domains", "cidr", "ips", "keywords", "lists", "apps", "ports", "port_ranges"} {
 			if value, ok := original[key]; ok {
-				if key == "domains" {
+				switch key {
+				case "domains":
 					body["exact_domains"] = value
-				} else {
+				case "ips":
+					if _, hasCIDR := original["cidr"]; !hasCIDR {
+						body["cidr"] = value
+					}
+				default:
 					body[key] = value
 				}
 			}

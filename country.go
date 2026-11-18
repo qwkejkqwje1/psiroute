@@ -22,19 +22,18 @@ import (
 // Per-rule exit country ("psiphon:DE") and optional 2-tunnel parallel download
 // load-balancing pool (Priority 6).
 //
-// Memory optimization (1.1.0+):
+// Memory & Stability optimization (2.0.5):
 //  1. Zero-process fast path: if the main in-process Psiphon controller is
-//     already connected to country CC (or configured for CC), traffic goes
-//     straight through the main controller (0 extra processes, 0 MB extra RAM).
-//  2. Hot-switch mode: if SingleProcessCountries is enabled (or the main
-//     tunnel is idle/auto and no conflicting country rule is active), the main
-//     in-process controller can hot-switch its EgressRegion to CC without
-//     spawning a child process.
-//  3. Ultra-slim worker fallback & optional 2nd parallel pool slot (Priority 6):
-//     when two different country tunnels are simultaneously active (or when a
-//     secondary parallel download tunnel is active), the helper process
-//     initializes ONLY a bare Psiphon controller with GOMEMLIMIT=24MiB and
-//     GOGC=30, and stops automatically after countryIdle (5 min) of inactivity.
+//     already connected to country CC (or explicitly configured for CC),
+//     traffic goes straight through the main controller (0 extra processes,
+//     0 MB extra RAM).
+//  2. Non-destructive per-country workers (Находка 12 fix): when a rule
+//     requests a different exit country than the main tunnel (e.g. psiphon:NL
+//     while the main tunnel is Auto/DE or another rule uses psiphon:US),
+//     canReuseMain NEVER overwrites Config.Psiphon.Country and NEVER restarts
+//     the main Psiphon tunnel. Instead, it launches an ultra-slim worker
+//     process (GOMEMLIMIT=24MiB, GOGC=30) that stops after countryIdle (5 min)
+//     of inactivity.
 
 const countryIdle = 5 * time.Minute
 
@@ -211,9 +210,16 @@ func (c *Countries) DialPoolSlot(ctx context.Context, region, addr string) (net.
 }
 
 // canReuseMain reports whether the main in-process Psiphon controller already
-// serves country cc (or can be hot-switched in single-process mode).
+// serves country cc or is explicitly configured for cc.
+// Находка 12 fix: NEVER mutates c.app.cfg.Psiphon.Country and NEVER calls
+// c.app.psi.Restart() when a per-rule country differs from the main tunnel,
+// preventing tunnel drops, infinite country ping-pong, and config corruption.
 func (c *Countries) canReuseMain(cc string) bool {
 	if c.app == nil || c.app.psi == nil {
+		return false
+	}
+	cc = strings.ToUpper(strings.TrimSpace(cc))
+	if cc == "" {
 		return false
 	}
 	c.app.psi.mu.Lock()
@@ -224,28 +230,11 @@ func (c *Countries) canReuseMain(cc string) bool {
 		return true
 	}
 	c.app.cfg.mu.Lock()
-	cfgReg := strings.ToUpper(c.app.cfg.Psiphon.Country)
+	cfgReg := strings.ToUpper(strings.TrimSpace(c.app.cfg.Psiphon.Country))
 	singleProc := c.app.cfg.Psiphon.SingleProcessCountries
 	c.app.cfg.mu.Unlock()
-	if cfgReg == cc && c.app.psi.running() {
+	if cfgReg == cc && (c.app.psi.running() || st == "connected" || st == "connecting" || st == "reconnecting" || singleProc) {
 		return true
-	}
-	if singleProc {
-		c.mu.Lock()
-		canHot := c.hotCountry == cc || time.Since(c.hotSwitch) > 30*time.Second
-		if canHot && cfgReg != cc {
-			c.hotCountry = cc
-			c.hotSwitch = time.Now()
-			c.mu.Unlock()
-			c.app.cfg.mu.Lock()
-			c.app.cfg.Psiphon.Country = cc
-			c.app.cfg.mu.Unlock()
-			logf("info", "Psiphon: горячее переключение страны выхода на %s в основном процессе (без дочернего процесса)", cc)
-			go c.app.psi.Restart()
-			return true
-		}
-		c.mu.Unlock()
-		return canHot
 	}
 	return false
 }
@@ -323,8 +312,8 @@ func (c *Countries) get(cc string) (*countryWorker, error) {
 	return w, nil
 }
 
-// Dial goes out through the main Psiphon tunnel when it already matches cc (or
-// in single-process hot-switch mode), otherwise through the slim worker for cc.
+// Dial goes out through the main Psiphon tunnel when it already matches cc,
+// otherwise through the dedicated slim worker for cc.
 func (c *Countries) Dial(ctx context.Context, cc, addr string) (net.Conn, error) {
 	cc = strings.ToUpper(strings.TrimSpace(cc))
 	if err := ctx.Err(); err != nil {

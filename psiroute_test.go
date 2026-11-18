@@ -97,25 +97,25 @@ func TestRouterPlanRulesMode(t *testing.T) {
 			{Name: "ключ", Outbound: obDesync, Keywords: []string{"video"}},
 		}
 	})
-	// rule by domain, failover appends psiphon at the end
+	// rule by domain: explicit direct rule never appends psiphon failover
 	order, name := app.router.plan("www.blocked.test", 443)
-	if len(order) != 2 || order[0] != obDirect || order[1] != obPsiphon || name != "прямой" {
+	if len(order) != 1 || order[0] != obDirect || name != "прямой" {
 		t.Fatalf("domain plan = %v (%q)", order, name)
 	}
 	// rule by port matches even when the domain does not
 	order, name = app.router.plan("other.test", 25)
-	if len(order) == 0 || order[0] != obDirect || name != "почта" {
+	if len(order) != 1 || order[0] != obDirect || name != "почта" {
 		t.Fatalf("port plan = %v (%q)", order, name)
 	}
-	// rule by keyword
+	// rule by keyword: in "rules" mode Failover must NOT append obPsiphon to obDesync
 	order, name = app.router.plan("my-video.test", 443)
-	if len(order) == 0 || order[0] != obDesync || name != "ключ" {
-		t.Fatalf("keyword plan = %v (%q)", order, name)
+	if len(order) != 1 || order[0] != obDesync || name != "ключ" {
+		t.Fatalf("keyword plan = %v (%q), want [direct-dpi] without psiphon failover", order, name)
 	}
-	// no rule: default outbound, failover must not duplicate psiphon
+	// no rule: in "rules" mode unmatched traffic goes to obDirect ("по умолчанию (мимо VPN)") without psiphon failover
 	order, name = app.router.plan("unknown.test", 443)
-	if len(order) != 1 || order[0] != obPsiphon || name != "по умолчанию" {
-		t.Fatalf("default plan = %v (%q)", order, name)
+	if len(order) != 1 || order[0] != obDirect || name != "по умолчанию (мимо VPN)" {
+		t.Fatalf("default plan = %v (%q), want [direct] (\"по умолчанию (мимо VPN)\")", order, name)
 	}
 }
 
@@ -164,11 +164,13 @@ func TestRouterPlanLearnedFirst(t *testing.T) {
 	if len(order) != 2 || order[0] != obDirect || order[1] != obPsiphon {
 		t.Fatalf("learned plan = %v (%q)", order, name)
 	}
-	// In rules mode the same learned entry must NOT hijack the default.
+	// In rules mode a learned VPN/WARP entry must NOT hijack unmatched traffic:
+	// unmatched hosts go to obDirect ("по умолчанию (мимо VPN)") without psiphon failover.
+	app.router.remember("learned-vpn.test", obWarp, "тест-vpn", true)
 	setCfg(app, func(c *Config) { c.Routing.Mode = "rules" })
-	order, _ = app.router.plan("learned.test", 443)
-	if len(order) == 0 || order[0] != obPsiphon {
-		t.Fatalf("rules mode must ignore learned, plan = %v", order)
+	order, name = app.router.plan("learned-vpn.test", 443)
+	if len(order) != 1 || order[0] != obDirect || name != "по умолчанию (мимо VPN)" {
+		t.Fatalf("rules mode must ignore learned and route unmatched to direct, plan = %v (%q)", order, name)
 	}
 }
 

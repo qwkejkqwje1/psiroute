@@ -14,7 +14,7 @@ import (
 	"syscall"
 )
 
-const version = "2.0.4"
+const version = "2.1.1"
 
 // crashRestarts: how many times the watchdog restarted the core after a crash.
 var crashRestarts int

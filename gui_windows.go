@@ -13,7 +13,7 @@ import (
 
 // windowTitle also identifies the window: the core finds it by its title to
 // bring it to the front and to close it on exit.
-const windowTitle = "Psiroute — Psiphon VPN"
+const windowTitle = "Psiroute v" + version + " — Psiphon VPN"
 
 var procMessageBox = dtUser32.NewProc("MessageBoxW")
 

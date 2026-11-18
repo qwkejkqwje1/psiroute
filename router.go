@@ -181,8 +181,8 @@ type RouteStageInfo struct {
 
 var routingPipelineStages = []RouteStageInfo{
 	{Stage: 1, Title: "Системные и LAN", Example: "127.0.0.0/8, 192.168.0.0/16, psiroute.exe", Summary: "Всегда Direct (защита от петель и потери доступа к роутеру)"},
-	{Stage: 2, Title: "Правила для программ", Example: "cs2.exe → Direct, Discord.exe → WARP", Summary: "Явный маршрут процесса перекрывает списки доменов"},
-	{Stage: 3, Title: "Личные правила пользователя", Example: "mybank.ru → Direct, work.com → psiphon:DE", Summary: "Точные домены, IP и порты из Быстрого правила и редактора"},
+	{Stage: 2, Title: "Правила для программ", Example: "chrome.exe + youtube.com → Psiphon, cs2.exe → Direct", Summary: "Точечные правила Программа+Сайт (Tier 1) и маршруты процессов (Tier 3)"},
+	{Stage: 3, Title: "Личные правила пользователя", Example: "youtube.com → Psiphon, mybank.ru → Direct", Summary: "Точные домены, IP и порты из вкладки Правила (работают внутри всех браузеров)"},
 	{Stage: 4, Title: "Белый список РФ / Исключения", Example: "ru-gov-banks (*.ru, *.рф, Госуслуги, банки)", Summary: "Всегда Direct в Умном обходе без капч и лишнего пинга"},
 	{Stage: 5, Title: "Подключённые списки (Пресеты)", Example: "youtube → direct-dpi, ai-services → psiphon", Summary: "Массовые списки заблокированных сервисов и подсетей"},
 	{Stage: 6, Title: "Выученные маршруты (Auto-learn)", Example: "psiroute-learned.json", Summary: "Автоматически найденные обходы после сброса ТСПУ (только в Умном обходе)"},
@@ -191,17 +191,19 @@ var routingPipelineStages = []RouteStageInfo{
 
 // RouteExplanation возвращает полную диагностику («Почему так пошло?») для любого домена/IP/программы.
 type RouteExplanation struct {
-	Host       string   `json:"host"`
-	Port       int      `json:"port"`
-	Proto      string   `json:"proto"`
-	App        string   `json:"app,omitempty"`
-	Outbound   string   `json:"outbound"`
-	Chain      []string `json:"chain"`
-	Rule       string   `json:"rule"`
-	Stage      int      `json:"stage"`
-	StageTitle string   `json:"stage_title"`
-	Badge      string   `json:"badge"`
-	Learned    string   `json:"learned"`
+	Host         string   `json:"host"`
+	Port         int      `json:"port"`
+	Proto        string   `json:"proto"`
+	App          string   `json:"app,omitempty"`
+	Outbound     string   `json:"outbound"`
+	Chain        []string `json:"chain"`
+	Rule         string   `json:"rule"`
+	Stage        int      `json:"stage"`
+	StageTitle   string   `json:"stage_title"`
+	Badge        string   `json:"badge"`
+	Learned      string   `json:"learned"`
+	Conflict     string   `json:"conflict,omitempty"`
+	ConflictRule string   `json:"conflict_rule,omitempty"`
 }
 
 func stageTitleFor(stage int) string {
@@ -256,12 +258,37 @@ func formatRouteBadge(ob string, stage int, ruleName, app string) string {
 	}
 }
 
-// rulePriorityTier относит правило к уровню конвейера (2..5):
-//
-//	2 — явное правило для программы; proto/ports/domain/list уточняют совпадение
-//	3 — личное правило пользователя (точные домены/IP/порты без внешних списков)
-//	4 — правило Белого списка РФ / исключений (ru-gov-banks / ru -> direct)
-//	5 — правило на основе подключённых списков (Lists)
+// isRUWhitelistRule определяет правила Белого списка РФ (ru-direct / except-ru / ru-gov-banks),
+// чтобы широкие правила для зоны .ru/.рф/.su всегда находились на Уровне 5 (Группа 4) и НИКОГДА
+// не перебивали личные доменные правила пользователя (Уровень 3) для конкретных сайтов!
+func isRUWhitelistRule(ru Rule) bool {
+	if ru.Outbound != obDirect {
+		return false
+	}
+	for _, l := range ru.Lists {
+		l = strings.ToLower(strings.TrimSpace(l))
+		if l == "ru" || l == "ru-gov-banks" {
+			return true
+		}
+	}
+	if len(ru.Domains) > 0 && len(ru.Apps) == 0 && len(ru.CIDR) == 0 && len(ru.Ports) == 0 && len(ru.PortRanges) == 0 {
+		for _, d := range ru.Domains {
+			d = strings.ToLower(strings.TrimSpace(d))
+			if d == "ru" || d == ".ru" || d == "*.ru" || d == "xn--p1ai" || d == "su" || d == "рф" || d == "country:ru" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// rulePriorityTier синхронизирует порядок проверки в router.go с визуальными группами gui_rules.go:
+//   2 — Группа 1: Точечные правила (Программа + Сайт/Порт/Список/Протокол)
+//   3 — Группа 2: Личные сайты, домены и IP (работают внутри всех браузеров поверх общих правил программ!)
+//   4 — Группа 3: Общие правила для программ целиком с конкретным маршрутом (Discord.exe, игры)
+//   5 — Группа 4а: Белый список РФ (ru / ru-gov-banks -> direct)
+//   6 — Группа 4б: Массовые подключённые списки (youtube, ru-blocked, ai-services и др.)
+//   7 — Чистое правило программы с маршрутом obAuto (chrome.exe -> auto), чтобы браузеры сначала проверяли списки Tier 5..6
 func rulePriorityTier(ru Rule) int {
 	hasPosApp := false
 	for _, a := range ru.Apps {
@@ -271,21 +298,69 @@ func rulePriorityTier(ru Rule) int {
 			break
 		}
 	}
-	if hasPosApp {
+	hasTarget := len(ru.Domains) > 0 || len(ru.Keywords) > 0 || len(ru.CIDR) > 0 ||
+		len(ru.Ports) > 0 || len(ru.PortRanges) > 0
+	hasLists := len(ru.Lists) > 0
+
+	// 2 — Точечные правила: Программа + Сайт/Порт/Список/Протокол
+	if hasPosApp && (hasTarget || hasLists || strings.TrimSpace(ru.Proto) != "") {
 		return 2
 	}
-	if len(ru.Lists) == 0 {
+	// 5 — Белый список РФ (проверяется ДО Tier 3, чтобы шаблон ru-direct с доменом "ru" не перехватывал личные .ru сайты!)
+	if !hasPosApp && isRUWhitelistRule(ru) {
+		return 5
+	}
+	// 3 — Личные сайты, домены и IP (работают внутри всех браузеров поверх общих правил программ!)
+	if !hasPosApp && (hasTarget || !hasLists) {
 		return 3
 	}
-	if ru.Outbound == obDirect {
-		for _, l := range ru.Lists {
-			l = strings.ToLower(strings.TrimSpace(l))
-			if l == "ru" || l == "ru-gov-banks" {
-				return 4
+	// 4 / 7 — Общие правила для программ целиком (если маршрут auto — проверяется после списков на уровне 7)
+	if hasPosApp {
+		if strings.EqualFold(strings.TrimSpace(ru.Outbound), obAuto) {
+			return 7
+		}
+		return 4
+	}
+	// 6 — Массовые подключённые списки (youtube, ru-blocked и др.)
+	return 6
+}
+
+// rulePipelineStage отображает внутренний уровень приоритета (2..7) на 7-уровневую шкалу конвейера (Stage 2..5).
+func rulePipelineStage(ru Rule, tier int) int {
+	switch tier {
+	case 2, 4, 7:
+		return 2
+	case 3:
+		return 3
+	case 5:
+		return 4
+	case 6:
+		if ru.Outbound == obDirect {
+			for _, l := range ru.Lists {
+				l = strings.ToLower(strings.TrimSpace(l))
+				if l == "ru" || l == "ru-gov-banks" {
+					return 4
+				}
 			}
 		}
+		return 5
 	}
 	return 5
+}
+
+// RuleGroupTier возвращает группу карточки правила для визуальной группировки во вкладке «Правила» (1..4).
+func RuleGroupTier(ru Rule) int {
+	t := rulePriorityTier(ru)
+	switch t {
+	case 2:
+		return 1 // 1. Точечные правила (Программа + Сайт/Порт)
+	case 3:
+		return 2 // 2. Сайты и домены (внутри всех браузеров)
+	case 4, 7:
+		return 3 // 3. Правила программ целиком
+	default:
+		return 4 // 4. Подключённые списки (ru-blocked и др.)
+	}
 }
 
 // serviceCompanionDomains связывает основные домены популярных сервисов с их техническими
@@ -377,10 +452,10 @@ func hostMatches(host, pattern string) bool {
 		return host != "" && rest != "" && strings.Contains(host, rest)
 	}
 	if rest, ok := strings.CutPrefix(lowerPat, "exact:"); ok {
-		return host != "" && host == cleanHostKey(rest)
+		return host != "" && host == cleanHostKey(cleanHost(rest))
 	}
 	if rest, ok := strings.CutPrefix(lowerPat, "full:"); ok {
-		return host != "" && host == cleanHostKey(rest)
+		return host != "" && host == cleanHostKey(cleanHost(rest))
 	}
 	if rest, ok := strings.CutPrefix(lowerPat, "domain:"); ok {
 		lowerPat = strings.TrimSpace(rest)
@@ -392,11 +467,11 @@ func hostMatches(host, pattern string) bool {
 		}
 		return cc != "" && strings.HasSuffix(host, "."+cc)
 	}
-	if strings.Contains(lowerPat, "://") || strings.ContainsAny(lowerPat, "/?#") {
-		lowerPat = cleanHost(lowerPat)
-		if strings.HasPrefix(lowerPat, "www.") && strings.Count(lowerPat, ".") >= 2 {
-			lowerPat = strings.TrimPrefix(lowerPat, "www.")
-		}
+	// Всегда очищаем URL/порт и ведущий www., чтобы "www.youtube.com" и "youtube.com:443"
+	// корректно подхватывали serviceCompanionDomains["youtube.com"] (googlevideo.com и др.).
+	lowerPat = cleanHost(lowerPat)
+	if strings.HasPrefix(lowerPat, "www.") && strings.Count(lowerPat, ".") >= 2 {
+		lowerPat = strings.TrimPrefix(lowerPat, "www.")
 	}
 	pattern = cleanHostKey(strings.TrimPrefix(lowerPat, "*."))
 	pattern = strings.TrimPrefix(pattern, ".")
@@ -531,6 +606,12 @@ func isPrivateOrLANHost(host string, ips []net.IP) bool {
 	if h == "localhost" || strings.HasSuffix(h, ".local") || strings.HasSuffix(h, ".lan") || strings.HasSuffix(h, ".home") || strings.HasSuffix(h, ".internal") {
 		return true
 	}
+	// Если h — это публичное доменное имя (не IP-литерал), НЕ проверяем ips на принадлежность к 10.0.0.0/8 и 192.168.0.0/16:
+	// провайдеры при DNS-спуфинге заблокированных сайтов часто отдают приватный IP заглушки (10.x.x.x),
+	// и он не должен уводить домен в Direct ("локальная сеть") мимо VPN-правил пользователя!
+	if h != "" && net.ParseIP(h) == nil {
+		return false
+	}
 	for _, ip := range ips {
 		if a, ok := netip.AddrFromSlice(ip); ok {
 			a = a.Unmap()
@@ -557,11 +638,17 @@ func (r *Router) matchRuleFull(proto, host, dstIP string, port int, app string, 
 	return ob, name
 }
 
-// matchRuleFullWithStage evaluates rules strictly along the Top-to-Bottom Priority Pipeline:
-// Tier 2 (Per-App Rules) -> Tier 3 (Personal Rules) -> Tier 4 (RU Whitelist) -> Tier 5 (Preset Lists).
+// matchRuleFullWithStage evaluates rules strictly along the priority tiers:
+// Tier 2 (Combo App+Target) -> Tier 3 (Explicit Domains/IPs/Ports) -> Tier 4 (Pure App concrete) -> Tier 5..6 (Lists) -> Tier 7 (Pure App auto).
 func (r *Router) matchRuleFullWithStage(proto, host, dstIP string, port int, app string, onlyAlways bool) (outbound, ruleName string, stage int) {
+	ob, name, st, _, _ := r.matchRuleWithConflict(proto, host, dstIP, port, app, onlyAlways)
+	return ob, name, st
+}
+
+func (r *Router) matchRuleWithConflict(proto, host, dstIP string, port int, app string, onlyAlways bool) (outbound, ruleName string, stage int, conflictDesc, conflictRule string) {
 	host = cleanHostKey(host)
 	r.a.cfg.mu.Lock()
+	mode := r.a.cfg.Routing.Mode
 	rules := append([]Rule(nil), r.a.cfg.Routing.Rules...)
 	r.a.cfg.mu.Unlock()
 
@@ -618,6 +705,7 @@ func (r *Router) matchRuleFullWithStage(proto, host, dstIP string, port int, app
 
 		excluded := false
 		hasPosCond := false
+		hasNegCond := false
 		posMatched := false
 
 		for _, d := range ru.Domains {
@@ -626,6 +714,7 @@ func (r *Router) matchRuleFullWithStage(proto, host, dstIP string, port int, app
 				continue
 			}
 			if strings.HasPrefix(d, "!") {
+				hasNegCond = true
 				if hostMatches(host, d[1:]) {
 					excluded = true
 					break
@@ -647,6 +736,7 @@ func (r *Router) matchRuleFullWithStage(proto, host, dstIP string, port int, app
 				continue
 			}
 			if strings.HasPrefix(kw, "!") {
+				hasNegCond = true
 				neg := strings.TrimSpace(kw[1:])
 				if neg != "" && host != "" && strings.Contains(host, neg) {
 					excluded = true
@@ -669,6 +759,7 @@ func (r *Router) matchRuleFullWithStage(proto, host, dstIP string, port int, app
 				continue
 			}
 			if strings.HasPrefix(c, "!") {
+				hasNegCond = true
 				if pfx, ok := parsePrefixCached(c[1:]); ok {
 					for _, a := range netipAddrs {
 						if pfx.Contains(a) {
@@ -699,6 +790,12 @@ func (r *Router) matchRuleFullWithStage(proto, host, dstIP string, port int, app
 		}
 
 		if len(ru.Lists) > 0 && r.a.lists != nil {
+			for _, l := range ru.Lists {
+				if strings.HasPrefix(strings.TrimSpace(l), "!") {
+					hasNegCond = true
+					break
+				}
+			}
 			listPos, listHasPos, listNeg := r.a.lists.EvalLists(ru.Lists, host, netipAddrs)
 			if listNeg {
 				return "", "", false
@@ -721,23 +818,46 @@ func (r *Router) matchRuleFullWithStage(proto, host, dstIP string, port int, app
 			}
 			return "", "", false
 		}
-		if len(ru.Ports) > 0 || len(ru.PortRanges) > 0 || len(ru.Apps) > 0 || ru.Proto != "" {
+		hasPosApp := false
+		for _, a := range ru.Apps {
+			a = strings.TrimSpace(a)
+			if a != "" && !strings.HasPrefix(a, "!") {
+				hasPosApp = true
+				break
+			}
+		}
+		// В режиме «По моим правилам» общее правило браузера со значением obAuto ("Авто / По правилам")
+		// не должно перехватывать несовпавшие сайты в VPN-цепочку — они должны идти по умолчанию (Direct).
+		if mode == "rules" && hasPosApp && strings.EqualFold(ob, obAuto) && len(ru.Ports) == 0 && len(ru.PortRanges) == 0 {
+			return "", "", false
+		}
+		if len(ru.Ports) > 0 || len(ru.PortRanges) > 0 || hasPosApp || hasNegCond {
 			return ob, ru.Name, true
 		}
 		return "", "", false
 	}
 
-	for tier := 2; tier <= 5; tier++ {
+	var matchedTier int
+	for tier := 2; tier <= 7; tier++ {
 		for _, ru := range rules {
 			if rulePriorityTier(ru) != tier {
 				continue
 			}
 			if ob, name, ok := evalOneRule(ru); ok {
-				return ob, name, tier
+				if outbound == "" {
+					outbound = ob
+					ruleName = name
+					matchedTier = tier
+					stage = rulePipelineStage(ru, tier)
+				} else if conflictRule == "" && ob != outbound && tier != matchedTier {
+					conflictRule = name
+					conflictDesc = fmt.Sprintf("Перекрывает правило «%s» (%s)", name, outboundShortTitle(ob))
+					return outbound, ruleName, stage, conflictDesc, conflictRule
+				}
 			}
 		}
 	}
-	return "", "", 0
+	return outbound, ruleName, stage, conflictDesc, conflictRule
 }
 
 // isVPNUp reports whether the given VPN outbound is currently connected or
@@ -783,22 +903,25 @@ func (r *Router) ExplainRoute(proto, host, dstIP string, port int, app string) R
 		port = 443
 	}
 	order, rule, stage := r.planForProtoWithStage(proto, host, dstIP, port, app)
+	_, _, _, conflictDesc, conflictRule := r.matchRuleWithConflict(proto, host, dstIP, port, app, false)
 	first := obDirect
 	if len(order) > 0 {
 		first = order[0]
 	}
 	return RouteExplanation{
-		Host:       cleanH,
-		Port:       port,
-		Proto:      proto,
-		App:        app,
-		Outbound:   first,
-		Chain:      order,
-		Rule:       rule,
-		Stage:      stage,
-		StageTitle: stageTitleFor(stage),
-		Badge:      formatRouteBadge(first, stage, rule, app),
-		Learned:    r.learnedFor(cleanH),
+		Host:         cleanH,
+		Port:         port,
+		Proto:        proto,
+		App:          app,
+		Outbound:     first,
+		Chain:        order,
+		Rule:         rule,
+		Stage:        stage,
+		StageTitle:   stageTitleFor(stage),
+		Badge:        formatRouteBadge(first, stage, rule, app),
+		Learned:      r.learnedFor(cleanH),
+		Conflict:     conflictDesc,
+		ConflictRule: conflictRule,
 	}
 }
 
@@ -833,8 +956,15 @@ func (r *Router) planForProtoWithStage(proto, host, dstIP string, port int, app 
 	blockSTUN := r.a.cfg.Routing.BlockSTUN
 	chain := append([]string(nil), r.a.cfg.Routing.Chain...)
 	desyncOn := r.a.cfg.Desync.Enabled
+	warpOn := r.a.cfg.Warp.Enabled
+	proxyOn := r.a.cfg.Proxy.Enabled && r.a.cfg.Proxy.Upstream != ""
 	rulesLen := len(r.a.cfg.Routing.Rules)
 	r.a.cfg.mu.Unlock()
+
+	// Если включён «Таймер паузы» (на 5 / 15 минут), временно пускаем весь трафик напрямую
+	if r.a != nil && r.a.IsPaused() {
+		return []string{obDirect}, "пауза защиты", 1
+	}
 
 	cacheKey := fmt.Sprintf("%d|%s|%s|%s|%d|%s|%s|%s|%t|%t|%t|%d",
 		generation, proto, cleanH, dstIP, port, normAppFullPath(app), mode, def, failover, bypassLAN, blockSTUN, rulesLen)
@@ -853,16 +983,11 @@ func (r *Router) planForProtoWithStage(proto, host, dstIP string, port int, app 
 		}
 	}
 
-	// Если включён «Таймер паузы» (на 5 / 15 минут), временно пускаем весь трафик напрямую
-	if r.a != nil && r.a.IsPaused() {
-		return []string{obDirect}, "пауза защиты", 1
-	}
-
 	// Приоритет 1 (Высший): Системные, LAN (127.0.0.0/8, 192.168.0.0/16, 10.0.0.0/8, psiroute.exe) и Captive Portal Wi-Fi
 	if app != "" && normAppName(app) == "psiroute" {
 		return []string{obDirect}, "локальная сеть", 1
 	}
-	if bypassLAN && isPrivateOrLANHost(cleanH, checkIPs) {
+	if bypassLAN && port != 53 && isPrivateOrLANHost(cleanH, checkIPs) {
 		return []string{obDirect}, "локальная сеть", 1
 	}
 	if r.a.net != nil && r.a.net.isCaptiveHost(cleanH) {
@@ -897,11 +1022,13 @@ func (r *Router) planForProtoWithStage(proto, host, dstIP string, port int, app 
 		return out, 7
 	}
 
-	// Приоритеты 2..5: Правила программ (2) -> Личные правила (3) -> Белый список РФ (4) -> Пресеты списков (5)
+	// Приоритеты 2..7: Комбо (Tier 2) -> Личные правила (Tier 3) -> Программы (Tier 4) -> Списки (Tier 5..6) -> Авто-браузеры (Tier 7)
 	matchedOb, matchedName, matchedStage := r.matchRuleFullWithStage(proto, host, dstIP, port, app, false)
 
 	// Приоритет 4 (в режиме «Умный обход»): автоматический Белый список РФ (.ru, .рф, Госуслуги, банки)
-	if (matchedOb == "" || matchedStage == 5) && mode == "auto" && r.a.lists != nil && r.a.lists.MatchRUWhitelist(cleanH) {
+	// Срабатывает только если ни одно явное правило или список пользователя не совпали (matchedOb == ""),
+	// чтобы не перебивать пользовательские списки и правила (Баг 7).
+	if matchedOb == "" && mode == "auto" && r.a.lists != nil && r.a.lists.MatchRUWhitelist(cleanH) {
 		return []string{obDirect}, "Белый список РФ", 4
 	}
 
@@ -914,10 +1041,23 @@ func (r *Router) planForProtoWithStage(proto, host, dstIP string, port int, app 
 			}
 			return []string{obPsiphon}, "всё через Psiphon", 7
 		case "rules":
-			if def == "" {
-				def = obPsiphon
+			// Kill Switch важнее умолчания: если маршрут по умолчанию — VPN (Psiphon/страна),
+			// а VPN не поднят, непокрытый правилами трафик блокируется, а не уходит напрямую.
+			if killSwitch && (def == obPsiphon || isCountryOb(def)) && !r.isVPNUp(def) {
+				return []string{obBlock}, "Kill Switch: VPN отключён", 7
 			}
-			matchedOb, matchedName = def, "по умолчанию"
+			// В режиме «По моим правилам» всё, что НЕ попало в правила, идёт НАПРЯМУЮ (Direct),
+			// если пользователь явно не выбрал другой рабочий маршрут по умолчанию.
+			origDef := def
+			if origDef == "" || origDef == obPsiphon || isCountryOb(origDef) || origDef == obBlock || (origDef == obWarp && !warpOn) || (origDef == obProxy && !proxyOn) {
+				def = obDirect
+			}
+			// «(мимо VPN)» помечает именно ПЕРЕБИТОЕ VPN-умолчание; явный Default=direct — просто «по умолчанию».
+			defName := "по умолчанию"
+			if def == obDirect && origDef != "" && origDef != obDirect {
+				defName = "по умолчанию (мимо VPN)"
+			}
+			matchedOb, matchedName = def, defName
 		case "auto":
 			matchedOb, matchedName = obAuto, "автоподбор"
 		default:
@@ -933,6 +1073,11 @@ func (r *Router) planForProtoWithStage(proto, host, dstIP string, port int, app 
 	}
 
 	applyFailover := func(out []string) ([]string, string) {
+		// Если маршрут явно Direct (по правилу или по умолчанию в режиме «По правилам»),
+		// НИКОГДА не заворачиваем его в VPN ни при Failover, ни при Kill Switch!
+		if len(out) == 1 && out[0] == obDirect && matchedOb != obAuto {
+			return out, matchedName
+		}
 		if killSwitch {
 			var vpnOut []string
 			for _, o := range out {
@@ -948,7 +1093,9 @@ func (r *Router) planForProtoWithStage(proto, host, dstIP string, port int, app 
 			}
 			return vpnOut, matchedName
 		}
-		if failover && !slices.Contains(out, obPsiphon) && !slices.ContainsFunc(out, isCountryOb) {
+		// В режиме «По правилам» не добавляем скрытый откат на Psiphon к чужим маршрутам (например, к DPI или WARP),
+		// а также не добавляем Failover для UDP-потоков вне режима psiphon (звонки Telegram).
+		if failover && mode != "rules" && !(proto == "udp" && mode != "psiphon") && !slices.Contains(out, obPsiphon) && !slices.ContainsFunc(out, isCountryOb) {
 			out = append(out, obPsiphon)
 		}
 		return out, matchedName
@@ -1202,6 +1349,11 @@ func (r *Router) dialer(outbound string) dialFunc {
 			on, engine, socks := r.a.cfg.Warp.Enabled, r.a.cfg.Warp.Engine, r.a.cfg.Warp.Socks
 			r.a.cfg.mu.Unlock()
 			if !on {
+				if r.a != nil && !r.a.IsPaused() && r.a.warp != nil && engine != "socks" {
+					r.a.cfg.setKey("warp.enabled", true)
+					r.a.warp.Want()
+					return r.a.warp.Dial(ctx, network, addr)
+				}
 				return nil, errors.New("WARP выключен в настройках")
 			}
 			if engine != "socks" {
@@ -1222,7 +1374,13 @@ func (r *Router) dialer(outbound string) dialFunc {
 	default:
 		// Priority 6: Use DialBalanced so when Psiphon.Parallel >= 2 and a 2nd
 		// tunnel slot is active, downloads balance across both tunnels.
-		return r.a.psi.DialBalanced
+		// Auto-start Psiphon if a rule routes traffic to VPN while Psiphon was stopped.
+		return func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if r.a != nil && !r.a.IsPaused() && r.a.psi != nil && !r.a.psi.running() && r.a.psi.cur.Load() == nil && r.a.psi.primaryDialHook == nil {
+				r.a.psi.Start()
+			}
+			return r.a.psi.DialBalanced(ctx, network, addr)
+		}
 	}
 }
 

@@ -90,7 +90,7 @@ type Config struct {
 	} `json:"dns"`
 	Routing struct {
 		Mode       string   `json:"mode"`                  // psiphon | rules | auto
-		Failover   bool     `json:"failover"`              // fall back to Psiphon when a direct route fails
+		Failover   bool     `json:"failover"`              // fall back to Psiphon when a non-direct route fails
 		Learn      bool     `json:"learn"`                 // remember the working route per host
 		BypassLAN  bool     `json:"bypass_lan,omitempty"`  // keep private/LAN addresses direct in all modes
 		BlockQUIC  bool     `json:"block_quic,omitempty"`  // drop UDP:443 (QUIC) on non-direct routes so browsers use TCP+DPI
@@ -124,6 +124,7 @@ type Config struct {
 		UI          string `json:"ui"`                    // web UI address, e.g. 127.0.0.1:9090
 		NoWeb       bool   `json:"no_web,omitempty"`      // disable web UI listener when headless/CLI
 		UIMode      string `json:"ui_mode,omitempty"`     // gio (modern Gio UI, default) | browser
+		UITheme     string `json:"ui_theme,omitempty"`    // obsidian (Tactical Glass, default) | cyber (Cyber-Amber / Soviet Terminal HUD)
 		LogLevel    string `json:"log_level,omitempty"`   // debug | info | warn | error
 		LogFile     string `json:"log_file,omitempty"`    // optional custom log file path
 		MemLimitMB  int    `json:"mem_limit_mb,omitempty"`
@@ -142,6 +143,7 @@ type Config struct {
 	path          string     `json:"-"`
 	corruptErr    string     `json:"-"`
 	corruptBackup string     `json:"-"`
+	lastSavedMod  time.Time  `json:"-"`
 }
 
 func (c *Config) corruptError() string {
@@ -154,6 +156,14 @@ func (c *Config) corruptBackupPath() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.corruptBackup
+}
+
+// isSelfSaveModTime проверяет, совпадает ли время модификации файла на диске с последним
+// сохранением из самой программы (Находка 11: защита от ложного срабатывания reloadConfig в loop()).
+func (c *Config) isSelfSaveModTime(mod time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.lastSavedMod.IsZero() && !mod.After(c.lastSavedMod)
 }
 
 // Rule is one routing rule matched by host, keyword, CIDR, port/port-range,
@@ -197,7 +207,7 @@ func defaultConfig() *Config {
 	c.Routing.Mode = "psiphon"
 	c.Routing.Failover = true
 	c.Routing.Learn = true
-	c.Routing.Default = "psiphon"
+	c.Routing.Default = obDirect
 	c.Routing.Chain = []string{"direct", "direct-dpi", "psiphon"}
 	c.Share.Port = 1081
 	c.Share.User = "psiroute"
@@ -206,6 +216,7 @@ func defaultConfig() *Config {
 	c.General.Listen = "127.0.0.1:1080"
 	c.General.UI = "127.0.0.1:9090"
 	c.General.UIMode = "gio"
+	c.General.UITheme = "obsidian"
 	c.Tun.MTU = 1500
 	c.Tun.DNS = true
 	c.Tun.FakeIP = true
@@ -299,6 +310,9 @@ func (c *Config) postLoadDefaults() {
 	}
 	if c.General.UIMode != "browser" {
 		c.General.UIMode = "gio"
+	}
+	if c.General.UITheme == "" {
+		c.General.UITheme = "obsidian"
 	}
 	if c.General.LogLevel == "" {
 		c.General.LogLevel = "info"
@@ -541,7 +555,15 @@ func (c *Config) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(p, b, 0o600)
+	if err := writeFileAtomic(p, b, 0o600); err != nil {
+		return err
+	}
+	if st, err := os.Stat(p); err == nil {
+		c.lastSavedMod = st.ModTime()
+	} else {
+		c.lastSavedMod = time.Now()
+	}
+	return nil
 }
 
 // values returns the flat key/value map the settings UI binds to.
@@ -705,6 +727,13 @@ func (c *Config) setKey(key string, v any) (restart bool) {
 			c.General.UIMode = m
 		default:
 			c.General.UIMode = "gio"
+		}
+	case "general.ui_theme":
+		switch m := strings.ToLower(strings.TrimSpace(toStr(v))); m {
+		case "cyber", "amber", "soviet":
+			c.General.UITheme = "cyber"
+		default:
+			c.General.UITheme = "obsidian"
 		}
 	}
 	return restart

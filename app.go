@@ -464,7 +464,8 @@ func (a *App) loop() {
 			a.cfg.mu.Unlock()
 			if st, err := os.Stat(a.cfgPath); err == nil && st.ModTime().After(mod) {
 				mod = st.ModTime()
-				if watch {
+				// Находка 11: игнорируем изменение ModTime, вызванное собственным a.cfg.save()
+				if watch && !a.cfg.isSelfSaveModTime(mod) {
 					a.reloadConfig()
 				}
 			}
@@ -499,6 +500,9 @@ func (a *App) reloadConfig() {
 	c.UDP = n.UDP
 	c.Tun = n.Tun
 	c.General.WatchConfig = n.General.WatchConfig
+	if n.General.UITheme != "" {
+		c.General.UITheme = n.General.UITheme
+	}
 	if n.General.UIMode == "browser" || n.General.UIMode == "gio" || n.General.UIMode == "native" {
 		if n.General.UIMode == "native" {
 			c.General.UIMode = "gio"
@@ -556,7 +560,8 @@ func (a *App) setSysProxy(on bool) error {
 }
 
 // onRulesChanged принудительно сбрасывает кэш маршрутных решений (routeCache),
-// кэш DNS/FakeIP и закрывает активные TCP/UDP соединения, чей маршрут изменился (Раздел 2.2 ТЗ).
+// кэш прямых A/AAAA ответов (сохраняя таблицу FakeIP и RevDNS!) и немедленно
+// закрывает активные TCP/UDP соединения, чей маршрут изменился или заблокирован.
 func (a *App) onRulesChanged() int {
 	if a == nil {
 		return 0
@@ -564,7 +569,8 @@ func (a *App) onRulesChanged() int {
 	if a.router != nil {
 		a.router.InvalidateRules()
 	}
-	theDNS.clear()
+	theDNS.clearLookupCache()
+	flushWindowsDNSCache()
 	if a.stats == nil || a.router == nil {
 		return 0
 	}
@@ -572,14 +578,27 @@ func (a *App) onRulesChanged() int {
 		if t == nil {
 			return false
 		}
-		targetHost, host, port, appName, curOb := a.stats.routeAndHost(t)
+		targetHost, rawHost, port, appName, curOb := a.stats.routeAndHost(t)
 		proto := t.protocol
 		if proto == "" {
 			proto = "tcp"
 		}
-		order, _ := a.router.planForProto(proto, targetHost, host, port, appName)
-		if len(order) == 0 {
-			return false
+		dstIP := ""
+		if net.ParseIP(rawHost) != nil {
+			dstIP = rawHost
+		}
+		if proto == "udp" {
+			newOb, _ := a.planUDPIP(targetHost, dstIP, port, appName)
+			if newOb == "" {
+				return curOb != obBlock && curOb != ""
+			}
+			return newOb != curOb
+		}
+		order, _ := a.router.planForProto(proto, targetHost, dstIP, port, appName)
+		if len(order) == 0 || order[0] == obBlock {
+			// Если новый маршрут блокирует трафик (пустой order / block),
+			// обязательно закрываем активное соединение!
+			return curOb != obBlock && curOb != ""
 		}
 		return order[0] != curOb
 	})
@@ -606,6 +625,7 @@ func (a *App) stateCompact(compact bool) map[string]any {
 	localDNSAddr := a.cfg.DNS.LocalAddr
 	warpOn := a.cfg.Warp.Enabled
 	uiMode := a.cfg.General.UIMode
+	uiTheme := a.cfg.General.UITheme
 	favCountries := append([]string(nil), a.cfg.Psiphon.FavoriteCountries...)
 	cfgErr := a.cfg.corruptErr
 	cfgBackup := a.cfg.corruptBackup
@@ -634,7 +654,7 @@ func (a *App) stateCompact(compact bool) map[string]any {
 		"share_on": shareOn, "dns_on": dnsOn, "local_dns_on": localDNSOn, "local_dns_addr": localDNSAddr,
 		"warp_on": warpOn, "bypass_lan": bypassLAN, "block_quic": blockQUIC,
 		"kill_switch": killSwitch, "block_stun": blockSTUN, "fake_ip": fakeIP,
-		"single_process_countries": singleCountry, "fakeip_count": theFakeIP.count(), "ui_mode": uiMode,
+		"single_process_countries": singleCountry, "fakeip_count": theFakeIP.count(), "ui_mode": uiMode, "ui_theme": uiTheme,
 		"psiphon": a.psi.view(), "psiphon_slots": a.psi.slots(), "warp": a.warp.view(),
 		"stats": a.stats.snapshot(), "history": a.stats.history(),
 		"log": logs, "learned": learned, "learned_count": learnedCount,

@@ -655,6 +655,13 @@ func (a *App) answerLocalDNS(q []byte) []byte {
 		}
 	}
 	if useFake && !strings.HasSuffix(name, ".arpa") && !strings.HasSuffix(name, ".local") {
+		if qtype == 65 || qtype == 64 {
+			// Блокируем SVCB/HTTPS (Type 64/65) при активном FakeIP, чтобы браузеры не получали
+			// прямые ipv4hint в обход FakeIP и не прятали реальный домен за внешним ECH SNI (cloudflare-ech.com).
+			if nodata := dnsNoDataResponse(q); nodata != nil {
+				return nodata
+			}
+		}
 		if qtype == 1 || qtype == 28 {
 			fip := theFakeIP.Assign(name)
 			if resp := dnsFakeIPResponse(q, fip); resp != nil {
