@@ -42,7 +42,9 @@ func (a *App) setShare(on bool) error {
 		a.cfg.mu.Lock()
 		a.cfg.Share.Enabled = false
 		a.cfg.mu.Unlock()
-		_ = a.cfg.save()
+		if serr := a.cfg.saveOrReport("setShare"); serr != nil {
+			return saveFailed(serr)
+		}
 		logf("info", "Раздача в сеть выключена")
 		return nil
 	}
@@ -66,8 +68,15 @@ func (a *App) setShare(on bool) error {
 	a.cfg.mu.Lock()
 	a.cfg.Share.Enabled = true
 	a.cfg.mu.Unlock()
-	_ = a.cfg.save()
-	go a.serveProxy(ln, &proxyAuth{user: user, pass: pass, lanFree: free})
+	if serr := a.cfg.saveOrReport("setShare"); serr != nil {
+		_ = ln.Close()
+		a.shareLn = nil
+		a.cfg.mu.Lock()
+		a.cfg.Share.Enabled = false // roll back the in-memory flag together with the listener
+		a.cfg.mu.Unlock()
+		return saveFailed(serr)
+	}
+	safeLoop(a.ctx, "раздача в сеть", func() { a.serveProxy(ln, &proxyAuth{user: user, pass: pass, lanFree: free}) })
 	logf("info", "Раздача в сеть: %s:%d", lanIP(), port)
 	return nil
 }

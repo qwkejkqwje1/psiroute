@@ -38,12 +38,12 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 
 func (a *App) serveUI(ln net.Listener) {
 	srv := &http.Server{Handler: a.routes(), ReadHeaderTimeout: 10 * time.Second}
-	go func() {
+	safeGo("App.serveUI", func() {
 		<-a.ctx.Done()
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(ctx)
-	}()
+	})
 	_ = srv.Serve(ln)
 }
 
@@ -120,7 +120,7 @@ func (a *App) routes() http.Handler {
 
 func (a *App) restartIfRunning() bool {
 	if a.psi.running() {
-		go a.psi.Restart()
+		safeGo("App.restartIfRunning", a.psi.Restart)
 		return true
 	}
 	return false
@@ -138,6 +138,11 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 	ok := map[string]any{"ok": true}
 	tail := func(prefix string) string { return strings.TrimPrefix(p, prefix) }
 
+	if p == "config/ack-corrupt" && post {
+		a.cfg.ackCorruptError() // the user has seen the warning about the damaged config
+		writeJSON(w, ok)
+		return
+	}
 	if strings.HasPrefix(p, "profiles") && a.profilesAPI(w, r, p) {
 		return
 	}
@@ -151,6 +156,10 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch {
+	case p == "leaktest" && post:
+		ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+		defer cancel()
+		writeJSON(w, a.RunLeakTest(ctx))
 	case p == "selftest" && post:
 		ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
 		defer cancel()
@@ -170,6 +179,90 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"ok": true, "path": path})
 	case p == "state":
 		writeJSON(w, a.stateCompact(q.Get("compact") == "1"))
+	case p == "fsm":
+		writeJSON(w, a.fsm.View())
+	case p == "stack/reset" && post:
+		a.ResetStack()
+		writeJSON(w, ok)
+	case p == "clean-chain/verify" && post:
+		ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+		defer cancel()
+		writeJSON(w, a.cleanChain.Verify(ctx))
+	case p == "psi/blocked-countries":
+		if post {
+			var b struct {
+				Country string   `json:"country"`
+				CC      string   `json:"cc"`
+				Blocked []string `json:"blocked"`
+			}
+			if json.NewDecoder(r.Body).Decode(&b) != nil {
+				writeErr(w, 400, "ошибка в данных запроса")
+				return
+			}
+			a.cfg.mu.Lock()
+			if b.Blocked != nil {
+				a.cfg.Psiphon.BlockedCountries = normalizeFavoriteCountries(b.Blocked)
+			} else {
+				cc := strings.ToUpper(strings.TrimSpace(b.Country))
+				if cc == "" {
+					cc = strings.ToUpper(strings.TrimSpace(b.CC))
+				}
+				if len(cc) == 2 && cc != "AUTO" {
+					cur := append([]string(nil), a.cfg.Psiphon.BlockedCountries...)
+					idx := slices.Index(cur, cc)
+					if idx >= 0 {
+						cur = append(cur[:idx], cur[idx+1:]...)
+					} else {
+						cur = append(cur, cc)
+					}
+					a.cfg.Psiphon.BlockedCountries = normalizeFavoriteCountries(cur)
+				}
+			}
+			blk := append([]string(nil), a.cfg.Psiphon.BlockedCountries...)
+			curEgress := ""
+			if a.psi != nil {
+				v := a.psi.view()
+				curEgress, _ = v["egress"].(string)
+			}
+			pinned := strings.TrimSpace(a.cfg.Psiphon.Country)
+			a.cfg.mu.Unlock()
+			if !a.saveOrFail(w, "App.api") {
+				return
+			}
+			rotated := false
+			if pinned == "" && curEgress != "" && slices.Contains(blk, strings.ToUpper(curEgress)) && a.psi != nil && a.psi.running() {
+				a.psi.NewNode()
+				rotated = true
+			}
+			writeJSON(w, map[string]any{"ok": true, "blocked_countries": blk, "rotated": rotated})
+			return
+		}
+		a.cfg.mu.Lock()
+		blk := append([]string(nil), a.cfg.Psiphon.BlockedCountries...)
+		a.cfg.mu.Unlock()
+		writeJSON(w, map[string]any{"ok": true, "blocked_countries": blk})
+	case p == "clean-chain/toggle" && post:
+		var b struct {
+			Enabled   *bool `json:"enabled"`
+			AutoChain *bool `json:"auto_chain"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&b)
+		if b.Enabled != nil {
+			a.cfg.setKey("clean_chain.enabled", *b.Enabled)
+			if !*b.Enabled && a.cleanChain != nil {
+				a.cleanChain.Close()
+			}
+		}
+		if b.AutoChain != nil {
+			a.cfg.setKey("clean_chain.auto_chain", *b.AutoChain)
+		}
+		if !a.saveOrFail(w, "App.api") {
+			return
+		}
+		a.onRulesChanged()
+		a.syncWFPKillSwitch()
+		a.tun.refresh()
+		writeJSON(w, map[string]any{"ok": true, "clean_chain": a.cleanChain.View()})
 	case p == "processes" && !post:
 		writeJSON(w, a.processesView())
 	case p == "processes" && post:
@@ -212,7 +305,9 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 				restart = true
 			}
 		}
-		_ = a.cfg.save()
+		if !a.saveOrFail(w, "App.api") {
+			return
+		}
 		a.onRulesChanged()
 		restarted := restart && a.restartIfRunning()
 		writeJSON(w, map[string]any{"ok": true, "restarted": restarted})
@@ -234,7 +329,9 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 		a.cfg.mu.Lock()
 		a.cfg.Psiphon.Strategies = ids
 		a.cfg.mu.Unlock()
-		_ = a.cfg.save()
+		if !a.saveOrFail(w, "App.api") {
+			return
+		}
 		writeJSON(w, map[string]any{"ok": true, "restarted": a.restartIfRunning()})
 	case p == "psi/favorites":
 		if post {
@@ -268,7 +365,9 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 			}
 			favs := append([]string(nil), a.cfg.Psiphon.FavoriteCountries...)
 			a.cfg.mu.Unlock()
-			_ = a.cfg.save()
+			if !a.saveOrFail(w, "App.api") {
+				return
+			}
 			writeJSON(w, map[string]any{"ok": true, "favorite_countries": favs})
 			return
 		}
@@ -280,6 +379,10 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 		a.stats.ResetTotals()
 		logf("info", "Счётчики трафика сброшены пользователем")
 		writeJSON(w, map[string]any{"ok": true, "stats": a.stats.snapshot()})
+	case p == "psi/reset-order" && post:
+		a.psi.ResetStrategyMemory()
+		logf("info", "Рейтинг стратегий Psiphon сброшен — приоритет прямых DPI-методов восстановлен")
+		writeJSON(w, map[string]any{"ok": true, "restarted": a.restartIfRunning()})
 	case p == "psi/region":
 		var b struct {
 			Region string `json:"region"`
@@ -292,7 +395,9 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 		a.cfg.mu.Lock()
 		a.cfg.Psiphon.Country = reg
 		a.cfg.mu.Unlock()
-		_ = a.cfg.save()
+		if !a.saveOrFail(w, "App.api") {
+			return
+		}
 		if reg == "" {
 			logf("info", "Страна выхода: любая (быстрейшая)")
 		} else {
@@ -326,6 +431,47 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 		case "stats":
 			writeJSON(w, a.psi.statsView())
 			return
+		case "state":
+			writeJSON(w, a.psi.connectionStateView())
+			return
+		case "action":
+			if !post {
+				writeErr(w, 405, "нужен POST-запрос")
+				return
+			}
+			var act struct {
+				Action string `json:"action"`
+			}
+			if json.NewDecoder(r.Body).Decode(&act) != nil {
+				writeErr(w, 400, "ошибка в данных запроса")
+				return
+			}
+			switch act.Action {
+			case "use_warp":
+				a.cfg.setKey("warp.enabled", true)
+				if !a.saveOrFail(w, "App.api") {
+					return
+				}
+				a.warp.Want()
+				writeJSON(w, map[string]any{"ok": true, "action": "use_warp"})
+			case "retry_patient":
+				a.cfg.setKey("psiphon.preset", PresetPatient)
+				if !a.saveOrFail(w, "App.api") {
+					return
+				}
+				if a.psi.running() {
+					safeGo("App.api", a.psi.Restart)
+				}
+				writeJSON(w, map[string]any{"ok": true, "action": "retry_patient", "preset": PresetPatient})
+			case "run_diagnostics":
+				rep := a.psi.RunPreflight(r.Context(), true)
+				writeJSON(w, map[string]any{"ok": true, "action": "run_diagnostics", "preflight": rep})
+			case "import_servers", "use_worker":
+				writeJSON(w, map[string]any{"ok": true, "action": act.Action, "ui_prompt": true})
+			default:
+				writeErr(w, 400, "неизвестное действие подключения")
+			}
+			return
 		case "server-entries":
 			if !post {
 				writeErr(w, 405, "нужен POST-запрос")
@@ -344,12 +490,22 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 				writeErr(w, 400, err.Error())
 				return
 			}
-			writeJSON(w, map[string]any{
-				"ok":         true,
-				"imported":   added + dup,
-				"added":      added,
-				"duplicates": dup,
-				"invalid":    bad,
+			// Audit A-04: the trust warning is shown on the FIRST import from a source.
+			isNewSource := a.psi.noteSeedSource(b.Source)
+			warn := ""
+			if isNewSource {
+				warn = seedTrustWarning
+			}
+			writeJSON(w, SeedImportResult{
+				OK:           true,
+				Imported:     added + dup,
+				Added:        added,
+				Duplicates:   dup,
+				Invalid:      bad,
+				Source:       b.Source,
+				TrustWarning: warn,
+				NewSource:    isNewSource,
+				SeedHealth:   a.psi.SeedHealth(),
 			})
 			return
 		case "start":
@@ -357,7 +513,7 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 		case "stop":
 			a.DisconnectVPN()
 		case "restart":
-			go a.psi.Restart()
+			safeGo("App.api#2", a.psi.Restart)
 		case "next":
 			if left := a.psi.Next(); left > 0 {
 				writeJSON(w, map[string]any{"ok": true, "wait": left})
@@ -378,13 +534,17 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 		switch tail("warp/") {
 		case "on":
 			restarted := a.cfg.setKey("warp.enabled", true) && a.restartIfRunning()
-			_ = a.cfg.save()
+			if !a.saveOrFail(w, "App.api") {
+				return
+			}
 			a.warp.Want()
 			writeJSON(w, map[string]any{"ok": true, "restarted": restarted})
 			return
 		case "off":
 			restarted := a.cfg.setKey("warp.enabled", false) && a.restartIfRunning()
-			_ = a.cfg.save()
+			if !a.saveOrFail(w, "App.api") {
+				return
+			}
 			writeJSON(w, map[string]any{"ok": true, "restarted": restarted})
 			return
 		case "reconnect":
@@ -415,7 +575,7 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 500, err.Error())
 			return
 		}
-		writeJSON(w, map[string]any{"ok": true, "autostart": autostartEnabled()})
+		writeJSON(w, map[string]any{"ok": true, "autostart": refreshAutostartCache(), "warning": autostartWarning()})
 	case strings.HasPrefix(p, "mode/"):
 		m := tail("mode/")
 		if m != "psiphon" && m != "rules" && m != "auto" {
@@ -425,7 +585,9 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 		a.cfg.mu.Lock()
 		a.cfg.Routing.Mode = m
 		a.cfg.mu.Unlock()
-		_ = a.cfg.save()
+		if !a.saveOrFail(w, "App.api") {
+			return
+		}
 		a.onRulesChanged()
 		logf("info", "Режим маршрутизации: %s", m)
 		writeJSON(w, ok)
@@ -449,7 +611,7 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, map[string]any{"ok": true, "restarting": true})
-		go func() { time.Sleep(700 * time.Millisecond); a.cancel() }()
+		safeGo("App.api#3", func() { time.Sleep(700 * time.Millisecond); a.cancel() })
 	case strings.HasPrefix(p, "tun/") && post:
 		on := tail("tun/") == "on"
 		if err := a.setTun(on); err != nil {
@@ -511,7 +673,7 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 			a.stats.Flush()
 		}
 		writeJSON(w, ok)
-		go func() { time.Sleep(300 * time.Millisecond); a.cancel() }()
+		safeGo("App.api#4", func() { time.Sleep(300 * time.Millisecond); a.cancel() })
 	case p == "reload":
 		a.reloadConfig()
 		writeJSON(w, ok)
@@ -589,10 +751,10 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 		warpOn := a.cfg.Warp.Enabled
 		a.cfg.mu.Unlock()
 		if warpOn && a.warp != nil {
-			go a.warp.Reconnect()
+			safeGo("App.api#5", a.warp.Reconnect)
 		}
 		if a.psi != nil {
-			go a.psi.Restart()
+			safeGo("App.api#6", a.psi.Restart)
 		}
 		logf("info", "Запущено быстрое восстановление соединения (DPI auto-tune + переподключение)")
 		writeJSON(w, ok)
@@ -1039,7 +1201,9 @@ func (a *App) listsAPI(w http.ResponseWriter, r *http.Request, p string) {
 					}
 					syncListRegistryLocked(a.cfg)
 					a.cfg.mu.Unlock()
-					_ = a.cfg.save()
+					if !a.saveOrFail(w, "App.listsAPI") {
+						return
+					}
 					writeJSON(w, map[string]any{"ok": true, "id": meta.ID, "hidden": hide, "enabled": !hide})
 					return
 				}
@@ -1547,7 +1711,7 @@ func (a *App) processesAPI(w http.ResponseWriter, r *http.Request) {
 		case "stop":
 			a.DisconnectVPN()
 		case "restart":
-			go a.psi.Restart()
+			safeGo("App.processesAPI", a.psi.Restart)
 		case "newnode":
 			if left := a.psi.NewNode(); left > 0 {
 				writeJSON(w, map[string]any{"ok": true, "wait": left})
@@ -1566,13 +1730,17 @@ func (a *App) processesAPI(w http.ResponseWriter, r *http.Request) {
 		switch req.Action {
 		case "enable", "on":
 			restarted := a.cfg.setKey("warp.enabled", true) && a.restartIfRunning()
-			_ = a.cfg.save()
+			if !a.saveOrFail(w, "App.processesAPI") {
+				return
+			}
 			a.warp.Want()
 			writeJSON(w, map[string]any{"ok": true, "restarted": restarted})
 			return
 		case "disable", "off":
 			restarted := a.cfg.setKey("warp.enabled", false) && a.restartIfRunning()
-			_ = a.cfg.save()
+			if !a.saveOrFail(w, "App.processesAPI") {
+				return
+			}
 			writeJSON(w, map[string]any{"ok": true, "restarted": restarted})
 			return
 		case "reconnect":
@@ -1610,10 +1778,14 @@ func (a *App) processesAPI(w http.ResponseWriter, r *http.Request) {
 		switch req.Action {
 		case "enable", "on":
 			a.cfg.setKey("dns.enabled", true)
-			_ = a.cfg.save()
+			if !a.saveOrFail(w, "App.processesAPI") {
+				return
+			}
 		case "disable", "off":
 			a.cfg.setKey("dns.enabled", false)
-			_ = a.cfg.save()
+			if !a.saveOrFail(w, "App.processesAPI") {
+				return
+			}
 		case "clear":
 			theDNS.clear()
 			logf("info", "Кэш DNS очищен")
@@ -1667,10 +1839,14 @@ func (a *App) processesAPI(w http.ResponseWriter, r *http.Request) {
 		switch req.Action {
 		case "bypass_lan":
 			a.cfg.setKey("routing.bypass_lan", req.Value == "true" || req.Value == "1" || req.Value == "on")
-			_ = a.cfg.save()
+			if !a.saveOrFail(w, "App.processesAPI") {
+				return
+			}
 		case "block_quic":
 			a.cfg.setKey("routing.block_quic", req.Value == "true" || req.Value == "1" || req.Value == "on")
-			_ = a.cfg.save()
+			if !a.saveOrFail(w, "App.processesAPI") {
+				return
+			}
 		case "clear_learned":
 			a.router.clearLearned()
 		default:
@@ -1702,7 +1878,7 @@ func cleanHost(s string) string {
 // ruleOutbounds fills the route dropdowns: the usual outbounds plus
 // "psiphon:CC" for common exit countries and any country already used in the rules.
 func ruleOutbounds() []string {
-	out := []string{obPsiphon, obDirect, obDesync, obWarp, obProxy, obBlock, obAuto}
+	out := []string{obPsiphon, obDirect, obDesync, obWarp, obCleanIP, obProxy, obBlock, obAuto}
 	for _, cc := range countryChoices {
 		out = append(out, obPsiphon+":"+cc)
 	}

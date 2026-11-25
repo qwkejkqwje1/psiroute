@@ -229,7 +229,7 @@ func (a *App) serveProxy(ln net.Listener, auth *proxyAuth) {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		go a.handleConn(c, auth)
+		safeGo("App.serveProxy", func() { a.handleConn(c, auth) })
 	}
 }
 
@@ -723,7 +723,7 @@ func (a *App) relay(c net.Conn, br *bufio.Reader, up net.Conn, t *tracked) (erro
 		err    error
 	}
 	errc := make(chan res, 2)
-	go func() {
+	safeGo("App.relay", func() {
 		bufPtr := getRelayBuf()
 		defer putRelayBuf(bufPtr)
 		buf := *bufPtr
@@ -868,8 +868,8 @@ func (a *App) relay(c net.Conn, br *bufio.Reader, up net.Conn, t *tracked) (erro
 				return
 			}
 		}
-	}()
-	go func() {
+	})
+	safeGo("App.relay#2", func() {
 		bufPtr := getRelayBuf()
 		defer putRelayBuf(bufPtr)
 		_, err := io.CopyBuffer(c, up, *bufPtr)
@@ -879,7 +879,7 @@ func (a *App) relay(c net.Conn, br *bufio.Reader, up net.Conn, t *tracked) (erro
 		default:
 		}
 		errc <- res{false, err}
-	}()
+	})
 	r1 := <-errc
 	curUp := getUp()
 	if r1.client {
@@ -944,10 +944,10 @@ func dialHappyEyeballs(ctx context.Context, dial dialFunc, addrs []string) (net.
 	defer cancel()
 	ch := make(chan res, len(addrs))
 	launch := func(addr string) {
-		go func() {
+		safeGo("dialHappyEyeballs", func() {
 			c, err := dial(rctx, "tcp", addr)
 			ch <- res{c, err}
-		}()
+		})
 	}
 	launch(addrs[0])
 	started := 1
@@ -962,13 +962,13 @@ func dialHappyEyeballs(ctx context.Context, dial dialFunc, addrs []string) (net.
 				cancel()
 				rem := started - finished
 				if rem > 0 {
-					go func(n int) {
+					func(n int) { safeGo("dialHappyEyeballs#2", func() {
 						for range n {
 							if x := <-ch; x.c != nil {
 								_ = x.c.Close()
 							}
 						}
-					}(rem)
+					}) }(rem)
 				}
 				return r.c, nil
 			}

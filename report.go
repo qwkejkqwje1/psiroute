@@ -137,7 +137,8 @@ func (a *App) reportState() []byte {
 	st := map[string]any{
 		"version": version, "os": runtime.GOOS, "arch": runtime.GOARCH, "go": runtime.Version(),
 		"time": time.Now().Format(time.RFC3339), "ui": ui, "listen": listen, "system_proxy": sys,
-		"psiphon": a.psi.view(), "warp": a.warp.view(), "tun": a.tun.view(), "obfs": a.obfsView(),
+		"psiphon": a.psi.view(), "psiphon_timeline": a.psi.tl().Events(), "psiphon_counters": a.psi.tl().Counters(), "psiphon_preflight": a.psi.lastPreflightReport(),
+		"warp": a.warp.view(), "tun": a.tun.view(), "obfs": a.obfsView(),
 		"memory": memView(), "net": a.net.view(),
 		"panics": panicsCaught.Load(), "crash_restarts": crashRestarts,
 		"udp": map[string]any{"mode": a.udpMode(), "sessions": udpStats.sessions.Load(), "flows": udpStats.flows.Load()},

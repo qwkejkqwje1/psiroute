@@ -428,14 +428,15 @@ func (w *netWatch) detectCaptivePortal(ctx context.Context) (bool, string) {
 
 func (a *App) recoverNetwork(kind, text string) {
 	if a.net != nil {
-		go a.net.detectCaptivePortal(a.ctx)
+		safeGo("App.recoverNetwork", func() { a.net.detectCaptivePortal(a.ctx) })
 	}
 	logf("info", "%s — проверяю связь", upperFirst(text))
 	theDNS.clear()
 	a.dohReset()
 	a.tun.refresh()
 	if kind == "net" {
-		obfs.reset() // another network, other DPI: learn the methods again
+		obfs.reset()
+		a.psi.invalidatePreflight("") // another network, other DPI: learn the methods again
 		a.countries.StopAll()
 		if t := a.warp.cur.Load(); t != nil {
 			if err := t.refresh(); err != nil {

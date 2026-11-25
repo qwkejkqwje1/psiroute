@@ -442,9 +442,11 @@ func TestNoDoubleSNISniffDelayWhenBuffered(t *testing.T) {
 	app := testApp(t)
 	setCfg(app, func(c *Config) {
 		c.Routing.Mode = "rules"
-		c.Routing.Default = obWarp // Stage 7 (>= 6), and dialer(obWarp) fails in 0ms when Warp.Enabled == false
+		c.Routing.Default = obWarp // Stage 7 (>= 6); dead local socks fails in <1ms without rules-mode fallback to obDirect
 		c.Routing.Failover = false
-		c.Warp.Enabled = false
+		c.Warp.Enabled = true
+		c.Warp.Engine = "socks"
+		c.Warp.Socks = "127.0.0.1:1"
 	})
 
 	cClient, cProxy := net.Pipe()

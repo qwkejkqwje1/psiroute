@@ -125,72 +125,9 @@ func warpPeerConf(peer, ep string) string {
 }
 
 func openWarpTunnel(id *warpIdentity, ep string, m warpMask) (*warpTunnel, error) {
-	parseOpt := func(raw string) ([]warpSigPart, error) {
-		if raw == "" {
-			return nil, nil
-		}
-		return parseWarpSig(raw)
-	}
-	sig1, err := parseOpt(m.I1)
-	if err != nil {
-		return nil, err
-	}
-	sig2, err := parseOpt(m.I2)
-	if err != nil {
-		return nil, err
-	}
-	sig3, err := parseOpt(m.I3)
-	if err != nil {
-		return nil, err
-	}
-	sig4, err := parseOpt(m.I4)
-	if err != nil {
-		return nil, err
-	}
-	sig5, err := parseOpt(m.I5)
-	if err != nil {
-		return nil, err
-	}
-	priv, err := warpHex(id.PrivateKey)
-	if err != nil {
-		return nil, err
-	}
-	peer, err := warpHex(id.PeerKey)
-	if err != nil {
-		return nil, err
-	}
-	var addrs []netip.Addr
-	for _, s := range []string{id.V4, id.V6} {
-		if a, ok := warpAddr(s); ok {
-			addrs = append(addrs, a)
-		}
-	}
-	if len(addrs) == 0 {
-		return nil, errors.New("у устройства WARP нет адресов")
-	}
-	dns := []netip.Addr{netip.MustParseAddr("1.1.1.1"), netip.MustParseAddr("1.0.0.1")}
-	tdev, tnet, err := netstack.CreateNetTUN(addrs, dns, warpMTU)
-	if err != nil {
-		return nil, err
-	}
-	bind := &warpBind{
-		Bind: conn.NewDefaultBind(),
-		i1:   sig1, i2: sig2, i3: sig3, i4: sig4, i5: sig5,
-		jc: m.Jc, jmin: m.Jmin, jmax: m.Jmax,
-	}
-	if r, err := base64.StdEncoding.DecodeString(id.ClientID); err == nil && len(r) >= 3 {
-		copy(bind.reserved[:], r[:3])
-	}
-	dev := device.NewDevice(tdev, bind, device.NewLogger(device.LogLevelSilent, ""))
-	if err := dev.IpcSet("private_key=" + priv + "\n" + warpPeerConf(peer, ep)); err != nil {
-		dev.Close()
-		return nil, err
-	}
-	if err := dev.Up(); err != nil {
-		dev.Close()
-		return nil, err
-	}
-	return &warpTunnel{dev: dev, tnet: tnet, ep: ep, peer: peer, mask: m}, nil
+	// Pin EntryWarp UDP sockets directly to the physical interface (IP_UNICAST_IF)
+	// so WARP traffic never loops through Wintun.
+	return openWarpTunnelWithBind(id, ep, m, warpMTU, newPhysUDPBind())
 }
 
 func (t *warpTunnel) Close() { t.dev.Close() }

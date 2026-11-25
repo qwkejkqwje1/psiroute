@@ -78,7 +78,7 @@ type Countries struct {
 func newCountries(app *App) *Countries { return &Countries{app: app, w: map[string]*countryWorker{}} }
 
 func (c *Countries) Start(ctx context.Context) {
-	go func() {
+	safeGo("Countries.Start", func() {
 		t := time.NewTicker(time.Minute)
 		defer t.Stop()
 		for {
@@ -105,7 +105,7 @@ func (c *Countries) Start(ctx context.Context) {
 				}
 			}
 		}
-	}()
+	})
 }
 
 func (c *Countries) StopAll() {
@@ -276,7 +276,7 @@ func (c *Countries) get(cc string) (*countryWorker, error) {
 	w := &countryWorker{cc: cc, cmd: cmd, stdin: in, state: "connecting", lastUse: time.Now(), done: make(chan struct{})}
 	c.w[cc] = w
 	logf("info", "Psiphon %s: запускаю облегчённое подключение для этой страны", cc)
-	go func() {
+	safeGo("Countries.get", func() {
 		sc := bufio.NewScanner(out)
 		for sc.Scan() {
 			line := sc.Text()
@@ -308,7 +308,7 @@ func (c *Countries) get(cc string) (*countryWorker, error) {
 		w.state, w.addr = "stopped", ""
 		w.mu.Unlock()
 		close(w.done)
-	}()
+	})
 	return w, nil
 }
 
@@ -390,7 +390,7 @@ func runPsiWorker(cfgPath, dir, region string) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _, _ = io.Copy(io.Discard, os.Stdin); cancel() }() // parent gone -> exit
+	safeGo("runPsiWorker", func() { _, _ = io.Copy(io.Discard, os.Stdin); cancel() }) // parent gone -> exit
 	_ = os.MkdirAll(dir, 0o700)
 
 	cfg := loadConfig(cfgPath)
@@ -415,7 +415,7 @@ func runPsiWorker(cfgPath, dir, region string) {
 	defer ln.Close()
 	fmt.Println("@listen", ln.Addr().String())
 
-	go func() {
+	safeGo("runPsiWorker#2", func() {
 		sent := 0
 		last := ""
 		t := time.NewTicker(time.Second)
@@ -442,18 +442,18 @@ func runPsiWorker(cfgPath, dir, region string) {
 				last = st
 			}
 		}
-	}()
+	})
 
 	slimApp.psi.Start()
-	go func() { <-ctx.Done(); ln.Close() }()
+	safeGo("runPsiWorker#3", func() { <-ctx.Done(); ln.Close() })
 	for {
 		c, err := ln.Accept()
 		if err != nil {
 			break
 		}
-		go serveWorkerSocks(ctx, c, func(dctx context.Context, network, addr string) (net.Conn, error) {
+		safeGo("runPsiWorker#4", func() { serveWorkerSocks(ctx, c, func(dctx context.Context, network, addr string) (net.Conn, error) {
 			return (&Countries{app: slimApp}).waitConfirmedCountry(dctx, region, addr)
-		})
+		}) })
 	}
 	slimApp.psi.Stop()
 }
@@ -526,18 +526,18 @@ func serveWorkerSocks(ctx context.Context, c net.Conn, dial dialFunc) {
 		err        error
 	}
 	errc := make(chan copyRes, 2)
-	go func() {
+	safeGo("serveWorkerSocks", func() {
 		bp := getRelayBuf()
 		defer putRelayBuf(bp)
 		_, err := io.CopyBuffer(up, br, *bp)
 		errc <- copyRes{fromClient: true, err: err}
-	}()
-	go func() {
+	})
+	safeGo("serveWorkerSocks#2", func() {
 		bp := getRelayBuf()
 		defer putRelayBuf(bp)
 		_, err := io.CopyBuffer(c, up, *bp)
 		errc <- copyRes{fromClient: false, err: err}
-	}()
+	})
 	r1 := <-errc
 	if r1.fromClient {
 		if cw, ok := up.(interface{ CloseWrite() error }); ok {
@@ -580,17 +580,17 @@ func dialCountryController(ctx context.Context, controller *psiphon.Controller, 
 		err  error
 	}
 	results := make(chan result, 1)
-	go func() { conn, err := controller.Dial(addr, nil); results <- result{conn, err} }()
+	safeGo("dialCountryController", func() { conn, err := controller.Dial(addr, nil); results <- result{conn, err} })
 	select {
 	case r := <-results:
 		return r.conn, r.err
 	case <-ctx.Done():
-		go func() {
+		safeGo("dialCountryController#2", func() {
 			r := <-results
 			if r.conn != nil {
 				r.conn.Close()
 			}
-		}()
+		})
 		return nil, ctx.Err()
 	}
 }

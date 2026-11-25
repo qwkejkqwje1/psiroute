@@ -14,7 +14,7 @@ import (
 	"syscall"
 )
 
-const version = "2.2.0"
+const version = "2.4.0"
 
 // crashRestarts: how many times the watchdog restarted the core after a crash.
 var crashRestarts int
@@ -220,7 +220,11 @@ func main() {
 	crash := findCrash(dir)
 	setupCrashOutput(dir)
 	if *pprofAddr != "" {
-		go func() { _ = http.ListenAndServe(*pprofAddr, nil) }() // profiling for tests only; UI uses its own handler
+		pl, pw := pprofLoopbackAddr(*pprofAddr)
+		if pw != "" {
+			logf("error", "%s", pw)
+		}
+		safeGo("main", func() { _ = http.ListenAndServe(pl, nil) }) // profiling for tests only; loopback only (A-17/11)
 	}
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -261,7 +265,7 @@ func main() {
 		logf("warn", "Psiroute перезапущен после сбоя (%d-й раз подряд)", crashRestarts)
 	}
 	if _, err := os.Stat(path); os.IsNotExist(err) && a.cfg.corruptError() == "" {
-		_ = a.cfg.save() // first run: write defaults only if file did not exist and was not corrupt
+		_ = a.cfg.saveOrReport("main") // first run: write defaults only if file did not exist and was not corrupt
 	}
 	if *noGUI {
 		fmt.Println("Psiroute запущен, интерфейс:", a.uiURL())

@@ -254,7 +254,7 @@ func decodeProfile(data string) (Profile, error) {
 // validOutbound: the routes a rule may use (see ruleOutbounds).
 func validOutbound(ob string) bool {
 	switch ob {
-	case obPsiphon, obDirect, obDesync, obWarp, obProxy, obBlock, obAuto:
+	case obPsiphon, obDirect, obDesync, obWarp, obCleanIP, obProxy, obBlock, obAuto:
 		return true
 	}
 	return isCountryOb(ob)
@@ -437,7 +437,9 @@ func (a *App) undoProfile() (profileResult, error) {
 		return profileResult{}, err
 	}
 	res := applyProfile(a.cfg, p, false)
-	_ = a.cfg.save()
+	if serr := a.cfg.saveOrReport("undoProfile"); serr != nil {
+		return res, saveFailed(serr)
+	}
 	_ = os.Remove(a.profileUndoPath())
 	a.onRulesChanged()
 	a.lists.Refresh()
@@ -510,7 +512,9 @@ func (a *App) profilesAPI(w http.ResponseWriter, r *http.Request, p string) bool
 			logf("warn", "Профиль: не удалось сохранить копию правил для отмены: %v", err)
 		}
 		res := applyProfile(a.cfg, prof, req.Merge)
-		_ = a.cfg.save()
+		if !a.saveOrFail(w, "profilesAPI") {
+			return true
+		}
 		a.onRulesChanged()
 		a.lists.Refresh()
 		if req.Merge {

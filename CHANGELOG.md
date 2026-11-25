@@ -1,5 +1,112 @@
 # Changelog
 
+## 2.4.0 — релизный аудит: устойчивость, честные статусы, защита обновлений
+
+- **Фоновые задачи не убивают процесс (A-06, `safe.go`)**: все запуски `go` идут через `safeGo`/`safeLoop`; долгоживущие циклы перезапускаются с backoff, после 5 падений за минуту компонент помечается failed (виден баннером), процесс живёт.
+- **Сиды (A-03, A-04)**: клиент зеркала с таймаутом и редиректом только на https того же хоста; записи только с публичными адресами; лимит 500 записей за импорт; честные статусы (`ok` / `reachable` / `failed` / `unchecked`); предупреждение о доверии при первом импорте из нового источника.
+- **Предпроверка носителей (A-02, A-09)**: «ограничение ~16 КБ» только при обрыве на двух адресатах, «DNS отравлен» только по двум хостам.
+- **Настройки не теряются молча (A-10)**: провал записи — в журнал и 500 с понятным текстом; UI не показывает «сохранено».
+- **Таймауты всех HTTP-клиентов (A-12)**; **автозапуск (A-05)**: один механизм, задача с повышенными правами только в защищённой папке; **panic → error в QUIC-ключах (A-16)**.
+- **Обновления (A-07)**: манифест v2 `v2|release|version|sha256|url|not_after`, защита от отката и просрочки; `currentRelease = 20400`. Ключ разработчика пока пустой — проверка отказывает.
+- **Повреждённый конфиг (A-17)**: предупреждение остаётся до подтверждения (кнопка «Подтвердить» в окне и в веб-панели).
+- **Интерфейс**: переключатель «Автозапуск с Windows», баннеры (повреждённый конфиг, остановленные компоненты, предупреждение автозапуска) в нативном окне и веб-панели; новые поля состояния `autostart_on`, `autostart_warning`, `failed_components`.
+- Мелочи: `-pprof` только на loopback, `openBrowser` только http/https, SOAK-отчёт подписан как симуляция (A-18).
+
+## 2.3.9 — 100% зелёные тесты: закрыты отравление `theRevDNS` и таймаут `TestNoDoubleSNISniffDelayWhenBuffered`
+
+- **Устранено отравление `theRevDNS` адресом `127.0.0.1` (`tun_util.go`, `integration_test.go`)**: `TestRelayDynamicSNIRouteHandoff` записывал `127.0.0.1 → sni-routed.example.com` в глобальный `theRevDNS`, из-за чего следующий `TestDPIResetThenLearnDesync` обучал `sni-routed.example.com` вместо `127.0.0.1`. Теперь `revMap.put` игнорирует loopback-адреса (`ip.IsLoopback()`), что также исключает ложное кэширование `127.0.0.1` в продакшене.
+- **Исправлен `TestNoDoubleSNISniffDelayWhenBuffered` (`audit_202_test.go`)**: в режиме `rules` отключённый `Default = obWarp` переписывался роутером на `obDirect`, из-за чего тест стучался напрямую в blackhole IP `203.0.113.55:443` и упирался в 2-секундный таймаут. Тест переведён на локальный закрытый SOCKS (`127.0.0.1:1`, мгновенный `ECONNREFUSED`), честно проверяя отсутствие двойной SNI-задержки.
+
+## 2.3.8 — Закрыты все 4 оставшихся падающих unit-теста (214/214 зелёных)
+
+- **Исправлен `router.go` (`dialer(obWarp)`)**: убрано скрытое авто-включение `Warp.Enabled = true`, когда WARP явно выключен пользователем. Это одновременно закрыло оба регрессионных падения с v2.1.1 — `TestFailoverDeadWarpToDirect` и `TestNoDoubleSNISniffDelayWhenBuffered`.
+- **Изолирован `TestDPIResetThenLearnDesync` (`integration_test.go`)**: добавлен сброс глобального состояния `obfs.reset()` и `theDNS.clearLookupCache()` в начале теста, исключающий отравление от соседних тестов в полном прогоне.
+- **Обновлён `TestConfigSetKeyAndValues` (`psiroute_test.go`)**: таблица ключей дополнена 3 новыми параметрами (`routing.kill_switch_mode`, `clean_chain.enabled`, `clean_chain.auto_chain` — 37/37).
+
+## 2.3.7 — Полный аудит тестов и исправление дефектов навигации/журнала
+
+- **Синхронизирован `warp_test.go`**: обновлён `TestWarpSettingsKeys` под новый приоритет прямых DPI-стратегий (`direct-dpi` первый, `via-warp` в резерве), чтобы `go test ./...` проходил без расхождений.
+- **Исправлены дефекты навигации в нативном Gio GUI (`gui_widgets.go`, `gui_events.go`)**:
+  - Восстановлена подвкладка **«Живой журнал»** (`layoutLiveLogOnlyTab`) внутри раздела «Сеть и Ядро» (`subTabs[3] == 4`) с полной загрузкой логов (`compact=0`).
+  - Исправлен фокус `Ctrl+F` и загрузка `psiStats` / `share` после объединения 5-й вкладки в 4-зонную верхнюю навигацию Aether Flow Dark.
+- **Синхронизирован `ui/index.html.gz`** под версию `2.3.7` для чистого прохождения `embedded_assets_test.go`.
+
+## 2.3.6 — Хотфикс подключения WARP и прямых стратегий Psiphon
+
+- **Восстановлена работа WARP на Windows (`warptun.go`)**: возвращён штатный `conn.NewDefaultBind()` вместо кастомного `physUDPBind`, в котором Windows `WSAECONNRESET` (от ICMP Port Unreachable при отправке junk-пакетов AmneziaWG) завершал цикл приёма пакетов `wireguard-go`.
+- **Исправлен сбой `psiphon.LoadConfig` на прямых стратегиях (`psi.go`)**: удалено некорректное имя протокола `"FRONTED-MEEK-QUIC-OSSH"` из `psiProtoSets["meek"]`, из-за которого `psiphon-tunnel-core` отклонял конфиг для `meek`, `desync-meek`, `race-direct` и `desync-direct`.
+- **Ускорен откат на резерв (`psiorder.go`)**: таймаут первой прямой попытки сокращён до 15 с, гонки протоколов — до 25 с, чтобы при жёсткой блокировке входа переход к рабочему транспорту происходил без долгого ожидания.
+
+## 2.3.5 — Усиление прямых методов подключения к Psiphon без WARP
+
+- **Новые DPI-усиленные стратегии Psiphon (`psi.go`, `config.go`)**:
+  - Добавлены стратегии `desync-meek` (CDN-фронтование `FRONTED-MEEK-OSSH / HTTP / QUIC` через локальный desync-прокси) и `desync-ossh` (`OSSH / Shadowsocks` с `psiRawSplitConn` — побайтовым дроблением первых 48 байт рукопожатия по 1–3 байта с `TCP_NODELAY` и паузой 2 мс, ломающим сигнатурный анализ ТСПУ).
+  - Увеличен параллельный пул подбора серверов `ConnectionWorkerPoolSize = 16`, сокращена пауза переподключения до 1 с, усилен встроенный фрагментатор `applyDPI` (запись кусками 1–16 байт + 100% TLS ClientHello fragmentation).
+- **Устранение «залипания» на `via-warp` в истории стратегий (`psiorder.go`, `app.go`, `web.go`)**:
+  - В `buildRoundZeroPlan` даже при высоком старом рейтинге `via-warp` в `psiroute-strategies.json` первым всегда даётся шанс быстрому прямому/DPI-методу (`direct-dpi` / `desync-meek` / `conduit`), а `via-warp` остаётся автоматическим резервом.
+  - Добавлен метод `Psi.ResetStrategyMemory()` (вызывается в `Reset Stack` и по `POST /api/psi/reset-order`).
+
+## 2.3.4 — Нативный Gio GUI в стиле Aether Flow Dark (без бокового меню и без второй темы)
+
+- **Нативный Go/Gio GUI перестроен под Aether Flow Dark Spatial Bento (`gui_widgets.go`, `gui_theme.go`, `gui_events.go`)**:
+  - Полностью удалена вторая тема (`cyber-amber`) и кнопка переключения тем — оставлена единственная тёмная палитра **Dark Obsidian** (`#080B12` / `#111623` / `#161D2E` / `#232E47`).
+  - Левая боковая панель заменена на плавающую верхнюю навигацию с 4 рабочими зонами (**Пульт**, **Маршруты**, **Потоки**, **Сеть и Ядро**), закреплённым прокси `127.0.0.1:1080`, кнопкой «Чистый экран» и `Reset Stack`.
+  - В нативный Gio GUI добавлены **Чёрный список стран (`⊘`)**, отображение результатов 3-звенной проверки **`WARP → VPN → WARP`** (`gui_countries.go`) и **Тест утечек в 1 клик** (`gui_diag.go`).
+  - `general.ui_mode` по умолчанию снова `"gio"` (нативное окно).
+
+## 2.3.3 — Прямые методы Psiphon без принудительного WARP, 1-клик Тест утечек, App-окно Aether Flow Dark и быстрый трей
+
+- **Прямое подключение Psiphon без принудительного WARP (`psi.go`, `config.go`)**:
+  - Добавлена стратегия первого приоритета `direct-dpi` («Прямой + DPI-обход без WARP»), прогоняющая TLS/MEEK рукопожатия Psiphon через локальный desync-прокси `dialObfs` (`auto`).
+  - Стратегия `tls` усилена принудительным сильным дроблением ClientHello (`DPI: "strong"`).
+  - Изменён порядок стратегий по умолчанию: `direct-dpi → conduit → meek → tls → auto → ossh → quic → via-warp` (WARP больше не перехватывает 1-е место при включении, а служит быстрым автоматическим резервом).
+- **Диагностика среды и «Тест утечек» в 1 клик (`leaktest.go`, `web.go`, `ui/index.html`)**:
+  - Добавлен `App.RunLeakTest` и `POST /api/leaktest`: проверяет 5 векторов (маскировка внешнего IP, DoH + Split-DNS + FakeIP, IPv6 blackhole, WebRTC/STUN + WFP Kill Switch, конфликты с чужими VPN-адаптерами).
+- **Окно Aether Flow Dark без адресной строки и быстрый трей (`gui_windows.go`, `desktop_windows.go`, `config.go`)**:
+  - Добавлен режим `general.ui_mode = "app"` (`openAppWindow` через Edge/Chrome `--app=...` с портативным профилем в `dataDir\tmp\app-ui`, без записи на диск `C:`).
+  - В контекстное меню трея добавлены «Открыть PsiRoute (Aether Flow Dark)», «Каскад Clean-IP» и «Reset Stack».
+
+## 2.3.2 — Чёрный список стран, 3-звенная проверка WARP → VPN → WARP, всегда активный прокси :1080 и Dark Aether Flow UI
+
+- **Чёрный список стран (`config.go`, `psi.go`, `web.go`, `ui/index.html`)**:
+  - Добавлено поле `psiphon.blocked_countries` и API `GET/POST /api/psi/blocked-countries`.
+  - В авто-режиме (`Country == ""`) при подключении к стране из чёрного списка `psi.go` автоматически меняет узел (`manual-rotate`). В интерфейсе добавлены кнопки `⊘` на карточках стран и панель активного чёрного списка.
+- **Проверка связки `WARP → VPN (Psiphon) → WARP` (`trace.go`, `clean_chain.go`, `web.go`, `gui_countries.go`, `gui_events.go`, `ui/index.html`)**:
+  - В `traceInfo` добавлен разбор поля `warp` (`on` / `plus` / `off`) из Cloudflare `/cdn-cgi/trace`.
+  - Реализован метод `CleanChain.Verify(ctx)` и endpoint `POST /api/clean-chain/verify`, пошагово проверяющий все 3 звена (Звено 1 Entry WARP, Звено 2 Psiphon VPN, Звено 3 Exit WARP) и подтверждающий смену выходного IP на чистый Cloudflare WARP (`warp=on` + отличный от Psiphon IP).
+- **Всегда доступный проброс трафика через локальный прокси `127.0.0.1:1080` (`app.go`, `ui/index.html`)**:
+  - В `stateCompact` добавлены флаги `proxy_always_on`, `proxy_socks5` и `proxy_http`; локальный SOCKS5/HTTP прокси `127.0.0.1:1080` (включая проброс прямых IP-адресов) всегда активен параллельно с TUN и закреплён в верхней панели и на Пульте.
+- **Новый дизайн Aether Flow Spatial Bento — строго тёмная тема (`ui/index.html`, `ui/index.html.gz`)**:
+  - Веб-панель полностью пересобрана в стиле **Dark Obsidian Aether Flow** (только тёмная тема `#080B12` / `#111623` / `#161D2E` / `#232E47`, плавающая верхняя навигация на 4 зоны, анимированная 3-узловая цепочка трафика, SVG-флаги, график скорости и 0 внешних CDN под строгий CSP).
+
+## 2.3.1 — Исправление коллизий FakeIP (ERR_CERT_COMMON_NAME_INVALID) и конфликтов после других VPN
+
+- **Исправлена подмена домена и ошибка сертификата `NET::ERR_CERT_COMMON_NAME_INVALID` (`tun.go`, `fakeip.go`)**:
+  - В `tun.go` (`resolveTCPHost`, `onTCP`, `serveUDP`) убрана перезапись реального не-ECH TLS/QUIC SNI на устаревший `fakeDomain` при коллизии FakeIP из кэша браузера; реальный SNI теперь всегда имеет приоритет, а неизвестные «сиротские» FakeIP от других VPN немедленно сбрасываются (RST), заставляя браузер обновить DNS.
+  - В `fakeip.go` стартовый диапазон выдачи FakeIP перенесён в верхнюю половину `198.19.16.1–198.19.240.0` со случайным смещением на каждую сессию (`randomFakeIPStart`), чтобы не пересекаться с пулом `198.18.0.x`, который используют Clash, Sing-box, v2rayN, Nekoray и Amnezia.
+- **Исправлен «пропавший трафик» после использования других VPN (`tun_windows.go`, `tun_util.go`, `platform_windows.go`, `app.go`)**:
+  - В `tun_windows.go` (`tunBestDefault`) внедрён двухпроходный выбор физического адаптера: на первом проходе игнорируются виртуальные/туннельные VPN-адаптеры сторонних клиентов (`isVirtualVPNAdapterName`, `IfTypeTunnel`, `IfTypePropVirtual`), чтобы `bindPhys` (`IP_UNICAST_IF`) не отправлял трафик PsiRoute в чужой виртуальный интерфейс.
+  - В `platform_windows.go` (`clearDeadLoopbackProxy`) добавлена автоматическая очистка «мёртвого» системного прокси Windows (`127.0.0.1:*`), оставшегося от других VPN-клиентов, при старте и по кнопке `Reset Stack`.
+
+## 2.3.0 — Core FSM, WFP Kill Switch, IPv6/DNS Anti-Leak, Каскад Clean-IP (WARP → VPN → WARP) и 5-экранный «Пульт управления»
+
+- **Очистка архитектуры и строгий Core FSM (`core_fsm.go`, `docs/ARCHITECTURE.md`)**:
+  - Удалены неиспользуемые файлы сторонней Rust-ветки (`app-slint/`, `Cargo.toml`); зафиксирован единый каноничный Go/Gio GUI с Web UI (`:9090`) в режиме мониторинга и управления.
+  - Введён конечный автомат ядра `CoreFSM` (`Idle → Bootstrapping → Connecting → Connected → Degraded → Reconnecting → Stopping`), стадии запуска (`Bootstrap → Obfs → Tunnel → Check → Ready`), потокобезопасные подписки UI и единый интерфейс транспортов `ChainDialer`.
+- **Пресечение утечек и стабильность Windows (`wfp_killswitch.go`, `wfp_windows.go`, `wfp_other.go`, `tun_windows.go`, `tun.go`, `selftest_windows.go`, `psi.go`)**:
+  - Реализован системный **WFP Kill Switch** с 3 режимами (`off`, `auto`, `strict`) и автоматической очисткой сиротских фильтров при старте после аварийного завершения (`CleanupOrphans`).
+  - Закрыта утечка IPv6: `setupAdapter` в `tun_windows.go` всегда перехватывает `::/1` и `8000::/1` на адаптер Wintun, а `tun.go` сбрасывает IPv6-пакеты при `tun.ipv6 = false` (blackhole).
+  - Закрыта утечка DNS при падении Psiphon или активном Kill Switch: в `tun.go` (`resolveDNS`) введён строгий Split-DNS без молчаливого отката туннелируемых доменов в `obDirect`.
+  - В `selftest_windows.go` добавлена событийная подписка на смену маршрутов Windows через `NotifyRouteChange2` (`winipcfg.RegisterRouteChangeCallback`) с мгновенным обновлением `IP_UNICAST_IF`.
+  - В `psi.go` добавлен умный Watchdog (`probeChunk32KB`), проверяющий передачу контрольного чанка `>= 32 КБ` (детекция «тихой блокировки» ТСПУ после 16 КБ) с автопереключением транспорта после 2 сбоев подряд.
+- **Каскад «Чистый IP»: `WARP → VPN (Psiphon) → WARP` (`clean_chain.go`, `warptun.go`, `router.go`, `tun_util.go`, `tun.go`)**:
+  - Выделены `physUDPBind` (привязка `EntryWarp` напрямую к физическому адаптеру через `IP_UNICAST_IF` без петель через TUN) и `udpgwBind` (инкапсуляция WireGuard UDP для 3-го звена `ExitWarp` поверх `udpgw` TCP-моста через Psiphon).
+  - Реализован мульти-инстансный userspace netstack (`openWarpTunnelWithBind`, отдельный ключ `warp-exit-identity.json`, **без создания второго TUN-адаптера**), outbound-тег `clean-ip`, адаптивный `Auto-Chain` и жёсткий TCP MSS Clamping (`<= 1140` IPv4 / `<= 1120` IPv6, MTU `1280 → 1200`).
+- **Рефакторинг UI и API (`gui_widgets.go`, `gui_events.go`, `gui_countries.go`, `gui_windows.go`, `web.go`, `app.go`)**:
+  - Закреплён тактический Status Bar на всех 5 экранах («Пульт», «Маршруты», «Инспектор», «Транспорт», «Защита»): индикатор режима (`TUN`/`PROXY`), статус WFP Kill Switch (`KS: OFF/AUTO/STRICT` / `WFP LOCK ●`), Exit IP и кнопка экстренного сброса **`Reset Stack`** (`POST /api/stack/reset`).
+  - Добавлена панель управления каскадом `Clean-IP` + `Auto-Chain` (`POST /api/clean-chain/toggle`), 3-режимный переключатель WFP Kill Switch и выбор маршрута `Clean-IP` в правилах.
+  - Добавлены unit-тесты в `v230_architecture_test.go`.
+
 ## 2.2.0 — Честное отключение VPN по кнопке «Пуск», устранение гонок GUI и редизайн Obsidian Pro
 
 - **Честное отключение VPN по кнопке «Пуск» (`psi.go`, `app.go`, `router.go`, `web.go`, `desktop_windows.go`, `gui_events.go`, `ui/index.html`)**:

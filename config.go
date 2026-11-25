@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -63,9 +65,15 @@ type Config struct {
 		DPI                    string   `json:"dpi"`                                // "" std | off | hello | light | strong | auto
 		Country                string   `json:"country"`                            // egress region, "" = auto
 		FavoriteCountries      []string `json:"favorite_countries,omitempty"`       // user's favorite exit countries
+		BlockedCountries       []string `json:"blocked_countries,omitempty"`        // country blacklist excluded from Auto egress
 		Via                    string   `json:"via"`                                // auto | direct | warp | proxy
 		Strategies             []string `json:"strategies"`                         // enabled strategy ids, order = priority
 		SingleProcessCountries bool     `json:"single_process_countries,omitempty"` // hot-switch exit country in main process (saves 20-25 MB RAM per country)
+		Preset                 string   `json:"preset,omitempty"`                   // fast | balanced | patient
+		MirrorURL              string   `json:"mirror_url,omitempty"`               // optional user-controlled HTTPS mirror for server entries (off by default)
+		PropagationChannelID   string   `json:"propagation_channel_id,omitempty"`   // optional 16-hex official Psiphon PropagationChannelId
+		SponsorID              string   `json:"sponsor_id,omitempty"`               // optional 16-hex official Psiphon SponsorId
+		ClientPlatform         string   `json:"client_platform,omitempty"`          // optional Psiphon ClientPlatform string
 	} `json:"psiphon"`
 	Desync struct {
 		Enabled   bool     `json:"enabled"`    // split TLS ClientHello on direct connections
@@ -79,6 +87,10 @@ type Config struct {
 		Mask     string `json:"mask"`     // built-in: handshake masking auto | quic | masque | bwg | dns | off
 		Endpoint string `json:"endpoint"` // built-in: Cloudflare endpoint ip:port, "" = auto
 	} `json:"warp"`
+	CleanChain struct {
+		Enabled   bool `json:"enabled"`    // WARP -> VPN -> WARP clean exit IP cascade
+		AutoChain bool `json:"auto_chain"` // bypass EntryWarp automatically when direct VPN works
+	} `json:"clean_chain"`
 	Proxy struct {
 		Enabled  bool   `json:"enabled"`
 		Upstream string `json:"upstream"` // external upstream, e.g. socks5://127.0.0.1:1081 or http://...
@@ -94,7 +106,8 @@ type Config struct {
 		Learn      bool     `json:"learn"`                 // remember the working route per host
 		BypassLAN  bool     `json:"bypass_lan,omitempty"`  // keep private/LAN addresses direct in all modes
 		BlockQUIC  bool     `json:"block_quic,omitempty"`  // drop UDP:443 (QUIC) on non-direct routes so browsers use TCP+DPI
-		KillSwitch bool     `json:"kill_switch,omitempty"` // block VPN traffic when Psiphon is disconnected
+		KillSwitch     bool     `json:"kill_switch,omitempty"`      // block VPN traffic when Psiphon is disconnected
+		KillSwitchMode string   `json:"kill_switch_mode,omitempty"` // off | auto | strict (WFP Kill Switch)
 		BlockSTUN  bool     `json:"block_stun,omitempty"`  // block STUN/WebRTC UDP ports (3478, 5349, 19302) on direct routes
 		Default    string   `json:"default"`               // default outbound in rules mode
 		Rules      []Rule   `json:"rules"`
@@ -143,6 +156,7 @@ type Config struct {
 	path          string     `json:"-"`
 	corruptErr    string     `json:"-"`
 	corruptBackup string     `json:"-"`
+	corruptLogged bool       `json:"-"`
 	lastSavedMod  time.Time  `json:"-"`
 }
 
@@ -192,14 +206,18 @@ func defaultConfig() *Config {
 	c.Psiphon.HealthIntervalS = 30
 	c.Psiphon.MinSpeedKBps = 0
 	c.Psiphon.Via = "auto"
+	c.Psiphon.Preset = PresetBalanced
 	c.Psiphon.FavoriteCountries = append([]string(nil), defaultFavoriteCountries...)
-	c.Psiphon.Strategies = []string{"via-warp", "auto", "conduit", "meek", "tls", "ossh", "quic"}
+	c.Psiphon.Strategies = []string{"via-warp", "auto", "conduit", "meek", "tls", "ossh", "quic", "direct-dpi", "desync-meek", "desync-ossh"}
 	c.Desync.Enabled = true
 	c.Desync.Method = "auto"
 	c.Warp.Enabled = false
 	c.Warp.Socks = "127.0.0.1:40000"
 	c.Warp.Engine = "builtin"
 	c.Warp.Mask = "auto"
+	c.CleanChain.Enabled = false
+	c.CleanChain.AutoChain = true
+	c.Routing.KillSwitchMode = wfpModeOff
 	c.Proxy.Enabled = false
 	c.DNS.Enabled = true
 	c.DNS.LocalAddr = "127.0.0.1:5353"
@@ -538,14 +556,55 @@ func writeFileAtomic(path string, b []byte, perm os.FileMode) error {
 	return os.Rename(tmp, path)
 }
 
+// saveOrReport saves the config and, if the write fails, writes the reason to
+// the log (audit A-10). The error is returned so API handlers can show it.
+func (c *Config) saveOrReport(where string) error {
+	err := c.save()
+	if err != nil {
+		logf("error", "Не удалось сохранить настройки (%s): %v", where, err)
+	}
+	return err
+}
+
+// saveErrText is the user-facing text for a failed settings write.
+func saveErrText(err error) string {
+	return fmt.Sprintf("Настройки не сохранены на диск: %v. Изменение действует только до перезапуска. Проверьте свободное место и права на папку с настройками Psiroute", err)
+}
+
+// saveFailed wraps a failed settings write into an error with the user-facing text.
+func saveFailed(err error) error { return errors.New(saveErrText(err)) }
+
+// saveOrFail is used by API handlers: on a failed write it answers 500 with a
+// human text and returns false, so the UI never shows "saved" after a failure.
+func (a *App) saveOrFail(w http.ResponseWriter, where string) bool {
+	if err := a.cfg.saveOrReport(where); err != nil {
+		writeErr(w, http.StatusInternalServerError, saveErrText(err))
+		return false
+	}
+	return true
+}
+
 func (c *Config) save() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.saveLocked()
 }
 
-func (c *Config) saveLocked() error {
+// ackCorruptError clears the damaged-config warning after the user confirmed it (A-17).
+func (c *Config) ackCorruptError() {
+	c.mu.Lock()
 	c.corruptErr = ""
+	c.corruptLogged = false
+	c.mu.Unlock()
+}
+
+func (c *Config) saveLocked() error {
+	// A-17: a save must not silently drop the warning. It stays visible until the
+	// user confirms it; meanwhile the journal says the program runs on defaults.
+	if c.corruptErr != "" && !c.corruptLogged {
+		c.corruptLogged = true
+		logf("warn", "Конфигурация была повреждена, работа идёт на настройках по умолчанию (%s). Предупреждение остаётся в интерфейсе, пока вы его не подтвердите", c.corruptErr)
+	}
 	syncListRegistryLocked(c)
 	p := c.path
 	if p == "" {
@@ -581,6 +640,11 @@ func (c *Config) values() map[string]any {
 		"psiphon.min_speed_kbps":           c.Psiphon.MinSpeedKBps,
 		"psiphon.dpi":                      c.Psiphon.DPI,
 		"psiphon.single_process_countries": c.Psiphon.SingleProcessCountries,
+		"psiphon.preset":                   normalizePreset(c.Psiphon.Preset),
+		"psiphon.mirror_url":               c.Psiphon.MirrorURL,
+		"psiphon.propagation_channel_id":   c.Psiphon.PropagationChannelID,
+		"psiphon.sponsor_id":               c.Psiphon.SponsorID,
+		"psiphon.client_platform":          c.Psiphon.ClientPlatform,
 		"desync.enabled":                   c.Desync.Enabled,
 		"desync.method":                    c.Desync.Method,
 		"warp.enabled":                     c.Warp.Enabled,
@@ -605,6 +669,9 @@ func (c *Config) values() map[string]any {
 		"routing.bypass_lan":               c.Routing.BypassLAN,
 		"routing.block_quic":               c.Routing.BlockQUIC,
 		"routing.kill_switch":              c.Routing.KillSwitch,
+		"routing.kill_switch_mode":         normalizeKillSwitchMode(c.Routing.KillSwitchMode, c.Routing.KillSwitch),
+		"clean_chain.enabled":              c.CleanChain.Enabled,
+		"clean_chain.auto_chain":           c.CleanChain.AutoChain,
 		"routing.block_stun":               c.Routing.BlockSTUN,
 		"general.watch_config":             c.General.WatchConfig,
 		"general.system_proxy":             c.General.SystemProxy,
@@ -633,6 +700,41 @@ func (c *Config) setKey(key string, v any) (restart bool) {
 		restart = true
 	case "psiphon.single_process_countries":
 		c.Psiphon.SingleProcessCountries = toBool(v)
+	case "psiphon.preset":
+		c.Psiphon.Preset = normalizePreset(toStr(v))
+		restart = true
+	case "psiphon.mirror_url":
+		if norm, err := validateUserMirrorURL(toStr(v)); err == nil {
+			c.Psiphon.MirrorURL = norm
+		}
+	case "psiphon.propagation_channel_id":
+		s := strings.ToUpper(strings.TrimSpace(toStr(v)))
+		if s == "" || validateHexID16(s) == nil {
+			c.Psiphon.PropagationChannelID = s
+			restart = true
+		}
+	case "psiphon.sponsor_id":
+		s := strings.ToUpper(strings.TrimSpace(toStr(v)))
+		if s == "" || validateHexID16(s) == nil {
+			c.Psiphon.SponsorID = s
+			restart = true
+		}
+	case "psiphon.client_platform":
+		c.Psiphon.ClientPlatform = strings.TrimSpace(toStr(v))
+		restart = true
+	case "psiphon.blocked_countries":
+		switch arr := v.(type) {
+		case []string:
+			c.Psiphon.BlockedCountries = normalizeFavoriteCountries(arr)
+		case []any:
+			tmp := make([]string, 0, len(arr))
+			for _, it := range arr {
+				if s, ok := it.(string); ok {
+					tmp = append(tmp, s)
+				}
+			}
+			c.Psiphon.BlockedCountries = normalizeFavoriteCountries(tmp)
+		}
 	case "psiphon.favorite_countries":
 		switch arr := v.(type) {
 		case []string:
@@ -656,7 +758,8 @@ func (c *Config) setKey(key string, v any) (restart bool) {
 	case "warp.enabled":
 		c.Warp.Enabled = toBool(v)
 		if c.Warp.Enabled && !slices.Contains(c.Psiphon.Strategies, "via-warp") {
-			c.Psiphon.Strategies = append([]string{"via-warp"}, c.Psiphon.Strategies...)
+			// Keep via-warp as automatic fallback AFTER direct-dpi / conduit / meek / tls
+			c.Psiphon.Strategies = append(c.Psiphon.Strategies, "via-warp")
 		}
 		restart = true
 	case "warp.engine":
@@ -712,6 +815,14 @@ func (c *Config) setKey(key string, v any) (restart bool) {
 		c.Routing.BlockQUIC = toBool(v)
 	case "routing.kill_switch":
 		c.Routing.KillSwitch = toBool(v)
+	case "routing.kill_switch_mode":
+		m := normalizeKillSwitchMode(toStr(v), false)
+		c.Routing.KillSwitchMode = m
+		c.Routing.KillSwitch = m != wfpModeOff
+	case "clean_chain.enabled":
+		c.CleanChain.Enabled = toBool(v)
+	case "clean_chain.auto_chain":
+		c.CleanChain.AutoChain = toBool(v)
 	case "routing.block_stun":
 		c.Routing.BlockSTUN = toBool(v)
 	case "general.watch_config":
@@ -768,4 +879,18 @@ func toStr(v any) string {
 		return s
 	}
 	return ""
+}
+
+// isCountryBlocked reports whether 2-letter country code cc is in the user blacklist.
+func (c *Config) isCountryBlocked(cc string) bool {
+	if c == nil {
+		return false
+	}
+	cc = strings.ToUpper(strings.TrimSpace(cc))
+	if len(cc) != 2 {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Contains(c.Psiphon.BlockedCountries, cc)
 }

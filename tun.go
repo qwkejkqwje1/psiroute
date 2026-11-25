@@ -86,7 +86,7 @@ func (t *tunCtl) start(a *App) error {
 	}
 	if t.stopReq || a.ctx.Err() != nil {
 		t.stopReq, t.state = false, "off"
-		go e.close()
+		safeGo("tunCtl.start", e.close)
 		return nil
 	}
 	t.eng, t.state = e, "on"
@@ -193,7 +193,9 @@ func (c *Config) tunOpts() (dns bool, fakeIP bool, exclude []string) {
 
 func (a *App) setTun(on bool) error {
 	a.cfg.setKey("tun.enabled", on)
-	_ = a.cfg.save()
+	if serr := a.cfg.saveOrReport("setTun"); serr != nil {
+		return saveFailed(serr)
+	}
 	if !on {
 		a.tun.stop()
 		return nil
@@ -201,7 +203,7 @@ func (a *App) setTun(on bool) error {
 	err := a.tun.start(a)
 	if err != nil && !errors.Is(err, errNeedAdmin) {
 		a.cfg.setKey("tun.enabled", false)
-		_ = a.cfg.save()
+		_ = a.cfg.saveOrReport("setTun")
 	}
 	return err
 }
@@ -210,7 +212,9 @@ func (a *App) setTun(on bool) error {
 // one to exit; the caller then quits normally.
 func (a *App) relaunchForTun() error {
 	a.cfg.setKey("tun.enabled", true)
-	_ = a.cfg.save()
+	if serr := a.cfg.saveOrReport("relaunchForTun"); serr != nil {
+		return saveFailed(serr)
+	}
 	pid := os.Getpid()
 	if watchdogPID > 0 {
 		pid = int(watchdogPID)
@@ -273,9 +277,10 @@ func (e *tunEngine) syncDynamicMTU() {
 	e.mtuMu.Lock()
 	defer e.mtuMu.Unlock()
 	cfgMTU, warpCascade, psiActive := e.cascadeState()
-	effMTU := effectiveTunMTU(cfgMTU, warpCascade, psiActive)
-	m4 := effectiveTunMSS(cfgMTU, false, warpCascade, psiActive)
-	m6 := effectiveTunMSS(cfgMTU, true, warpCascade, psiActive)
+	cleanActive := e.a != nil && e.a.cleanChain != nil && (e.a.cleanChain.Healthy() || e.a.cleanChain.enabled())
+	effMTU := effectiveTunMTUWithClean(cfgMTU, warpCascade, psiActive, cleanActive)
+	m4 := effectiveTunMSSWithClean(cfgMTU, false, warpCascade, psiActive, cleanActive)
+	m6 := effectiveTunMSSWithClean(cfgMTU, true, warpCascade, psiActive, cleanActive)
 	prevMTU := int(e.curMTU.Load())
 	if prevMTU != 0 && (prevMTU != effMTU || e.mtuDirty) && e.dev != nil {
 		setter := e.setMTU
@@ -416,7 +421,7 @@ func (e *tunEngine) readLoop() {
 		}
 		if err != nil {
 			if fails++; fails > 200 {
-				go e.ctl.fail(e, "адаптер перестал отвечать: "+err.Error())
+				safeGo("tunEngine.readLoop", func() { e.ctl.fail(e, "адаптер перестал отвечать: "+err.Error()) })
 				return
 			}
 			time.Sleep(5 * time.Millisecond)
@@ -584,6 +589,29 @@ func (e *tunEngine) resolveRealDst(dst netip.Addr, host string, port int) (netip
 
 // ---------- TCP ----------
 
+// isECHOuterHost reports whether host is an Encrypted ClientHello public outer SNI.
+func isECHOuterHost(host string) bool {
+	l := strings.ToLower(strings.TrimSpace(host))
+	return l != "" && (strings.Contains(l, "ech.") || strings.HasSuffix(l, "-ech.com") || l == "cloudflare-ech.com")
+}
+
+// resolveTCPHost chooses the authoritative target domain for a TUN flow.
+// A real non-ECH TLS SNI or HTTP Host ALWAYS takes precedence over fakeDomain:
+// overwriting a real SNI (e.g. 2ip.io) with a colliding FakeIP domain (e.g. google.com
+// from a stale browser DNS cache after another VPN) causes NET::ERR_CERT_COMMON_NAME_INVALID.
+func resolveTCPHost(dst netip.Addr, sniffedHost, fakeDomain string) string {
+	if fakeDomain == "" {
+		return sniffedHost
+	}
+	if sniffedHost == "" || sniffedHost == dst.String() || isECHOuterHost(sniffedHost) {
+		return fakeDomain
+	}
+	if !strings.EqualFold(sniffedHost, fakeDomain) && isFakeIP(dst) {
+		logf("debug", "TUN: коллизия кэша FakeIP %s (ожидался %s, реальный SNI %s) — использую SNI", dst.String(), fakeDomain, sniffedHost)
+	}
+	return sniffedHost
+}
+
 func (e *tunEngine) onTCP(r *tcp.ForwarderRequest) {
 	defer tunRecover("TCP")
 	id := r.ID()
@@ -646,18 +674,11 @@ func (e *tunEngine) onTCP(r *tcp.ForwarderRequest) {
 		return
 	}
 	first, host := e.sniff(c, dst, dport)
-	if fakeDomain != "" {
-		if host == "" || host == dst.String() || strings.Contains(strings.ToLower(host), "ech.") || strings.HasSuffix(strings.ToLower(host), "-ech.com") {
-			host = fakeDomain
-		} else if host != fakeDomain && e.a != nil && e.a.router != nil {
-			// Если по FakeIP для домена есть явное правило пользователя, а по внешнему SNI (например, CDN/ECH) — нет,
-			// используем точный домен из FakeIP, чтобы правило VPN гарантированно сработало!
-			if obFake, _ := e.a.router.matchRule(fakeDomain, dport); obFake != "" {
-				if obSniff, _ := e.a.router.matchRule(host, dport); obSniff == "" {
-					host = fakeDomain
-				}
-			}
-		}
+	host = resolveTCPHost(dst, host, fakeDomain)
+	if isFakeIP(dst) && (host == "" || host == dst.String()) {
+		// Stale FakeIP from another VPN or previous session with no TLS SNI / HTTP Host:
+		// close immediately so the browser re-resolves DNS instead of hanging on 198.18.x.y.
+		return
 	}
 	if hijackDNS && dport == 443 && isKnownPublicDoHHost(host) {
 		return
@@ -760,14 +781,14 @@ func tunHalfClose(c net.Conn) {
 func tunPipe(c, up net.Conn) (int64, int64) {
 	var upN int64
 	done := make(chan struct{})
-	go func() {
+	safeGo("tunPipe", func() {
 		defer close(done)
 		bPtr := getRelayBuf()
 		upN, _ = io.CopyBuffer(up, c, *bPtr)
 		putRelayBuf(bPtr)
 		tunHalfClose(up)
 		_ = up.SetReadDeadline(time.Now().Add(2 * time.Minute))
-	}()
+	})
 	bPtr := getRelayBuf()
 	downN, _ := io.CopyBuffer(c, up, *bPtr)
 	putRelayBuf(bPtr)
@@ -848,14 +869,14 @@ func (e *tunEngine) serveUDP(c net.Conn, dst netip.Addr, dport int, sport uint16
 	// Читаем первую датаграмму заранее, чтобы на UDP:443 при отсутствии FakeIP/RevDNS
 	// расшифровать QUIC Initial (RFC 9001) и узнать реальный SNI до выбора маршрута!
 	var firstPayload []byte
-	if host == "" && dport == 443 && !self {
+	if (host == "" || isFakeIP(dst)) && dport == 443 && !self {
 		bufPtr := getUDPBuf()
 		buf := *bufPtr
 		_ = c.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 		if n, err := c.Read(buf); err == nil && n > 0 {
 			firstPayload = append([]byte(nil), buf[:n]...)
 			if sni := parseQUICInitialSNI(firstPayload); sni != "" {
-				host = sni
+				host = resolveTCPHost(dst, sni, host)
 				if !isFakeIP(dst) {
 					e.rev.put(net.IP(dst.AsSlice()), sni, 10*time.Minute)
 					theRevDNS.put(net.IP(dst.AsSlice()), sni, 10*time.Minute)
@@ -867,6 +888,10 @@ func (e *tunEngine) serveUDP(c net.Conn, dst netip.Addr, dport int, sport uint16
 		if hijack && isKnownPublicDoHHost(host) {
 			return
 		}
+	}
+	if isFakeIP(dst) && (host == "" || host == dst.String()) {
+		// Drop stale unmapped FakeIP UDP packets from other VPNs so apps re-resolve DNS.
+		return
 	}
 	if host == "" {
 		host = dst.String()
@@ -927,6 +952,15 @@ func (e *tunEngine) serveUDP(c net.Conn, dst netip.Addr, dport int, sport uint16
 			return
 		}
 		e.udpRelayWithFirst(c, up, t, false, firstPayload)
+	case obCleanIP:
+		ctx, cancel := context.WithTimeout(e.ctx, 20*time.Second)
+		up, err := e.a.cleanChain.DialContext(ctx, "udp", addr)
+		cancel()
+		if err != nil {
+			e.a.stats.close(t, err)
+			return
+		}
+		e.udpRelayWithFirst(c, up, t, false, firstPayload)
 	default:
 		e.udpGWWithFirst(c, realDst, dport, t, firstPayload)
 	}
@@ -947,7 +981,7 @@ func (e *tunEngine) udpRelayWithFirst(c, up net.Conn, t *tracked, quicDesync boo
 		return e.ctx.Err() == nil && time.Since(time.Unix(0, last.Load())) < udpIdle
 	}
 	done := make(chan struct{})
-	go func() {
+	safeGo("tunEngine.udpRelayWithFirst", func() {
 		defer close(done)
 		defer tunRecover("UDP")
 		bufPtr := getUDPBuf()
@@ -972,7 +1006,7 @@ func (e *tunEngine) udpRelayWithFirst(c, up net.Conn, t *tracked, quicDesync boo
 				return
 			}
 		}
-	}()
+	})
 
 	firstPkt := true
 	sendOne := func(payload []byte) bool {
@@ -1062,7 +1096,7 @@ func (e *tunEngine) udpGWWithFirst(c net.Conn, dst netip.Addr, port int, t *trac
 		return e.ctx.Err() == nil && time.Since(time.Unix(0, last.Load())) < udpIdle
 	}
 	done := make(chan struct{})
-	go func() {
+	safeGo("tunEngine.udpGWWithFirst", func() {
 		defer close(done)
 		defer tunRecover("udpgw")
 		br := bufio.NewReaderSize(gw, 16<<10)
@@ -1085,9 +1119,9 @@ func (e *tunEngine) udpGWWithFirst(c net.Conn, dst netip.Addr, port int, t *trac
 				return
 			}
 		}
-	}()
+	})
 	stopKA := make(chan struct{})
-	go func() {
+	safeGo("tunEngine.udpGWWithFirst#2", func() {
 		tk := time.NewTicker(10 * time.Second)
 		defer tk.Stop()
 		for {
@@ -1100,7 +1134,7 @@ func (e *tunEngine) udpGWWithFirst(c net.Conn, dst netip.Addr, port int, t *trac
 				}
 			}
 		}
-	}()
+	})
 	sent := false
 	if len(firstPayload) > 0 && len(firstPayload) <= udpgwMaxData {
 		sent = true
@@ -1234,8 +1268,18 @@ func (e *tunEngine) resolveDNS(q []byte) []byte {
 	}
 	if name != "" && e.a != nil && e.a.router != nil {
 		if ord, _ := e.a.router.planForProto("udp", name, "", 53, ""); len(ord) > 0 {
-			if ord[0] == obPsiphon || isCountryOb(ord[0]) || ord[0] == obWarp {
-				obs = []string{obPsiphon, obDirect}
+			switch {
+			case ord[0] == obBlock:
+				if nx := dnsNXDomain(q); nx != nil {
+					return nx
+				}
+				return dnsServfail(q)
+			case ord[0] == obPsiphon || isCountryOb(ord[0]) || ord[0] == obWarp || ord[0] == obCleanIP:
+				// Strict Split-DNS: never fall back to obDirect for tunnel-routed domains
+				// (prevents ISP DNS leaks when Psiphon drops or Kill Switch is active).
+				obs = []string{obPsiphon}
+			case ord[0] == obDirect || ord[0] == obDesync:
+				obs = []string{obDirect}
 			}
 		}
 	}

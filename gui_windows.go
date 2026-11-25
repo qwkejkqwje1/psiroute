@@ -37,8 +37,8 @@ var (
 	nativeDPIModes = []string{"auto", "off", "tlsrec", "split", "double", "multirec", "chunk"}
 	nativeDPINames = []string{"Авто (подбор)", "Выключен", "2 TLS-записи (tlsrec)", "Разрез TCP (split)", "Записи + разрез (double)", "Много записей (multirec)", "Мелкие куски (chunk)"}
 
-	nativeRuleObs     = []string{"psiphon", "direct", "direct-dpi", "warp", "block", "auto", "psiphon:DE", "psiphon:NL", "psiphon:FI", "psiphon:US", "psiphon:GB", "psiphon:FR"}
-	nativeRuleObNames = []string{"Psiphon", "Напрямую (direct)", "DPI-обход (direct-dpi)", "Через WARP", "Блокировать (block)", "Авто-подбор (auto)", "Psiphon: Германия (DE)", "Psiphon: Нидерланды (NL)", "Psiphon: Финляндия (FI)", "Psiphon: США (US)", "Psiphon: Великобритания (GB)", "Psiphon: Франция (FR)"}
+	nativeRuleObs     = []string{"psiphon", "direct", "direct-dpi", "warp", "clean-ip", "block", "auto", "psiphon:DE", "psiphon:NL", "psiphon:FI", "psiphon:US", "psiphon:GB", "psiphon:FR"}
+	nativeRuleObNames = []string{"Psiphon", "Напрямую (direct)", "DPI-обход (direct-dpi)", "Через WARP", "Clean-IP (WARP→VPN→WARP)", "Блокировать (block)", "Авто-подбор (auto)", "Psiphon: Германия (DE)", "Psiphon: Нидерланды (NL)", "Psiphon: Финляндия (FI)", "Psiphon: США (US)", "Psiphon: Великобритания (GB)", "Psiphon: Франция (FR)"}
 
 	nativeProfileIDs   = []string{"discord-youtube", "gaming-discord-youtube", "except-ru", "blocked-only", "telegram"}
 	nativeProfileNames = []string{"Discord + YouTube через Psiphon", "Игры + Discord (голос) + YouTube", "Всё, кроме российских сайтов", "Только заблокированное через Psiphon", "Только Telegram"}
@@ -54,6 +54,10 @@ func runWindowProcess(dataDir, uiURL string, parentPID int) {
 		return
 	}
 	cfg := loadConfig(readConfigPath(dataDir))
+	if cfg.General.UIMode == "app" {
+		openAppWindow(uiURL, dataDir)
+		os.Exit(exitNoWebView)
+	}
 	if cfg.General.UIMode == "browser" {
 		openBrowser(uiURL)
 		os.Exit(exitNoWebView)
@@ -81,7 +85,40 @@ func resolveAPIConfig(dataDir, uiURL string) (apiBase, token string) {
 
 
 func openBrowser(url string) {
+	if !isHTTPURL(url) {
+		logf("warn", "Ссылка не открыта: разрешены только http и https")
+		return
+	}
 	_ = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
+}
+
+// openAppWindow launches the Aether Flow Dark UI as a standalone frameless
+// desktop app window (--app=URL) using Edge or Chrome with a strictly portable
+// profile inside dataDir\tmp\app-ui (zero files written to C:).
+func openAppWindow(uiURL, dataDir string) {
+	profDir := dataDir + `\tmp\app-ui`
+	_ = os.MkdirAll(profDir, 0o700)
+	candidates := []string{
+		`C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`,
+		`C:\Program Files\Microsoft\Edge\Application\msedge.exe`,
+		`C:\Program Files\Google\Chrome\Application\chrome.exe`,
+		`C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`,
+	}
+	for _, bin := range candidates {
+		if _, err := os.Stat(bin); err == nil {
+			cmd := exec.Command(bin,
+				"--app="+uiURL,
+				"--window-size=1280,820",
+				"--user-data-dir="+profDir,
+				"--no-first-run",
+				"--no-default-browser-check",
+			)
+			if cmd.Start() == nil {
+				return
+			}
+		}
+	}
+	openBrowser(uiURL)
 }
 
 // showFatal shows a startup error: the GUI build has no console to print to.

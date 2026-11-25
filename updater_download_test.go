@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestUpdateDownloadPreservesDestinationOnFailure(t *testing.T) {
@@ -31,7 +32,7 @@ func TestUpdateDownloadPreservesDestinationOnFailure(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			m := &UpdateManifest{Version: "2.0.5", URL: server.URL, SHA256: hex.EncodeToString(sum[:])}
+			m := &UpdateManifest{Version: "2.0.5", URL: server.URL, SHA256: hex.EncodeToString(sum[:]), Release: currentRelease + 1, NotAfter: time.Now().Add(time.Hour).Unix()}
 			if mode == "tamper" {
 				m.SHA256 = hex.EncodeToString(make([]byte, 32))
 			}

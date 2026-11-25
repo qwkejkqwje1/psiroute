@@ -248,7 +248,7 @@ func (ui *gioUI) layoutRulesTab(gtx layout.Context) layout.Dimensions {
 			ui.mu.Unlock()
 			inspectorPreview, inspectorConflict = "", ""
 		} else {
-			go func(target string, ts time.Time) {
+			func(target string, ts time.Time) { safeGo("gioUI.layoutRulesTab", func() {
 				time.Sleep(250 * time.Millisecond)
 				ui.mu.Lock()
 				stillCurrent := ui.lastRuleCheckQuery == target && ui.lastRuleCheckAt.Equal(ts)
@@ -276,7 +276,7 @@ func (ui *gioUI) layoutRulesTab(gtx layout.Context) layout.Dimensions {
 						ui.w.Invalidate()
 					}
 				}
-			}(firstTok, stamp)
+			}) }(firstTok, stamp)
 		}
 	}
 

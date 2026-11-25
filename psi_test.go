@@ -84,8 +84,8 @@ func TestPsiBuildRoundZeroPlanAndProtocolRace(t *testing.T) {
 	if plan[1].ID != "race-direct" || len(plan[1].CustomProtos) < 5 {
 		t.Fatalf("plan[1] = %+v, want combined race-direct with merged protocols", plan[1])
 	}
-	if bestStrategyShortTimeout+combinedRaceTimeout > 60 {
-		t.Fatalf("first round total direct budget = %d s, must be <= 60 s", bestStrategyShortTimeout+combinedRaceTimeout)
+	if bestStrategyShortTimeout != 15 || combinedRaceTimeout != 25 {
+		t.Fatalf("first round budgets: best=%d s race=%d s, want 15/25 s (2.3.9-fixed values, Alla 2026-11-24)", bestStrategyShortTimeout, combinedRaceTimeout)
 	}
 }
 
@@ -222,46 +222,25 @@ func TestPsiFailureDiagnosticsAndStatsAPI(t *testing.T) {
 // TestPsiEmergencyBootstrapDNSTXTAndECH verifies Priority 4:
 // Ed25519 signature verification, multi-chunk DNS TXT assembly, emergency
 // server entries import via DNS TXT, and ECH fallback via DNS TXT.
-func TestPsiEmergencyBootstrapDNSTXTAndECH(t *testing.T) {
-	a := testApp(t)
-	p := a.psi
-
+func TestPsiSignedECHFallbackAndChunkedTXT(t *testing.T) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
 	pubHex := hex.EncodeToString(pub)
 
-	validEntryRaw := `203.0.113.55 80 DE web {"ipAddress":"203.0.113.55","webServerPort":"80","webServerSecret":"sec999","webServerCertificate":"cert","sshPort":22,"sshPassword":"pw","sshHostKey":"hk","sshObfuscatedPort":443,"sshObfuscatedKey":"obkey","region":"DE","capabilities":["OSSH","TLS-OSSH"]}`
-	hexEntry := hex.EncodeToString([]byte(validEntryRaw))
-	sig := ed25519.Sign(priv, []byte(hexEntry))
-	signedPayload := "sig=" + hex.EncodeToString(sig) + ";data=" + hexEntry
-
-	// Split signed payload into 2 chunked DNS TXT records
-	mid := len(signedPayload) / 2
-	chunk0 := "v=psiroute1;seq=0;data=" + signedPayload[:mid]
-	chunk1 := "v=psiroute1;seq=1;data=" + signedPayload[mid:]
-
 	echRaw := buildSyntheticECHConfigList("cloudflare-ech.com", 0x55)
 	echB64 := base64.StdEncoding.EncodeToString(echRaw)
 	echSig := ed25519.Sign(priv, []byte(echB64))
 	signedECHTXT := "sig=" + hex.EncodeToString(echSig) + ";data=" + echB64
 
-	setDNSTXTLookupHook(func(ctx context.Context, domain string) ([]string, error) {
-		switch domain {
-		case psiBootstrapTXTDomains[0]:
-			return []string{chunk1, chunk0}, nil // out of order to test seq sorting
-		case "_ech.test-ech-fallback.example.com":
-			return []string{signedECHTXT}, nil
-		default:
-			return nil, errors.New("nxdomain")
-		}
-	})
-	defer setDNSTXTLookupHook(nil)
-
-	added := p.bootstrapEmergencyServerEntries(context.Background(), pubHex)
-	if added != 1 || p.importedServerEntriesCount() != 1 {
-		t.Fatalf("bootstrapEmergencyServerEntries added=%d count=%d, want 1", added, p.importedServerEntriesCount())
+	// Verify chunked TXT assembly preserves sequence order
+	mid := len(signedECHTXT) / 2
+	chunk0 := "v=psiroute1;seq=0;data=" + signedECHTXT[:mid]
+	chunk1 := "v=psiroute1;seq=1;data=" + signedECHTXT[mid:]
+	assembled := assembleChunkedTXTRecords([]string{chunk1, chunk0})
+	if assembled != signedECHTXT {
+		t.Fatalf("assembleChunkedTXTRecords mismatch: got %q", assembled)
 	}
 
 	// Verify ECH TXT fallback decoding and validation

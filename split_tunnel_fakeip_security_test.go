@@ -510,6 +510,7 @@ func TestConfigSchemaMigrationAndPauseTimerAndUpdater(t *testing.T) {
 		Version: "2.1.0",
 		URL:     "https://updates.example.com/psiroute-2.1.0.exe",
 		SHA256:  sumHex,
+		Release: currentRelease + 1, NotAfter: time.Now().Add(24 * time.Hour).Unix(),
 	}
 	manifest.Ed25519Sig = hex.EncodeToString(ed25519.Sign(priv, manifest.CanonicalPayload()))
 	if err := manifest.VerifyManifestSignature(pubHex); err != nil {

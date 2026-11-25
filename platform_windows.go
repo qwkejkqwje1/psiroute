@@ -258,6 +258,66 @@ func autostartEnabled() bool {
 	return err == nil
 }
 
+// exeDirUserWritable reports whether ordinary users (Users, Everyone,
+// Authenticated Users) have a write-type allow ACE on path. SIDs are used, not
+// names, so it works on every Windows language.
+func exeDirUserWritable(path string) (bool, error) {
+	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		return false, err
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		return false, err
+	}
+	if dacl == nil {
+		return true, nil // a NULL DACL gives everyone full access
+	}
+	var sids []*windows.SID
+	for _, str := range []string{"S-1-5-32-545", "S-1-1-0", "S-1-5-11"} {
+		if sid, serr := windows.StringToSid(str); serr == nil {
+			sids = append(sids, sid)
+		}
+	}
+	for i := uint32(0); i < uint32(dacl.AceCount); i++ {
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if gerr := windows.GetAce(dacl, i, &ace); gerr != nil || ace == nil {
+			continue
+		}
+		if ace.Header.AceType != 0 { // 0 = ACCESS_ALLOWED_ACE_TYPE
+			continue
+		}
+		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+		for _, u := range sids {
+			if sid.Equals(u) && aceMaskAllowsWrite(uint32(ace.Mask)) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// exeLocationUserWritable checks the folder of the exe and the exe itself.
+func exeLocationUserWritable(exe string) (bool, error) {
+	var firstErr error
+	for _, p := range []string{filepath.Dir(exe), exe} {
+		w, err := exeDirUserWritable(p)
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+		if w {
+			return true, nil
+		}
+	}
+	return false, firstErr
+}
+
+func deleteAutostartTask() {
+	delCmd := exec.Command("schtasks.exe", "/Delete", "/TN", schtasksAutostartName, "/F")
+	hideConsole(delCmd)
+	_ = delCmd.Run()
+}
+
 func setAutostart(on bool) error {
 	sysProxyMu.Lock()
 	mock := autostartMockFn
@@ -269,41 +329,74 @@ func setAutostart(on bool) error {
 		return nil
 	}
 	if !on {
-		delCmd := exec.Command("schtasks.exe", "/Delete", "/TN", schtasksAutostartName, "/F")
-		hideConsole(delCmd)
-		_ = delCmd.Run()
-	} else if isElevated() {
-		if exe, err := os.Executable(); err == nil {
-			tr := fmt.Sprintf(`"%s" --minimized`, exe)
-			createCmd := exec.Command("schtasks.exe", "/Create", "/TN", schtasksAutostartName, "/TR", tr, "/SC", "ONLOGON", "/RL", "HIGHEST", "/F")
-			hideConsole(createCmd)
-			if createCmd.Run() == nil {
-				logf("info", "Автозапуск зарегистрирован через Планировщик заданий Windows (RL HIGHEST, без окон UAC)")
-			}
+		deleteAutostartTask()
+		setAutostartWarning("")
+		return deleteRunValue()
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	writable, werr := exeLocationUserWritable(exe)
+	plan := planAutostart(isElevated(), writable, werr, autostartTaskExists())
+	if plan.RemoveTask {
+		deleteAutostartTask()
+	}
+	if plan.UseTask {
+		tr := fmt.Sprintf(`"%s" --minimized`, exe)
+		createCmd := exec.Command("schtasks.exe", "/Create", "/TN", schtasksAutostartName, "/TR", tr, "/SC", "ONLOGON", "/RL", "HIGHEST", "/F")
+		hideConsole(createCmd)
+		if cerr := createCmd.Run(); cerr == nil {
+			logf("info", "Автозапуск зарегистрирован через Планировщик заданий Windows (RL HIGHEST, без окон UAC; папка программы защищена от записи)")
+		} else {
+			// The task could not be created: fall back to the plain Run value.
+			logf("warn", "Задача автозапуска не создана (%v), использую обычный автозапуск без повышенных прав", cerr)
+			plan.UseRunKey, plan.RemoveRunKey = true, false
 		}
 	}
+	if plan.RemoveRunKey {
+		if derr := deleteRunValue(); derr != nil {
+			logf("warn", "Не удалось убрать запись автозапуска из реестра: %v", derr)
+		}
+	}
+	setAutostartWarning(plan.Warning)
+	if plan.Warning != "" {
+		logf("warn", "%s", plan.Warning)
+	}
+	if plan.UseRunKey {
+		return setRunValue(exe)
+	}
+	return nil
+}
+
+func deleteRunValue() error {
 	k, err := registry.OpenKey(registry.CURRENT_USER, runKey, registry.SET_VALUE)
 	if err != nil {
 		return err
 	}
 	defer k.Close()
-	if on {
-		exe, err := os.Executable()
-		if err != nil {
-			return err
-		}
-		return k.SetStringValue("Psiroute", "\""+exe+"\" --minimized")
-	}
 	if err := k.DeleteValue("Psiroute"); err != nil && err != registry.ErrNotExist {
 		return err
 	}
 	return nil
 }
 
+func setRunValue(exe string) error {
+	k, err := registry.OpenKey(registry.CURRENT_USER, runKey, registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	defer k.Close()
+	return k.SetStringValue("Psiroute", "\""+exe+"\" --minimized")
+}
+
 func installBackgroundService() error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
+	}
+	if writable, werr := exeLocationUserWritable(exe); writable || werr != nil {
+		return fmt.Errorf("%s", autostartWarnWritable)
 	}
 	tr := fmt.Sprintf(`"%s" --minimized`, exe)
 	cmd := exec.Command("schtasks.exe", "/Create", "/TN", schtasksAutostartName, "/TR", tr, "/SC", "ONLOGON", "/RL", "HIGHEST", "/F")
@@ -446,4 +539,50 @@ func listRunningProcesses() []runningProc {
 		out = append(out, runningProc{Name: names[k], Count: c})
 	}
 	return out
+}
+
+// clearDeadLoopbackProxy checks if Windows System Proxy is still pointing to a
+// closed localhost port left behind by another VPN (e.g. Clash 127.0.0.1:7890,
+// v2rayN 127.0.0.1:10808). If unreachable, disables ProxyEnable so TUN traffic
+// is not blackholed by a dead local proxy.
+func clearDeadLoopbackProxy(ourAddrs ...string) string {
+	if isRunningTests() {
+		return ""
+	}
+	k, err := registry.OpenKey(registry.CURRENT_USER, inetKey, registry.QUERY_VALUE|registry.SET_VALUE)
+	if err != nil {
+		return ""
+	}
+	defer k.Close()
+	en, _, _ := k.GetIntegerValue("ProxyEnable")
+	srv, _, _ := k.GetStringValue("ProxyServer")
+	if en != 1 || srv == "" || isOurProxy(srv, ourAddrs...) {
+		return ""
+	}
+	// Extract host:port (supports "127.0.0.1:7890" or "http=127.0.0.1:7890;https=...")
+	target := strings.TrimSpace(srv)
+	if i := strings.IndexByte(target, ';'); i >= 0 {
+		target = target[:i]
+	}
+	if i := strings.IndexByte(target, '='); i >= 0 {
+		target = target[i+1:]
+	}
+	target = strings.TrimPrefix(strings.TrimPrefix(target, "http://"), "https://")
+	host, port, err := net.SplitHostPort(target)
+	if err != nil || port == "" {
+		return ""
+	}
+	h := strings.ToLower(strings.Trim(host, "[]"))
+	if h != "127.0.0.1" && h != "localhost" && h != "::1" {
+		return ""
+	}
+	c, derr := net.DialTimeout("tcp", net.JoinHostPort(host, port), 150*time.Millisecond)
+	if derr == nil {
+		_ = c.Close()
+		return "" // Another local proxy is actively listening; do not touch it.
+	}
+	_ = k.SetDWordValue("ProxyEnable", 0)
+	procInternetSetOption.Call(0, 39, 0, 0)
+	procInternetSetOption.Call(0, 37, 0, 0)
+	return srv
 }

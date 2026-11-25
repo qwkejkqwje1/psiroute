@@ -56,7 +56,7 @@ func (ui *gioUI) layoutHomeTab(gtx layout.Context) layout.Dimensions {
 		ui.mu.Unlock()
 		if curInput != "" {
 			target := curInput
-			go func(raw string, ts time.Time) {
+			func(raw string, ts time.Time) { safeGo("gioUI.layoutHomeTab", func() {
 				time.Sleep(250 * time.Millisecond)
 				ui.mu.Lock()
 				stillCurrent := ui.lastHomeQuery == raw && ui.lastHomeCheckAt.Equal(ts)
@@ -88,7 +88,7 @@ func (ui *gioUI) layoutHomeTab(gtx layout.Context) layout.Dimensions {
 						ui.w.Invalidate()
 					}
 				}
-			}(target, stamp)
+			}) }(target, stamp)
 		}
 	}
 
@@ -119,6 +119,16 @@ func (ui *gioUI) layoutHomeTab(gtx layout.Context) layout.Dimensions {
 	}
 	ping, _ := psi["health_ms"].(float64)
 	proto, _ := psi["protocol"].(string)
+	connSince, _ := psi["connected_since"].(float64)
+	attemptN, _ := psi["attempt"].(float64)
+	diagReason, _ := psi["diag_reason"].(string)
+	diagAdvice, _ := psi["diag_advice"].(string)
+	lastErr, _ := psi["last_error"].(string)
+	ksMode, _ := st["kill_switch_mode"].(string)
+	obfsMap, _ := st["obfs"].(map[string]any)
+	dpiMode, _ := obfsMap["mode"].(string)
+	ccMap, _ := st["clean_chain"].(map[string]any)
+	ccOn, _ := ccMap["enabled"].(bool)
 
 	captureTitle := "Ручной прокси"
 	captureBadge := "127.0.0.1:1080"
@@ -201,6 +211,26 @@ func (ui *gioUI) layoutHomeTab(gtx layout.Context) layout.Dimensions {
 												}
 												return ui.miniTag(gtx, ui.pal.dim, "v"+version)
 											},
+											func(gtx layout.Context) layout.Dimensions {
+												if state == "connected" && connSince > 0 {
+													return ui.miniTag(gtx, ui.pal.ok, fmtDur(float64(time.Now().Unix())-connSince))
+												}
+												return layout.Dimensions{}
+											},
+											func(gtx layout.Context) layout.Dimensions {
+												if ksMode == "strict" {
+													return ui.miniTag(gtx, ui.pal.err, "KS: Строгий")
+												} else if ksMode == "auto" {
+													return ui.miniTag(gtx, ui.pal.warn, "KS: Авто")
+												}
+												return layout.Dimensions{}
+											},
+											func(gtx layout.Context) layout.Dimensions {
+												if dpiMode != "" && dpiMode != "off" {
+													return ui.miniTag(gtx, ui.pal.teal, "DPI: "+dpiMode)
+												}
+												return layout.Dimensions{}
+											},
 										)
 									}),
 								)
@@ -244,7 +274,11 @@ func (ui *gioUI) layoutHomeTab(gtx layout.Context) layout.Dimensions {
 						wCol = ui.pal.warn
 						wBadge = "Активен"
 					}
-					return ui.pipelineRow(gtx, &ui.pipeWarpBtn, "bolt", "", "Подложка Cloudflare WARP", wBadge, wCol, warp)
+					if ccOn {
+						wCol = ui.pal.clean
+						wBadge = "Clean-IP"
+					}
+					return ui.pipelineRow(gtx, &ui.pipeWarpBtn, "bolt", "", "Подложка Cloudflare WARP", wBadge, wCol, warp || ccOn || ui.pipePopup == 3)
 				}),
 				gap(5),
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
@@ -269,6 +303,58 @@ func (ui *gioUI) layoutHomeTab(gtx layout.Context) layout.Dimensions {
 				children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 					return ui.subCard(gtx, ui.pal.card2, tint(ui.pal.vio, 140), unit.Dp(8), func(gtx layout.Context) layout.Dimensions {
 						return ui.compactCountryRow(gtx, configured)
+					})
+				}), gap(6))
+			}
+
+			if ui.pipePopup == 3 {
+				children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return ui.subCard(gtx, ui.pal.card2, tint(ui.pal.warn, 140), unit.Dp(8), func(gtx layout.Context) layout.Dimensions {
+						return flowWrap(gtx, unit.Dp(6), unit.Dp(6),
+							button(&ui.warpBtn, "WARP: "+onOffRu(warp), warp, "warn"),
+							button(&ui.cleanChainToggleBtn, "Clean-IP: "+onOffRu(ccOn), ccOn, "ok"),
+							button(&ui.verifyCleanBtn, "Проверить связку", false, "teal"),
+						)
+					})
+				}), gap(6))
+			}
+
+			if (state == "error" || ((state == "connecting" || state == "reconnecting") && attemptN > 2)) && (diagAdvice != "" || lastErr != "") {
+				btnPat := ui.appBtn("home|psi-patient")
+				btnUseW := ui.appBtn("home|psi-usewarp")
+				btnImp := ui.appBtn("home|psi-import")
+				if btnPat.Clicked(gtx) {
+					ui.doAsync("Включён терпеливый режим Psiphon…", func() (map[string]any, error) {
+						return ui.apiCall("POST", "/api/psiphon/action", map[string]any{"action": "retry_patient"})
+					})
+				}
+				if btnUseW.Clicked(gtx) {
+					ui.doAsync("Переключаюсь на подключение через WARP…", func() (map[string]any, error) {
+						return ui.apiCall("POST", "/api/psiphon/action", map[string]any{"action": "use_warp"})
+					})
+				}
+				if btnImp.Clicked(gtx) {
+					ui.tab = 4
+					ui.subTabs[4] = 2
+				}
+				children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return ui.subCard(gtx, mix(ui.pal.card2, ui.pal.warn, 0.08), tint(ui.pal.warn, 150), unit.Dp(8), func(gtx layout.Context) layout.Dimensions {
+						return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								return ui.labelLine(gtx, fontSmall, ui.pal.warn, font.Bold, orDefault(diagReason, "Задержка подключения"))
+							}),
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								return ui.label(gtx, fontMicro, ui.pal.mut, font.Normal, orDefault(diagAdvice, lastErr))
+							}),
+							layout.Rigid(layout.Spacer{Height: unit.Dp(5)}.Layout),
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								return flowWrap(gtx, unit.Dp(5), unit.Dp(5),
+									button(btnPat, "Терпеливый режим", false, "warn"),
+									button(btnUseW, "Через WARP", false, "teal"),
+									button(btnImp, "Импорт серверов", false, ""),
+								)
+							}),
+						)
 					})
 				}), gap(6))
 			}
@@ -314,8 +400,10 @@ func (ui *gioUI) layoutHomeTab(gtx layout.Context) layout.Dimensions {
 						layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout),
 						layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 							return flowWrap(gtx, unit.Dp(5), unit.Dp(5),
-								button(&ui.pause5Btn, "5 мин", false, ""),
-								button(&ui.pause15Btn, "15 мин", false, ""),
+								button(&ui.pause5Btn, "5м", false, ""),
+								button(&ui.pause15Btn, "15м", false, ""),
+								button(&ui.pause30Btn, "30м", false, ""),
+								button(&ui.pause60Btn, "60м", false, ""),
 							)
 						}),
 					)
@@ -373,6 +461,7 @@ func (ui *gioUI) layoutHomeTab(gtx layout.Context) layout.Dimensions {
 						{obDesync, "DPI", "teal"},
 						{obWarp, "WARP", "warn"},
 						{obPsiphon, "VPN", "vio"},
+						{obCleanIP, "Clean-IP", "teal"},
 						{obBlock, "Блок", "danger"},
 					}
 					return ui.subCard(gtx, ui.pal.card2, ui.pal.border, unit.Dp(3), func(gtx layout.Context) layout.Dimensions {
@@ -583,13 +672,13 @@ func (ui *gioUI) drawPowerButton(gtx layout.Context, state string, needAdm bool)
 	return ui.drawPowerButtonWithFlag(gtx, state, needAdm, "")
 }
 
-// drawPowerButtonWithFlag рисует главную кнопку Пуска (104×104 dp):
+// drawPowerButtonWithFlag рисует главную кнопку Пуска (124×124 dp):
 //   - При подключении: светящееся изумрудное кольцо + флаг страны + код региона;
 //     при наведении кольцо мягко смещается к коралловому цвету, показывая, что клик отключит VPN.
 //   - При отключении (stopping): коралловый индикатор.
 //   - В остановленном состоянии: минималистичная иконка питания с подсветкой при наведении.
 func (ui *gioUI) drawPowerButtonWithFlag(gtx layout.Context, state string, needAdm bool, cc string) layout.Dimensions {
-	sz := gtx.Dp(104)
+	sz := gtx.Dp(124)
 	col := ui.powerStateColor(state, needAdm)
 	hov := ui.powerBtn.Hovered()
 	ringCol := col
@@ -607,13 +696,15 @@ func (ui *gioUI) drawPowerButtonWithFlag(gtx layout.Context, state string, needA
 		if hov {
 			haloA = 72
 		}
-		paint.FillShape(gtx.Ops, tint(ringCol, haloA), clip.Ellipse{Max: image.Pt(sz, sz)}.Op(gtx.Ops))
+		paint.FillShape(gtx.Ops, tint(ringCol, haloA/2), clip.Ellipse{Max: image.Pt(sz, sz)}.Op(gtx.Ops))
+		haloPad := gtx.Dp(5)
+		paint.FillShape(gtx.Ops, tint(ringCol, haloA), clip.Ellipse{Min: image.Pt(haloPad, haloPad), Max: image.Pt(sz-haloPad, sz-haloPad)}.Op(gtx.Ops))
 
-		midPad := gtx.Dp(6)
+		midPad := gtx.Dp(9)
 		mid := clip.Ellipse{Min: image.Pt(midPad, midPad), Max: image.Pt(sz-midPad, sz-midPad)}
 		paint.FillShape(gtx.Ops, tint(ringCol, 85), clip.Stroke{Path: mid.Path(gtx.Ops), Width: float32(gtx.Dp(1.5))}.Op())
 
-		pad := gtx.Dp(12)
+		pad := gtx.Dp(16)
 		inner := clip.Ellipse{Min: image.Pt(pad, pad), Max: image.Pt(sz-pad, sz-pad)}
 		bg, fg := ui.pal.card, ringCol
 		if state == "connected" {
@@ -652,13 +743,13 @@ func (ui *gioUI) drawPowerButtonWithFlag(gtx layout.Context, state string, needA
 		}
 
 		// Иконка питания + микроподпись действия при наведении на активное соединение
-		is := gtx.Dp(30)
+		is := gtx.Dp(34)
 		offY := (sz - is) / 2
 		if state == "connected" && hov {
 			offY -= gtx.Dp(7)
 		}
 		t := op.Offset(image.Pt((sz-is)/2, offY)).Push(gtx.Ops)
-		drawIcon(gtx, "power", unit.Dp(30), fg)
+		drawIcon(gtx, "power", unit.Dp(34), fg)
 		t.Pop()
 
 		if state == "connected" && hov {
@@ -899,7 +990,7 @@ func (ui *gioUI) drawLiveAppsStrip(gtx layout.Context, st map[string]any, apps [
 	openStreamsBtn := ui.appBtn("home|open-streams")
 	if openStreamsBtn.Clicked(gtx) {
 		ui.tab = 2
-		go ui.fetchAll(true)
+		safeGo("gioUI.drawLiveAppsStrip", func() { ui.fetchAll(true) })
 	}
 
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,

@@ -134,11 +134,11 @@ func probeOne(dir, region string, s probeStrategy) probeResult {
 	ctx, cancel := context.WithTimeout(context.Background(), psiProbeTimeout+5*time.Second)
 	defer cancel()
 	runDone := make(chan struct{})
-	go func() { ctl.Run(ctx); close(runDone) }()
+	safeGo("probeOne", func() { ctl.Run(ctx); close(runDone) })
 	defer func() { cancel(); <-runDone }()
 
 	t0 := time.Now()
-	go func() {
+	safeGo("probeOne#2", func() {
 		for ctx.Err() == nil {
 			if c, derr := ctl.Dial("www.gstatic.com:80", nil); derr == nil {
 				c.Close()
@@ -150,7 +150,7 @@ func probeOne(dir, region string, s probeStrategy) probeResult {
 			}
 			time.Sleep(500 * time.Millisecond)
 		}
-	}()
+	})
 
 	select {
 	case <-time.After(psiProbeTimeout):
@@ -173,7 +173,7 @@ func probeOne(dir, region string, s probeStrategy) probeResult {
 	tcancel()
 
 	t1 := time.Now()
-	cl := &http.Client{Transport: rt}
+	cl := &http.Client{Timeout: 20 * time.Second, Transport: rt} // A-12
 	if req, e := http.NewRequest("GET", speedURL, nil); e == nil {
 		if resp, e2 := cl.Do(req); e2 == nil {
 			buf := make([]byte, 64<<10)

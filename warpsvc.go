@@ -123,7 +123,7 @@ func (w *Warp) Addr() string {
 			return ""
 		}
 		w.ln = ln
-		go w.serve(ln)
+		safeLoop(context.Background(), "WARP-сервис", func() { w.serve(ln) })
 	}
 	return w.ln.Addr().String()
 }
@@ -204,7 +204,7 @@ func (w *Warp) serve(ln net.Listener) {
 		if err != nil {
 			return
 		}
-		go w.handle(c)
+		safeGo("Warp.serve", func() { w.handle(c) })
 	}
 }
 
@@ -234,13 +234,13 @@ func (w *Warp) handle(c net.Conn) {
 	}
 	_ = c.SetDeadline(time.Time{})
 	done := make(chan struct{})
-	go func() {
+	safeGo("Warp.handle", func() {
 		_, _ = io.Copy(up, br)
 		if cw, ok := up.(interface{ CloseWrite() error }); ok {
 			_ = cw.CloseWrite()
 		}
 		close(done)
-	}()
+	})
 	_, _ = io.Copy(c, up)
 	_ = c.Close()
 	<-done
@@ -315,7 +315,7 @@ func (w *Warp) connectMask(ctx context.Context, id *warpIdentity, m warpMask, ca
 		bctx, cancel := context.WithTimeout(ctx, 6*time.Second)
 		ch := make(chan *warpTunnel, len(batch))
 		for _, ep := range batch {
-			go func() {
+			safeGo("Warp.connectMask", func() {
 				t, err := openWarpTunnel(id, ep, m)
 				if err == nil && t.probe(bctx) != nil {
 					t.Close()
@@ -325,7 +325,7 @@ func (w *Warp) connectMask(ctx context.Context, id *warpIdentity, m warpMask, ca
 					t = nil
 				}
 				ch <- t
-			}()
+			})
 		}
 		var win *warpTunnel
 		others := 0

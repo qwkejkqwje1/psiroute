@@ -418,14 +418,14 @@ func (ui *gioUI) layoutListsCatalogCard(gtx layout.Context) layout.Dimensions {
 				ui.listTitleEditor.SetText(listTitle)
 				if isLoc {
 					ui.listSourceMode = 0
-					go func() {
+					safeGo("gioUI.layoutListsCatalogCard", func() {
 						res, err := ui.apiCall("GET", "/api/lists/"+url.PathEscape(listID)+"/content", nil)
 						if err == nil && res != nil {
 							if txt, ok := res["content"].(string); ok {
 								ui.queueEditorText(&ui.listContentEditor, txt)
 							}
 						}
-					}()
+					})
 				} else {
 					ui.listSourceMode = 1
 					ui.listURLEditor.SetText(listURL)
@@ -440,7 +440,7 @@ func (ui *gioUI) layoutListsCatalogCard(gtx layout.Context) layout.Dimensions {
 			if delBtn.Clicked(gtx) {
 				listID := id
 				listTitle := title
-				go func() {
+				safeGo("gioUI.layoutListsCatalogCard#2", func() {
 					res, err := ui.apiCall("DELETE", "/api/lists/"+url.PathEscape(listID), map[string]any{})
 					if res != nil && res["in_use"] == true {
 						var used []string
@@ -467,7 +467,7 @@ func (ui *gioUI) layoutListsCatalogCard(gtx layout.Context) layout.Dimensions {
 					}
 					ui.setToast("Список «"+listTitle+"» удалён", false)
 					ui.fetchAll(true)
-				}()
+				})
 			}
 
 			metaLine := fmt.Sprintf("%s · доменов: %.0f · подсетей: %.0f", orDefault(cat, "Список"), doms, cidrs)

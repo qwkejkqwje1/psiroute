@@ -223,6 +223,8 @@ func outboundShortTitle(ob string) string {
 		return "DPI"
 	case ob == obWarp:
 		return "WARP"
+	case ob == obCleanIP:
+		return "Clean-IP"
 	case ob == obBlock:
 		return "Block"
 	case ob == obPsiphon:
@@ -868,6 +870,8 @@ func (r *Router) isVPNUp(ob string) bool {
 		return r.a.psi != nil && (r.a.psi.running() || r.a.psi.cur.Load() != nil)
 	case ob == obWarp:
 		return r.a.warp != nil && (r.a.warp.connected() || !r.a.warp.builtin())
+	case ob == obCleanIP:
+		return r.a.cleanChain != nil && (r.a.cleanChain.Healthy() || (r.a.psi != nil && (r.a.psi.running() || r.a.psi.cur.Load() != nil)))
 	case ob == obProxy:
 		r.a.cfg.mu.Lock()
 		ok := r.a.cfg.Proxy.Enabled && r.a.cfg.Proxy.Upstream != ""
@@ -1088,7 +1092,7 @@ func (r *Router) planForProtoWithStage(proto, host, dstIP string, port int, app 
 				if o == obBlock {
 					return []string{obBlock}, matchedName
 				}
-				if (o == obPsiphon || isCountryOb(o) || o == obWarp || o == obProxy) && r.isVPNUp(o) {
+				if (o == obPsiphon || isCountryOb(o) || o == obWarp || o == obCleanIP || o == obProxy) && r.isVPNUp(o) {
 					vpnOut = append(vpnOut, o)
 				}
 			}
@@ -1368,17 +1372,19 @@ func (r *Router) dialer(outbound string) dialFunc {
 			on, engine, socks := r.a.cfg.Warp.Enabled, r.a.cfg.Warp.Engine, r.a.cfg.Warp.Socks
 			r.a.cfg.mu.Unlock()
 			if !on {
-				if r.a != nil && !r.a.IsPaused() && r.a.warp != nil && engine != "socks" {
-					r.a.cfg.setKey("warp.enabled", true)
-					r.a.warp.Want()
-					return r.a.warp.Dial(ctx, network, addr)
-				}
 				return nil, errors.New("WARP выключен в настройках")
 			}
 			if engine != "socks" {
 				return r.a.warp.Dial(ctx, network, addr)
 			}
 			return dialSocks5(ctx, strings.TrimPrefix(socks, "socks5://"), addr, "", "")
+		}
+	case obCleanIP:
+		return func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if r.a != nil && r.a.cleanChain != nil {
+				return r.a.cleanChain.DialContext(ctx, network, addr)
+			}
+			return nil, errors.New("каскад Clean-IP не инициализирован")
 		}
 	case obProxy:
 		return func(ctx context.Context, network, addr string) (net.Conn, error) {

@@ -331,6 +331,9 @@ func dpiServer(t *testing.T) {
 }
 
 func TestDPIResetThenLearnDesync(t *testing.T) {
+	obfs.reset()
+	theDNS.clearLookupCache()
+	theRevDNS.clear()
 	dpiServer(t)
 	hello := clientHello(t, "blocked.test")
 	_, proxy := proxyApp(t, nil, func(c *Config) {

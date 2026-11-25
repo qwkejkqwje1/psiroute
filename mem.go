@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -32,7 +33,7 @@ func setupMemory() {
 		}
 		debug.SetMemoryLimit(limit)
 	}
-	go memTrimmer()
+	safeLoop(context.Background(), "освобождение памяти", func() { memTrimmer() })
 }
 
 // ReleaseGUIMemory forces a GC cycle and returns unused heap pages to the OS

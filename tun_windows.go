@@ -74,10 +74,10 @@ func openTunDevice(a *App, mtu int, v6 bool) (tunDevice, error) {
 		_ = dev.Close()
 		return nil, err
 	}
-	go func() {
+	safeGo("openTunDevice", func() {
 		for range dev.Events() {
 		}
-	}()
+	})
 	return dev, nil
 }
 
@@ -113,25 +113,30 @@ func setTunAdapterMTU(dev tunDevice, mtu int, v6 bool) error {
 // setupAdapter: addresses, DNS, and two /1 routes per family - they win over
 // the default route without touching it, and vanish with the adapter.
 func setupAdapter(luid winipcfg.LUID, mtu int, v6 bool) error {
-	addrs := []netip.Prefix{netip.PrefixFrom(tunAddr4, 30)}
-	if v6 {
-		addrs = append(addrs, netip.PrefixFrom(tunAddr6, 126))
-	}
+	// Always assign IPv6 address and capture ::/1 + 8000::/1 on the Wintun adapter:
+	// when v6 == false, tun.go drops all IPv6 packets (blackhole), preventing native
+	// ISP IPv6 leaks bypassing the IPv4 tunnel.
+	addrs := []netip.Prefix{netip.PrefixFrom(tunAddr4, 30), netip.PrefixFrom(tunAddr6, 126)}
 	if err := luid.SetIPAddresses(addrs); err != nil {
-		return fmt.Errorf("адрес адаптера TUN: %w", err)
-	}
-	routes := []string{"0.0.0.0/1", "128.0.0.0/1"}
-	if v6 {
-		routes = append(routes, "::/1", "8000::/1")
-	}
-	for _, r := range routes {
-		p := netip.MustParsePrefix(r)
-		hop := netip.IPv4Unspecified()
-		if p.Addr().Is6() {
-			hop = netip.IPv6Unspecified()
+		if v6 {
+			return fmt.Errorf("адрес адаптера TUN: %w", err)
 		}
-		if err := luid.AddRoute(p, hop, 0); err != nil {
+		// Host IPv6 stack may be disabled globally; fall back to IPv4-only address.
+		if err4 := luid.SetIPAddresses([]netip.Prefix{netip.PrefixFrom(tunAddr4, 30)}); err4 != nil {
+			return fmt.Errorf("адрес адаптера TUN: %w", err4)
+		}
+	}
+	for _, r := range []string{"0.0.0.0/1", "128.0.0.0/1"} {
+		if err := luid.AddRoute(netip.MustParsePrefix(r), netip.IPv4Unspecified(), 0); err != nil {
 			return fmt.Errorf("маршрут %s: %w", r, err)
+		}
+	}
+	for _, r := range []string{"::/1", "8000::/1"} {
+		if err := luid.AddRoute(netip.MustParsePrefix(r), netip.IPv6Unspecified(), 0); err != nil {
+			if v6 {
+				return fmt.Errorf("маршрут %s: %w", r, err)
+			}
+			logf("debug", "TUN: IPv6 blackhole %s пропущен: %v", r, err)
 		}
 	}
 	flushWindowsDNSCache()
@@ -283,29 +288,42 @@ func tunBestDefault(family winipcfg.AddressFamily) (uint32, string) {
 	if err != nil {
 		return 0, ""
 	}
-	best, bestMetric, name := uint32(0), uint32(math.MaxUint32), ""
-	for i := range rows {
-		r := &rows[i]
-		if r.DestinationPrefix.PrefixLength != 0 {
-			continue
+	// Pass 1: strictly prefer real physical NICs (skip virtual/VPN/TUN/TAP adapters left by other VPNs).
+	// Pass 2: fallback to any non-Psiroute default route if no physical adapter matched.
+	for pass := 0; pass < 2; pass++ {
+		best, bestMetric, name := uint32(0), uint32(math.MaxUint32), ""
+		for i := range rows {
+			r := &rows[i]
+			if r.DestinationPrefix.PrefixLength != 0 {
+				continue
+			}
+			ifr, err := r.InterfaceLUID.Interface()
+			if err != nil || ifr.OperStatus != winipcfg.IfOperStatusUp {
+				continue
+			}
+			alias := ifr.Alias()
+			desc := ifr.Description()
+			if strings.EqualFold(alias, "Psiroute") {
+				continue
+			}
+			if pass == 0 {
+				if ifr.Type == winipcfg.IfTypeTunnel || ifr.Type == winipcfg.IfTypeSoftwareLoopback || ifr.Type == winipcfg.IfTypePropVirtual || isVirtualVPNAdapterName(alias, desc) {
+					continue
+				}
+			}
+			m := r.Metric
+			if ipi, err := r.InterfaceLUID.IPInterface(family); err == nil {
+				m += ipi.Metric
+			}
+			if m < bestMetric {
+				best, bestMetric, name = r.InterfaceIndex, m, alias
+			}
 		}
-		ifr, err := r.InterfaceLUID.Interface()
-		if err != nil || ifr.OperStatus != winipcfg.IfOperStatusUp {
-			continue
-		}
-		alias := ifr.Alias()
-		if strings.EqualFold(alias, "Psiroute") {
-			continue
-		}
-		m := r.Metric
-		if ipi, err := r.InterfaceLUID.IPInterface(family); err == nil {
-			m += ipi.Metric
-		}
-		if m < bestMetric {
-			best, bestMetric, name = r.InterfaceIndex, m, alias
+		if best != 0 {
+			return best, name
 		}
 	}
-	return best, name
+	return 0, ""
 }
 
 func tunHtonl(v uint32) uint32 { return v>>24 | v>>8&0xff00 | v<<8&0xff0000 | v<<24 }

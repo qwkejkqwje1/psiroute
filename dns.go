@@ -217,7 +217,7 @@ func directWireExchange(ctx context.Context, q []byte) ([]byte, error) {
 	}
 
 	for _, srv := range directDNSServers {
-		go queryUDP(srv)
+		safeGo("directWireExchange", func() { queryUDP(srv) })
 	}
 
 	var lastErr error
@@ -295,7 +295,7 @@ func dohLookup(ctx context.Context, host string) ([]string, error) {
 	ch := make(chan res, len(dohJSONEndpoints))
 	for _, base := range dohJSONEndpoints {
 		base := base
-		go func() {
+		safeGo("dohLookup", func() {
 			u := base + "?name=" + url.QueryEscape(host) + "&type=A"
 			req, err := http.NewRequestWithContext(qctx, "GET", u, nil)
 			if err != nil {
@@ -336,7 +336,7 @@ func dohLookup(ctx context.Context, host string) ([]string, error) {
 				return
 			}
 			ch <- res{nil, errors.New("DoH: нет адресов")}
-		}()
+		})
 	}
 
 	var lastErr error
@@ -652,15 +652,15 @@ func resolve(ctx context.Context, host string, useDoH bool) ([]string, error) {
 		totalWorkers = 2
 	}
 	ch := make(chan lookupRes, totalWorkers)
-	go func() {
+	safeGo("resolve", func() {
 		resIPs, lerr := directWireLookup(rctx, cleanH)
 		ch <- lookupRes{resIPs, lerr}
-	}()
+	})
 	if useDoH {
-		go func() {
+		safeGo("resolve#2", func() {
 			resIPs, derr := dohLookup(rctx, cleanH)
 			ch <- lookupRes{resIPs, derr}
-		}()
+		})
 	}
 
 	var ips []string

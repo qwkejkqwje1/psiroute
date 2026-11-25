@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -27,11 +28,40 @@ type UpdateManifest struct {
 	SHA256     string `json:"sha256"`
 	Ed25519Sig string `json:"ed25519_sig"`
 	Notes      string `json:"notes,omitempty"`
+	// Release is a monotonically growing release number; NotAfter is the Unix time
+	// after which the manifest is no longer accepted. Both are signed (audit A-07),
+	// so an old signed manifest cannot be replayed to roll the client back.
+	Release  int64 `json:"release"`
+	NotAfter int64 `json:"not_after"`
 }
 
-// CanonicalPayload формирует строку "version|sha256|url", подписываемую ключом Ed25519 разработчика.
+// currentRelease is the release number of this build. It grows with every
+// version; a manifest is accepted only if its release is greater.
+const currentRelease int64 = 20400 // major*10000 + minor*100 + patch: 2.4.0 -> 20400
+
+// updaterNow is the clock of the manifest check (replaced in tests).
+var updaterNow = time.Now
+
+// CanonicalPayload — подписываемая строка формата v2:
+// "v2|release|version|sha256|url|not_after". Формат v1 ("version|sha256|url") не принимается.
 func (m *UpdateManifest) CanonicalPayload() []byte {
-	return []byte(strings.TrimSpace(m.Version) + "|" + strings.ToLower(strings.TrimSpace(m.SHA256)) + "|" + strings.TrimSpace(m.URL))
+	return []byte("v2|" + strconv.FormatInt(m.Release, 10) + "|" + strings.TrimSpace(m.Version) + "|" +
+		strings.ToLower(strings.TrimSpace(m.SHA256)) + "|" + strings.TrimSpace(m.URL) + "|" +
+		strconv.FormatInt(m.NotAfter, 10))
+}
+
+// checkFreshness rejects a manifest that is not newer than this build or has expired.
+func (m *UpdateManifest) checkFreshness(now time.Time) error {
+	if m.Release <= 0 || m.NotAfter <= 0 {
+		return errors.New("манифест обновления старого формата (v1) отвергнут: нет номера выпуска и срока действия")
+	}
+	if m.Release <= currentRelease {
+		return fmt.Errorf("манифест отвергнут: номер выпуска %d не новее установленного (%d) — защита от отката", m.Release, currentRelease)
+	}
+	if now.Unix() > m.NotAfter {
+		return errors.New("манифест обновления просрочен (not_after в прошлом)")
+	}
+	return nil
 }
 
 // VerifyManifestSignature проверяет криптографическую подпись Ed25519 манифеста обновления.
@@ -43,7 +73,7 @@ func (m *UpdateManifest) VerifyManifestSignature(pubKeyHex string) error {
 		return errors.New("манифест обновления содержит неполные поля")
 	}
 	if pubKeyHex == "" {
-		pubKeyHex = defaultBootstrapEd25519PubHex
+		pubKeyHex = defaultBootstrapEd25519PubHex // пусто = проверка отказывает (безопасно)
 	}
 	pubBytes, err := hex.DecodeString(strings.TrimSpace(pubKeyHex))
 	if err != nil || len(pubBytes) != ed25519.PublicKeySize {
@@ -56,7 +86,8 @@ func (m *UpdateManifest) VerifyManifestSignature(pubKeyHex string) error {
 	if !ed25519.Verify(ed25519.PublicKey(pubBytes), m.CanonicalPayload(), sigBytes) {
 		return errors.New("подпись Ed25519 манифеста обновления не прошла проверку")
 	}
-	return nil
+	// Свежесть проверяется после подписи: release и not_after подписаны.
+	return m.checkFreshness(updaterNow())
 }
 
 // VerifyUpdateBinary проверяет контрольную сумму SHA-256 и подпись Ed25519 скачанного .exe файла.

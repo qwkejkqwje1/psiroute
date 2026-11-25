@@ -93,7 +93,7 @@ func (a *App) maybeRunBackgroundAutoTune(failedMethod, nextMethod string) {
 	if desyncOn && curMethod != "" && curMethod != "auto" && curMethod == failedMethod && obfsByID(nextMethod) != nil {
 		a.cfg.Desync.Method = nextMethod
 		a.cfg.mu.Unlock()
-		_ = a.cfg.save()
+		_ = a.cfg.saveOrReport("App.maybeRunBackgroundAutoTune")
 	} else {
 		a.cfg.mu.Unlock()
 	}
@@ -138,7 +138,7 @@ func (a *App) maybeRunBackgroundAutoTune(failedMethod, nextMethod string) {
 			if a.cfg.Desync.Enabled && a.cfg.Desync.Method != "auto" {
 				a.cfg.Desync.Method = best
 				a.cfg.mu.Unlock()
-				_ = a.cfg.save()
+				_ = a.cfg.saveOrReport("App.maybeRunBackgroundAutoTune")
 			} else {
 				a.cfg.mu.Unlock()
 			}
@@ -408,7 +408,7 @@ func (a *App) dpiTestStart(sites []string) error {
 	a.cfg.mu.Lock()
 	a.cfg.Desync.TestSites = append([]string(nil), sites...)
 	a.cfg.mu.Unlock()
-	_ = a.cfg.save()
+	_ = a.cfg.saveOrReport("dpiTestStart") // t.running is already set: log only, do not abort the test
 	logf("info", "DPI: проверка %d сайтов × %d вариантов", len(sites), len(methods))
 
 	goSafe("dpitest", func() {

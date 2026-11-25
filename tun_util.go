@@ -228,6 +228,26 @@ func effectiveTunMSS(configuredMTU int, isIPv6, warpCascade, psiActive bool) uin
 	return uint16(mss)
 }
 
+func effectiveTunMTUWithClean(configuredMTU int, warpCascade, psiActive, cleanChain bool) int {
+	mtu := effectiveTunMTU(configuredMTU, warpCascade, psiActive)
+	if cleanChain && mtu > cleanExitWarpMTU {
+		mtu = cleanExitWarpMTU
+	}
+	return mtu
+}
+
+func effectiveTunMSSWithClean(configuredMTU int, isIPv6, warpCascade, psiActive, cleanChain bool) uint16 {
+	mss := effectiveTunMSS(configuredMTU, isIPv6, warpCascade, psiActive)
+	if cleanChain {
+		if !isIPv6 && mss > cleanChainMSS4 {
+			mss = cleanChainMSS4
+		} else if isIPv6 && mss > cleanChainMSS6 {
+			mss = cleanChainMSS6
+		}
+	}
+	return mss
+}
+
 func updateTCPChecksum16(csumBytes []byte, oldVal, newVal uint16) {
 	if len(csumBytes) < 2 || oldVal == newVal {
 		return
@@ -771,6 +791,9 @@ func (r *revMap) prune() {
 }
 
 func (r *revMap) put(ip net.IP, name string, ttl time.Duration) {
+	if ip == nil || ip.IsLoopback() {
+		return
+	}
 	a, ok := netip.AddrFromSlice(ip)
 	if !ok || name == "" {
 		return
@@ -851,4 +874,23 @@ func dnsServfail(q []byte) []byte {
 		r[i] = 0
 	}
 	return r
+}
+
+// isVirtualVPNAdapterName reports whether a network adapter alias or description
+// belongs to a virtual VPN/TUN/TAP/WireGuard interface (e.g., left behind by
+// Clash, Sing-box, Amnezia, WARP, v2rayN, OpenVPN, Tailscale, ZeroTier, etc.).
+func isVirtualVPNAdapterName(alias, desc string) bool {
+	s := strings.ToLower(alias + " " + desc)
+	for _, kw := range []string{
+		"psiroute", "wintun", "wireguard", "amnezia", "cloudflare", "warp",
+		"sing-tun", "sing-box", "clash", "mihomo", "v2ray", "xray", "nekoray",
+		"hiddify", "outline", "openvpn", "tap-windows", "tailscale", "zerotier",
+		"radmin", "hamachi", "nordlynx", "proton", "mullvad", "utun", "tun0",
+		"virtualbox", "vmware", "vethernet", "hyper-v", "loopback",
+	} {
+		if strings.Contains(s, kw) {
+			return true
+		}
+	}
+	return false
 }

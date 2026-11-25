@@ -623,7 +623,7 @@ func (l *Lists) Start(ctx context.Context) {
 	_ = os.MkdirAll(l.dir, 0o700)
 	l.discoverDiskLocalLists()
 	l.loadCached()
-	go func() {
+	safeGo("Lists.Start", func() {
 		t := time.NewTicker(time.Hour)
 		defer t.Stop()
 		l.updateAll(ctx)
@@ -637,7 +637,7 @@ func (l *Lists) Start(ctx context.Context) {
 				l.updateAll(ctx)
 			}
 		}
-	}()
+	})
 }
 
 // discoverDiskLocalLists registers any existing user-*.lst files in l.dir into
@@ -1178,7 +1178,9 @@ func (l *Lists) SaveLocalList(name, content string) (map[string]any, error) {
 		}
 		syncListRegistryLocked(c)
 		c.mu.Unlock()
-		_ = c.save()
+		if serr := c.saveOrReport("SaveLocalList"); serr != nil {
+			return nil, saveFailed(serr)
+		}
 		l.app.onRulesChanged()
 	}
 
@@ -1324,7 +1326,9 @@ func (l *Lists) UpsertCustomList(ctx context.Context, id, title, typ, rawURL, co
 	}
 	syncListRegistryLocked(c)
 	c.mu.Unlock()
-	_ = c.save()
+	if serr := c.saveOrReport("UpsertCustomList"); serr != nil {
+		return nil, saveFailed(serr)
+	}
 	l.app.onRulesChanged()
 
 	if typ == "url" && en {
@@ -1481,7 +1485,9 @@ func (l *Lists) DeleteList(id string, removeFromRules bool) (map[string]any, int
 	}
 	syncListRegistryLocked(c)
 	c.mu.Unlock()
-	_ = c.save()
+	if serr := c.saveOrReport("DeleteList"); serr != nil {
+		return nil, http.StatusInternalServerError, saveFailed(serr)
+	}
 	l.app.onRulesChanged()
 
 	if removedURL != "" {
@@ -1512,7 +1518,7 @@ func (l *Lists) RestoreBuiltinLists() map[string]any {
 	c.Lists.Hidden = nil
 	syncListRegistryLocked(c)
 	c.mu.Unlock()
-	_ = c.save()
+	_ = c.saveOrReport("Lists.RestoreBuiltinLists")
 	l.app.onRulesChanged()
 	return map[string]any{"ok": true, "restored": restored}
 }

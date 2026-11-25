@@ -126,7 +126,7 @@ func (a *App) openBrowser(id string) error {
 		if err := cmd.Start(); err != nil {
 			return fmt.Errorf("не удалось запустить %s: %w", k.name, err)
 		}
-		go func() { _ = cmd.Wait() }()
+		safeGo("App.openBrowser", func() { _ = cmd.Wait() })
 		logf("info", "Открыт %s через прокси %s (отдельный профиль)", k.name, hp)
 		return nil
 	}

@@ -356,19 +356,175 @@ func (ui *gioUI) layoutStreamsTab(gtx layout.Context) layout.Dimensions {
 	)
 }
 
-// layoutTrafficDiagTab (Вкладка 4, Подвкладка 2): Диагностика доступности сайта, телеметрия Psiphon и самопроверка.
+// layoutDiagTab (Вкладка 6 «Диагностика»): 3 подвкладки — Проверки, Проверка сайта, Инструменты.
+func (ui *gioUI) layoutDiagTab(gtx layout.Context) layout.Dimensions {
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return ui.layoutSubTabBar(gtx, 6, []string{"Проверки (Утечки и Самопроверка)", "Проверка сайта и трассы", "Инструменты и состояние ядра"})
+		}),
+		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+			switch ui.subTabs[6] {
+			case 1:
+				return ui.layoutDiagSiteSub(gtx)
+			case 2:
+				return ui.layoutDiagToolsSub(gtx)
+			default:
+				return ui.layoutDiagChecksSub(gtx)
+			}
+		}),
+	)
+}
+
 func (ui *gioUI) layoutTrafficDiagTab(gtx layout.Context) layout.Dimensions {
+	return ui.layoutDiagTab(gtx)
+}
+
+func (ui *gioUI) renderCheckRows(gtx layout.Context, checks []any, titleKey string) layout.Dimensions {
+	var rows []layout.FlexChild
+	for _, raw := range checks {
+		cm, _ := raw.(map[string]any)
+		title, _ := cm[titleKey].(string)
+		if title == "" {
+			title, _ = cm["name"].(string)
+		}
+		if title == "" {
+			title, _ = cm["title"].(string)
+		}
+		detail, _ := cm["detail"].(string)
+		status, _ := cm["status"].(string)
+		col := ui.pal.ok
+		tag := "OK"
+		if status == "warn" {
+			col = ui.pal.warn
+			tag = "ВНИМАНИЕ"
+		} else if status == "fail" {
+			col = ui.pal.err
+			tag = "ОШИБКА"
+		} else if status == "info" {
+			col = ui.pal.teal
+			tag = "ИНФО"
+		}
+		rows = append(rows, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return layout.Inset{Top: unit.Dp(6)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				return ui.subCard(gtx, ui.pal.card2, tint(col, 115), unit.Dp(8), func(gtx layout.Context) layout.Dimensions {
+					return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+						layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+							return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+									return ui.labelLine(gtx, fontBody, ui.pal.text, font.SemiBold, title)
+								}),
+								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+									if detail == "" {
+										return layout.Dimensions{}
+									}
+									return ui.label(gtx, fontMicro, ui.pal.mut, font.Normal, ui.maskText(detail))
+								}),
+							)
+						}),
+						layout.Rigid(layout.Spacer{Width: space1}.Layout),
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							return ui.miniTag(gtx, col, tag)
+						}),
+					)
+				})
+			})
+		}))
+	}
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx, rows...)
+}
+
+func (ui *gioUI) layoutDiagChecksSub(gtx layout.Context) layout.Dimensions {
+	ui.mu.Lock()
+	lr := ui.leakRes
+	sr := ui.selftestRes
+	ui.mu.Unlock()
+
+	sections := []layout.Widget{
+		func(gtx layout.Context) layout.Dimensions {
+			return ui.twoCol(gtx, 0.5, 0.5,
+				// Тест утечек
+				func(gtx layout.Context) layout.Dimensions {
+					return ui.card(gtx, space2, func(gtx layout.Context) layout.Dimensions {
+						var rows []layout.FlexChild
+						rows = append(rows,
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								return ui.cardHeader(gtx, "shield", "Тест утечек (1 клик)",
+									"Внешний IP, DNS/Split-DNS, IPv6 blackhole, WebRTC/STUN, Kill Switch и чужие VPN-адаптеры",
+									func(gtx layout.Context) layout.Dimensions {
+										return ui.iconButton(gtx, &ui.leakTestBtn, "play", "Запустить", false, "primary")
+									})
+							}),
+						)
+						if lr != nil {
+							verdict, _ := lr["verdict"].(string)
+							passed, _ := lr["passed"].(float64)
+							total, _ := lr["total"].(float64)
+							vCol := ui.pal.ok
+							vTxt := fmt.Sprintf("✓ Утечек нет (%.0f/%.0f)", passed, total)
+							if verdict == "warn" {
+								vCol = ui.pal.warn
+								vTxt = fmt.Sprintf("⚠ Есть рекомендации (%.0f/%.0f)", passed, total)
+							} else if verdict != "ok" {
+								vCol = ui.pal.err
+								vTxt = fmt.Sprintf("✕ Найдены проблемы (%.0f/%.0f)", passed, total)
+							}
+							rows = append(rows,
+								layout.Rigid(layout.Spacer{Height: space1}.Layout),
+								layout.Rigid(func(gtx layout.Context) layout.Dimensions { return ui.miniTag(gtx, vCol, vTxt) }),
+							)
+							if checks, ok := lr["checks"].([]any); ok {
+								rows = append(rows, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+									return ui.renderCheckRows(gtx, checks, "title")
+								}))
+							}
+						}
+						return layout.Flex{Axis: layout.Vertical}.Layout(gtx, rows...)
+					})
+				},
+				// Самопроверка программы
+				func(gtx layout.Context) layout.Dimensions {
+					return ui.card(gtx, space2, func(gtx layout.Context) layout.Dimensions {
+						var rows []layout.FlexChild
+						rows = append(rows,
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								return ui.cardHeader(gtx, "check", "Самопроверка программы",
+									"Полная проверка сети, DNS, ядра, прав администратора и конфигурации",
+									func(gtx layout.Context) layout.Dimensions {
+										return ui.iconButton(gtx, &ui.selftestBtn, "play", "Запустить", false, "primary")
+									})
+							}),
+						)
+						if sr != nil {
+							if checks, ok := sr["checks"].([]any); ok {
+								rows = append(rows, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+									return ui.renderCheckRows(gtx, checks, "name")
+								}))
+							}
+						}
+						return layout.Flex{Axis: layout.Vertical}.Layout(gtx, rows...)
+					})
+				},
+			)
+		},
+	}
+	return material.List(ui.th, &ui.diagPageList).Layout(gtx, len(sections), func(gtx layout.Context, i int) layout.Dimensions {
+		return layout.Inset{Bottom: space2, Right: space1}.Layout(gtx, sections[i])
+	})
+}
+
+func (ui *gioUI) layoutDiagSiteSub(gtx layout.Context) layout.Dimensions {
 	ui.mu.Lock()
 	diag := ui.diagRes
 	psiStats := ui.psiStatsData
 	ui.mu.Unlock()
 
 	sections := []layout.Widget{
-		// 1. Site Diagnostics Card (DNS, DoH, ECH & all routes)
+		// Диагностика сайта
 		func(gtx layout.Context) layout.Dimensions {
 			gtx.Constraints.Min.X = gtx.Constraints.Max.X
 			return ui.card(gtx, space2, func(gtx layout.Context) layout.Dimensions {
-				return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+				var rows []layout.FlexChild
+				rows = append(rows,
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 						return ui.cardHeader(gtx, "search", "Глубокая диагностика доступности сайта",
 							"Проверка системного DNS, DoH, Encrypted ClientHello (ECH) и скорости через Direct, DPI, WARP и Psiphon", nil)
@@ -377,115 +533,198 @@ func (ui *gioUI) layoutTrafficDiagTab(gtx layout.Context) layout.Dimensions {
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 						return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
 							layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-								return ui.editorBox(gtx, "diag-host", &ui.diagEditor, "например, www.youtube.com или discord.com (Ctrl+F)")
+								return ui.editorBox(gtx, "diag-host", &ui.diagEditor, "например, www.youtube.com или 2ip.io (Ctrl+F)")
 							}),
 							layout.Rigid(layout.Spacer{Width: space1}.Layout),
 							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-								return ui.pillButton(gtx, &ui.diagRunBtn, "Проверить сайт", false, "primary")
+								return ui.iconButton(gtx, &ui.diagRunBtn, "search", "Проверить сайт", false, "primary")
 							}),
 						)
 					}),
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						if diag == nil {
-							return layout.Dimensions{}
-						}
-						best, _ := diag["best"].(string)
-						dnsMap, _ := diag["dns"].(map[string]any)
-						hasECH, _ := dnsMap["ech"].(bool)
-						echTxt := "нет записи HTTPS ECH"
-						if hasECH {
-							echTxt = "поддерживается ECH (Encrypted ClientHello)"
-						}
-						return layout.Inset{Top: space1}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-							return ui.label(gtx, fontBody, ui.pal.ok, font.SemiBold, fmt.Sprintf("Лучший маршрут: %s   |   %s", orDefault(best, "не найден"), echTxt))
-						})
-					}),
 				)
-			})
-		},
-		// 2. Per-Network Psiphon Strategy Telemetry & Server Entries Import
-		func(gtx layout.Context) layout.Dimensions {
-			gtx.Constraints.Min.X = gtx.Constraints.Max.X
-			return ui.card(gtx, space2, func(gtx layout.Context) layout.Dimensions {
-				netKey := "—"
-				netID := "—"
-				var stratRows []map[string]any
-				var imported float64
-				if psiStats != nil {
-					netKey, _ = psiStats["net_key"].(string)
-					netID, _ = psiStats["network_id"].(string)
-					imported, _ = psiStats["imported_entries"].(float64)
-					stratRows = toMapSlice(psiStats["strategies"])
-				}
-				var rows []layout.FlexChild
-				rows = append(rows, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					return ui.cardHeader(gtx, "chart",
-						fmt.Sprintf("Статистика способов Psiphon для текущей сети (%s)", orDefault(netKey, "net-default")),
-						fmt.Sprintf("NetworkID: %s · импортировано записей серверов: %.0f", orDefault(netID, "psiroute"), imported), nil)
-				}))
-				rows = append(rows, layout.Rigid(layout.Spacer{Height: space1}.Layout))
-				for i := range stratRows {
-					sr := stratRows[i]
-					title, _ := sr["title"].(string)
-					att, _ := sr["attempts"].(float64)
-					succ, _ := sr["successes"].(float64)
-					medMs, _ := sr["median_connect_ms"].(float64)
-					medLife, _ := sr["median_lifetime_sec"].(float64)
-					score, _ := sr["score"].(float64)
-					unstable, _ := sr["unstable"].(bool)
-					line := fmt.Sprintf("попыток: %.0f · успехов: %.0f · мед. вход: %.0f мс · мед. жизнь: %.0f с · оценка: %.0f",
-						att, succ, medMs, medLife, score)
-					if unstable {
-						line += " · [временно нестабилен]"
+				if diag != nil {
+					best, _ := diag["best"].(string)
+					dnsMap, _ := diag["dns"].(map[string]any)
+					hasECH, _ := dnsMap["ech"].(bool)
+					echTxt := "нет записи HTTPS ECH"
+					if hasECH {
+						echTxt = "поддерживается ECH (Encrypted ClientHello)"
 					}
-					rows = append(rows, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return layout.Inset{Bottom: unit.Dp(4)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-							return ui.subCard(gtx, ui.pal.card2, ui.pal.border, space1, func(gtx layout.Context) layout.Dimensions {
-								return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle, Spacing: layout.SpaceBetween}.Layout(gtx,
-									layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-										return ui.labelLine(gtx, fontBody, ui.pal.text, font.SemiBold, title)
-									}),
-									layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-										return ui.labelLine(gtx, fontSmall, ui.pal.mut, font.Normal, line)
-									}),
-								)
-							})
-						})
-					}))
-				}
-				rows = append(rows, layout.Rigid(layout.Spacer{Height: space1}.Layout))
-				rows = append(rows, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
-						layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-							return ui.editorBox(gtx, "server-entries", &ui.serverEntriesEditor, "Импорт server entries Psiphon (вставьте hex или base64 строку)…")
-						}),
-						layout.Rigid(layout.Spacer{Width: space1}.Layout),
+					rows = append(rows,
+						layout.Rigid(layout.Spacer{Height: space1}.Layout),
 						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-							return ui.iconButton(gtx, &ui.importEntriesBtn, "plus", "Импортировать серверы", false, "primary")
+							return ui.subCard(gtx, ui.pal.okSoft, tint(ui.pal.ok, 120), unit.Dp(8), func(gtx layout.Context) layout.Dimensions {
+								return ui.label(gtx, fontBody, ui.pal.ok, font.SemiBold,
+									fmt.Sprintf("Лучший маршрут: %s   ·   %s", orDefault(best, "не найден"), echTxt))
+							})
 						}),
 					)
-				}))
+					if routes, ok := diag["routes"].([]any); ok {
+						for _, rr := range routes {
+							rm, _ := rr.(map[string]any)
+							name, _ := rm["route"].(string)
+							if name == "" {
+								name, _ = rm["outbound"].(string)
+							}
+							okR, _ := rm["ok"].(bool)
+							msR, _ := rm["ms"].(float64)
+							errR, _ := rm["error"].(string)
+							col := ui.pal.err
+							info := orDefault(errR, "недоступно")
+							if okR {
+								col = ui.pal.ok
+								info = fmt.Sprintf("OK · %.0f мс", msR)
+							}
+							rows = append(rows, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								return layout.Inset{Top: unit.Dp(5)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+									return ui.kvRow(gtx, routeShortRu(name), info)
+								})
+							}))
+							_ = col
+						}
+					}
+				}
 				return layout.Flex{Axis: layout.Vertical}.Layout(gtx, rows...)
 			})
 		},
-		// 3. Maintenance & Self-Check Card
+		// Статистика способов Psiphon для текущей сети
+		func(gtx layout.Context) layout.Dimensions {
+			gtx.Constraints.Min.X = gtx.Constraints.Max.X
+			netKey := "—"
+			netID := "—"
+			var stratRows []map[string]any
+			var imported float64
+			if psiStats != nil {
+				netKey, _ = psiStats["net_key"].(string)
+				netID, _ = psiStats["network_id"].(string)
+				imported, _ = psiStats["imported_entries"].(float64)
+				stratRows = toMapSlice(psiStats["strategies"])
+			}
+			var rows []layout.FlexChild
+			rows = append(rows, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return ui.cardHeader(gtx, "chart",
+					fmt.Sprintf("Телеметрия стратегий Psiphon (%s)", orDefault(netKey, "net-default")),
+					fmt.Sprintf("NetworkID: %s · импортировано записей серверов: %.0f", orDefault(netID, "psiroute"), imported), nil)
+			}))
+			for i := range stratRows {
+				sr := stratRows[i]
+				title, _ := sr["title"].(string)
+				att, _ := sr["attempts"].(float64)
+				succ, _ := sr["successes"].(float64)
+				medMs, _ := sr["median_connect_ms"].(float64)
+				medLife, _ := sr["median_lifetime_sec"].(float64)
+				score, _ := sr["score"].(float64)
+				unstable, _ := sr["unstable"].(bool)
+				line := fmt.Sprintf("попыток: %.0f · успехов: %.0f · вход: %.0f мс · жизнь: %.0f с · оценка: %.0f",
+					att, succ, medMs, medLife, score)
+				if unstable {
+					line += " · [нестабилен]"
+				}
+				rows = append(rows, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return layout.Inset{Top: unit.Dp(5)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+						return ui.subCard(gtx, ui.pal.card2, ui.pal.border, unit.Dp(8), func(gtx layout.Context) layout.Dimensions {
+							return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle, Spacing: layout.SpaceBetween}.Layout(gtx,
+								layout.Rigid(func(gtx layout.Context) layout.Dimensions { return ui.labelLine(gtx, fontBody, ui.pal.text, font.SemiBold, title) }),
+								layout.Rigid(func(gtx layout.Context) layout.Dimensions { return ui.labelLine(gtx, fontSmall, ui.pal.mut, font.Normal, line) }),
+							)
+						})
+					})
+				}))
+			}
+			return ui.card(gtx, space2, func(gtx layout.Context) layout.Dimensions {
+				return layout.Flex{Axis: layout.Vertical}.Layout(gtx, rows...)
+			})
+		},
+	}
+	return material.List(ui.th, &ui.diagPageList).Layout(gtx, len(sections), func(gtx layout.Context, i int) layout.Dimensions {
+		return layout.Inset{Bottom: space2, Right: space1}.Layout(gtx, sections[i])
+	})
+}
+
+func (ui *gioUI) layoutDiagToolsSub(gtx layout.Context) layout.Dimensions {
+	ui.mu.Lock()
+	st := ui.state
+	ui.mu.Unlock()
+
+	memStr := "—"
+	if mem, ok := st["mem"].(map[string]any); ok {
+		if t, _ := mem["text"].(string); t != "" {
+			memStr = t
+		} else if tot, ok := mem["total"].(float64); ok && tot > 0 {
+			memStr = fmt.Sprintf("%.0f МБ", tot/1048576)
+		}
+	}
+	fakeIPCnt, _ := st["fakeip_count"].(float64)
+	panicsCnt, _ := st["panics"].(float64)
+	restartsCnt, _ := st["crash_restarts"].(float64)
+	learnedCnt, _ := st["learned_count"].(float64)
+	udpMode := "—"
+	var udpFlows float64
+	if udp, ok := st["udp"].(map[string]any); ok {
+		udpMode, _ = udp["mode"].(string)
+		udpFlows, _ = udp["flows"].(float64)
+	}
+	netName := "—"
+	if netM, ok := st["net"].(map[string]any); ok {
+		if n, _ := netM["name"].(string); n != "" {
+			netName = n
+		} else if t, _ := netM["text"].(string); t != "" {
+			netName = t
+		}
+	}
+
+	sections := []layout.Widget{
+		// Быстрые инструменты обслуживания
 		func(gtx layout.Context) layout.Dimensions {
 			gtx.Constraints.Min.X = gtx.Constraints.Max.X
 			return ui.card(gtx, space2, func(gtx layout.Context) layout.Dimensions {
 				return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return ui.cardHeader(gtx, "refresh", "Обслуживание и самопроверка",
-							"Проверка сети, сброс кэша DNS/маршрутов и сохранение архива диагностики (.zip)", nil)
+						return ui.cardHeader(gtx, "refresh", "Инструменты обслуживания",
+							"Сброс DNS, перезапуск сетевого стека и сохранение диагностического архива (.zip)", nil)
 					}),
-					layout.Rigid(layout.Spacer{Height: space2}.Layout),
+					layout.Rigid(layout.Spacer{Height: space1}.Layout),
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return ui.maintenanceButtons(gtx, false)
+						return flowWrap(gtx, space1, space1,
+							func(gtx layout.Context) layout.Dimensions {
+								return ui.iconButton(gtx, &ui.clearDNSBtn, "refresh", "Сбросить кэш DNS", false, "")
+							},
+							func(gtx layout.Context) layout.Dimensions {
+								return ui.iconButton(gtx, &ui.resetStackBtn, "bolt", "Reset Stack", false, "warn")
+							},
+							func(gtx layout.Context) layout.Dimensions {
+								return ui.iconButton(gtx, &ui.reportBtn, "download", "Создать отчёт (.zip)", false, "primary")
+							},
+							func(gtx layout.Context) layout.Dimensions {
+								return ui.iconButton(gtx, &ui.clearLearnBtn, "swap", "Забыть выученные маршруты", false, "")
+							},
+							func(gtx layout.Context) layout.Dimensions {
+								return ui.iconButton(gtx, &ui.refreshListBtn, "download", "Обновить все списки", false, "")
+							},
+						)
 					}),
 				)
 			})
 		},
+		// Состояние ядра (телеметрия служб)
+		func(gtx layout.Context) layout.Dimensions {
+			gtx.Constraints.Min.X = gtx.Constraints.Max.X
+			return ui.card(gtx, space2, func(gtx layout.Context) layout.Dimensions {
+				return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return ui.cardHeader(gtx, "chart", "Состояние ядра", "Сводка по внутренним службам PsiRoute", nil)
+					}),
+					layout.Rigid(layout.Spacer{Height: space1}.Layout),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions { return ui.kvRow(gtx, "Память процесса", memStr) }),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions { return ui.kvRow(gtx, "FakeIP адресов в пуле", fmt.Sprintf("%.0f", fakeIPCnt)) }),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions { return ui.kvRow(gtx, "Выученных маршрутов", fmt.Sprintf("%.0f", learnedCnt)) }),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions { return ui.kvRow(gtx, "UDP-режим / активные потоки", fmt.Sprintf("%s / %.0f", orDefault(udpMode, "—"), udpFlows)) }),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions { return ui.kvRow(gtx, "Активная сеть", ui.maskSensitive(netName)) }),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions { return ui.kvRow(gtx, "Перехваченных сбоев / перезапусков", fmt.Sprintf("%.0f / %.0f", panicsCnt, restartsCnt)) }),
+				)
+			})
+		},
 	}
-
 	return material.List(ui.th, &ui.diagPageList).Layout(gtx, len(sections), func(gtx layout.Context, i int) layout.Dimensions {
 		return layout.Inset{Bottom: space2, Right: space1}.Layout(gtx, sections[i])
 	})

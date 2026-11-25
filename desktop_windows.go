@@ -205,7 +205,7 @@ func (t *tray) start() {
 	t.icons = map[uint32]uintptr{}
 	t.done = make(chan struct{})
 	ready := make(chan struct{})
-	go t.run(ready)
+	safeGo("tray.start", func() { t.run(ready) })
 	<-ready
 }
 
@@ -346,7 +346,7 @@ func (t *tray) showMenu() {
 		uintptr(pt.X), uintptr(pt.Y), 0, t.hwnd, 0)
 	dtPostMessageW.Call(t.hwnd, wmNull, 0, 0)
 	if cmd != 0 {
-		go t.onCommand(int(cmd))
+		safeGo("tray.showMenu", func() { t.onCommand(int(cmd)) })
 	}
 }
 
@@ -474,7 +474,10 @@ func makeHIconFlag(size int, rgb uint32, cc string) uintptr {
 
 const (
 	menuOpen = 1 + iota
+	menuOpenApp
 	menuOpenWeb
+	menuCleanIPToggle
+	menuResetStack
 	menuConnect
 	menuPause5
 	menuPause15
@@ -531,7 +534,7 @@ func runDesktop(ctx context.Context, a *App, dir string, openNow bool) {
 	if openNow {
 		d.openWindow()
 	}
-	go d.watch(ctx)
+	safeLoop(ctx, "слежение за окном", func() { d.watch(ctx) })
 	<-ctx.Done()
 	d.closeWindows()
 	d.t.stop()
@@ -622,9 +625,11 @@ func (d *desktop) menu() []trayItem {
 		probeTxt = "Остановить автоподбор обхода Psiphon"
 	}
 
+	cleanOn := d.a.cleanChain != nil && d.a.cleanChain.enabled()
 	return []trayItem{
-		{id: menuOpen, text: "Открыть окно Psiroute (Нативный UI)", bold: true},
-		{id: menuOpenWeb, text: "Открыть веб-панель в браузере"},
+		{id: menuOpen, text: "Открыть PsiRoute (Aether Flow Dark)", bold: true},
+		{id: menuOpenApp, text: "Открыть веб-панель в App-окне"},
+		{id: menuOpenWeb, text: "Открыть в обычном браузере"},
 		{sep: true},
 		{id: menuConnect, text: conn},
 		{id: menuPause5, text: "Пауза защиты на 5 минут", check: d.a.IsPaused() && d.a.PauseRemainingSec() <= 300},
@@ -636,6 +641,8 @@ func (d *desktop) menu() []trayItem {
 		{id: menuSysProxy, text: "Системный прокси Windows", check: sys},
 		{id: menuTun, text: "Режим TUN (весь ПК)", check: tunOn},
 		{id: menuWarpToggle, text: "Cloudflare WARP (подложка)", check: warpOn},
+		{id: menuCleanIPToggle, text: "Каскад Clean-IP (WARP → VPN → WARP)", check: cleanOn},
+		{id: menuResetStack, text: "Reset Stack (сброс DNS и стека)"},
 		{id: menuShareToggle, text: "Раздача в LAN (Телефон / ТВ)", check: shareOn},
 		{sep: true},
 		{text: "Режим маршрутизации", children: []trayItem{
@@ -683,19 +690,34 @@ func (d *desktop) command(id int) {
 		d.a.cfg.mu.Lock()
 		d.a.cfg.Psiphon.Country = reg
 		d.a.cfg.mu.Unlock()
-		_ = d.a.cfg.save()
+		_ = d.a.cfg.saveOrReport("desktop.command")
 		d.a.restartIfRunning()
 		d.refresh()
 		return
 	}
 	switch id {
+	case menuOpenApp:
+		openAppWindow(d.a.uiURL(), d.dir)
 	case menuOpen:
 		d.openWindow()
 	case menuOpenWeb:
 		openBrowser(d.a.uiURL())
+	case menuCleanIPToggle:
+		d.a.cfg.mu.Lock()
+		on := !d.a.cfg.CleanChain.Enabled
+		d.a.cfg.mu.Unlock()
+		d.a.cfg.setKey("clean_chain.enabled", on)
+		if !on && d.a.cleanChain != nil {
+			d.a.cleanChain.Close()
+		}
+		_ = d.a.cfg.saveOrReport("desktop.command")
+		d.a.onRulesChanged()
+		d.a.tun.refresh()
+	case menuResetStack:
+		safeGo("desktop.command", d.a.ResetStack)
 	case menuConnect:
 		if d.a.psi.running() {
-			go d.a.DisconnectVPN()
+			safeGo("desktop.command#2", func() { d.a.DisconnectVPN() })
 		} else {
 			d.a.ConnectVPN()
 		}
@@ -710,7 +732,7 @@ func (d *desktop) command(id int) {
 	case menuNextStrat:
 		d.a.psi.Next()
 	case menuRestartPsi:
-		go d.a.psi.Restart()
+		safeGo("desktop.command#3", d.a.psi.Restart)
 	case menuSysProxy:
 		d.a.mu.Lock()
 		on := !d.a.sysOn
@@ -735,7 +757,7 @@ func (d *desktop) command(id int) {
 		on := !d.a.cfg.Warp.Enabled
 		d.a.cfg.mu.Unlock()
 		restarted := d.a.cfg.setKey("warp.enabled", on) && d.a.restartIfRunning()
-		_ = d.a.cfg.save()
+		_ = d.a.cfg.saveOrReport("desktop.command")
 		if on && !restarted {
 			d.a.warp.Want()
 		}
@@ -751,34 +773,34 @@ func (d *desktop) command(id int) {
 		on := !d.a.cfg.DNS.Enabled
 		d.a.cfg.mu.Unlock()
 		d.a.cfg.setKey("dns.enabled", on)
-		_ = d.a.cfg.save()
+		_ = d.a.cfg.saveOrReport("desktop.command")
 	case menuModePsiphon:
 		d.a.cfg.mu.Lock()
 		d.a.cfg.Routing.Mode = "psiphon"
 		d.a.cfg.mu.Unlock()
-		_ = d.a.cfg.save()
+		_ = d.a.cfg.saveOrReport("desktop.command")
 	case menuModeRules:
 		d.a.cfg.mu.Lock()
 		d.a.cfg.Routing.Mode = "rules"
 		d.a.cfg.mu.Unlock()
-		_ = d.a.cfg.save()
+		_ = d.a.cfg.saveOrReport("desktop.command")
 	case menuModeAuto:
 		d.a.cfg.mu.Lock()
 		d.a.cfg.Routing.Mode = "auto"
 		d.a.cfg.mu.Unlock()
-		_ = d.a.cfg.save()
+		_ = d.a.cfg.saveOrReport("desktop.command")
 	case menuBypassLAN:
 		d.a.cfg.mu.Lock()
 		on := !d.a.cfg.Routing.BypassLAN
 		d.a.cfg.mu.Unlock()
 		d.a.cfg.setKey("routing.bypass_lan", on)
-		_ = d.a.cfg.save()
+		_ = d.a.cfg.saveOrReport("desktop.command")
 	case menuBlockQUIC:
 		d.a.cfg.mu.Lock()
 		on := !d.a.cfg.Routing.BlockQUIC
 		d.a.cfg.mu.Unlock()
 		d.a.cfg.setKey("routing.block_quic", on)
-		_ = d.a.cfg.save()
+		_ = d.a.cfg.saveOrReport("desktop.command")
 	case menuDPIModeAuto:
 		_ = d.a.dpiSetMode("auto")
 	case menuDPIModeOff:
@@ -814,13 +836,13 @@ func (d *desktop) command(id int) {
 	case menuReloadCfg:
 		d.a.reloadConfig()
 	case menuMakeReport:
-		go func() {
+		safeGo("desktop.command#4", func() {
 			ctx, cancel := context.WithTimeout(d.a.ctx, 90*time.Second)
 			defer cancel()
 			if path, err := d.a.makeReport(ctx); err == nil {
 				revealFile(path)
 			}
-		}()
+		})
 	case menuQuit:
 		d.a.cancel()
 		return
@@ -870,13 +892,13 @@ func (d *desktop) openWindow() {
 	}
 	dtAllowSetForegroundWindow.Call(uintptr(cmd.Process.Pid))
 	d.win = cmd
-	go func() {
+	safeGo("desktop.openWindow", func() {
 		_ = cmd.Wait()
 		d.mu.Lock()
 		d.win = nil
 		d.mu.Unlock()
 		d.windowClosed(cmd.ProcessState.ExitCode())
-	}()
+	})
 }
 
 func (d *desktop) windowClosed(code int) {

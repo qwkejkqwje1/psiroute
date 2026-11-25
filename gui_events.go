@@ -50,16 +50,43 @@ type gioUI struct {
 	statusToast       string
 	toastErr          bool
 	toastUntil        time.Time
-	pendingTheme      string
 	pendingEditorText map[*widget.Editor]string
 	powerBusy         atomic.Bool
 
-	// Navigation tabs (5 разделов):
-	// 0=Главная, 1=Маршруты, 2=Потоки (активна только при клике), 3=Сеть, 4=Журнал и Система
+	// Navigation tabs (9 разделов Aurora Dark):
+	// 0=Главная, 1=Маршруты, 2=Потоки, 3=Страны, 4=Обход и ядро, 5=Устройства, 6=Диагностика, 7=Настройки, 8=Журнал
 	tab                 int
-	navBtns             [5]widget.Clickable
-	subTabs             [5]int
-	subTabBtns          [5][3]widget.Clickable
+	navBtns             [9]widget.Clickable
+	subTabs             [9]int
+	subTabBtns          [9][5]widget.Clickable
+	sidebarCollapsed    bool
+	sidebarToggleBtn    widget.Clickable
+	paletteOpen         bool
+	paletteBtn          widget.Clickable
+	paletteCloseBtn     widget.Clickable
+	paletteEditor       widget.Editor
+	paletteList         widget.List
+	paletteTraceHost    string
+	paletteTraceRes     map[string]any
+	settingsData        map[string]any
+	settingsSynced      bool
+	profilesData        map[string]any
+	dpiTestData         map[string]any
+	probeData           map[string]any
+	psiInfoData         map[string]any
+	browsersData        []map[string]any
+	selftestRes         map[string]any
+	speedTestRes        map[string]any
+	countrySearchEditor widget.Editor
+	logSearchEditor     widget.Editor
+	profileImportEditor widget.Editor
+	warpEndpointEditor  widget.Editor
+	warpSocksEditor     widget.Editor
+	tunMTUEditor        widget.Editor
+	tunExcludeEditor    widget.Editor
+	proxyUpstreamEditor widget.Editor
+	bypassPageList      widget.List
+	countriesPageList   widget.List
 	rulesTemplatesOpen  bool
 	streamsPaused       bool
 	streamRuleForApp    bool
@@ -71,7 +98,12 @@ type gioUI struct {
 	logLevelFilter      int
 	lastIconState       string
 	lastIconCC          string
-	webBtn     widget.Clickable
+	webBtn              widget.Clickable
+	resetStackBtn       widget.Clickable
+	cleanChainToggleBtn widget.Clickable
+	cleanAutoChainBtn   widget.Clickable
+	verifyCleanBtn      widget.Clickable
+	ksModeBtns          [3]widget.Clickable // 0=off, 1=auto, 2=strict
 	quitBtn    widget.Clickable
 	keyTag     bool
 
@@ -98,6 +130,8 @@ type gioUI struct {
 	speedTestBtn    widget.Clickable
 	modeBtns        [3]widget.Clickable
 	sysProxyBtn     widget.Clickable
+	autostartBtn    widget.Clickable // toggle of autostart (A-05)
+	ackCorruptBtn   widget.Clickable // "Подтвердить" on the damaged-config banner (A-17)
 	tunBtn          widget.Clickable
 	tunAdminBtn     widget.Clickable
 	warpBtn         widget.Clickable
@@ -140,19 +174,20 @@ type gioUI struct {
 	repairConnBtn    widget.Clickable
 	pause5Btn        widget.Clickable
 	pause15Btn       widget.Clickable
+	pause30Btn       widget.Clickable
+	pause60Btn       widget.Clickable
 	pauseResumeBtn   widget.Clickable
 	captiveOpenBtn   widget.Clickable
 	privacyBtn       widget.Clickable
 	privacyMode      bool
 	homeRuleEditor   widget.Editor
 	homeRuleOb       string
-	homeRuleObBtns   [5]widget.Clickable
+	homeRuleObBtns   [6]widget.Clickable
 	homeRuleAddBtn   widget.Clickable
 	homeCheckBtn     widget.Clickable
 	homeRoutePreview string
 	lastHomeQuery    string
 	lastHomeCheckAt  time.Time
-	themeToggleBtn   widget.Clickable
 	liveAppBtns      [4]widget.Clickable
 	liveAppNames     [4]string
 	liveAppRoutes    [4]string
@@ -223,7 +258,10 @@ type gioUI struct {
 	listTrustCancelBtn     widget.Clickable
 
 	// Countries, DPI & WARP Mask
-	countryBtns    [28]widget.Clickable
+	countryBtns      [28]widget.Clickable
+	blockCountryBtns [28]widget.Clickable
+	leakTestBtn      widget.Clickable
+	leakRes          map[string]any
 	favCountryBtns [28]widget.Clickable
 	favStarBtns    [28]widget.Clickable
 	dpiModeBtns  [7]widget.Clickable
@@ -247,20 +285,38 @@ type gioUI struct {
 	shareInfo map[string]any
 }
 
-var navTitles = [5]string{
+var navTitles = [9]string{
 	"Главная",
 	"Маршруты",
 	"Потоки",
-	"Сеть",
+	"Страны",
+	"Обход и ядро",
+	"Устройства",
+	"Диагностика",
+	"Настройки",
 	"Журнал",
 }
 
-var navHints = [5]string{
-	"Командный центр: питание (с флагом страны), схема захвата, глобальный сценарий и живой омнибокс",
-	"Умные маршруты по 4 уровням приоритета ядра, раздельное туннелирование программ (.exe) и каталог списков",
-	"Живые потоки и подключения (вкладка активна только когда открыта) — назначение правил в 1 клик",
-	"Выбор страны выхода Psiphon, авто-тюнинг обхода DPI, параметры Cloudflare WARP и раздача в LAN",
-	"Полноэкранный живой журнал событий (без обрезки), настройки DNS/FakeIP и глубокая диагностика",
+var navHints = [9]string{
+	"Подключение, цепочка трафика, сценарии маршрутизации и быстрый омнибокс",
+	"Умные правила по приоритетам, программы (Split Tunneling) и каталог списков доменов",
+	"Живые соединения — клик по маршруту создаёт правило для сайта или программы",
+	"Выбор страны выхода Psiphon, избранное, чёрный список и фоновые процессы",
+	"Обход DPI, тест методов, автоподбор Psiphon, WARP, Clean-IP каскад и Kill Switch",
+	"Локальный прокси :1080, PAC, раздача в LAN и запуск браузеров через PsiRoute",
+	"Тест утечек, самопроверка программы, диагностика сайтов и состояние ядра",
+	"Автозапуск, параметры TUN/DNS/UDP, готовые и пользовательские профили",
+	"Живой журнал событий ядра в реальном времени с поиском и фильтром ошибок",
+}
+
+func (ui *gioUI) settingsValues() map[string]any {
+	if ui.settingsData == nil {
+		return map[string]any{}
+	}
+	if vals, ok := ui.settingsData["values"].(map[string]any); ok && vals != nil {
+		return vals
+	}
+	return map[string]any{}
 }
 
 // loadWindowsSystemFonts загружает системные шрифты Windows (Segoe UI / Consolas) напрямую с диска,
@@ -355,6 +411,9 @@ func runGioWindow(dataDir, uiURL string, parentPID int) {
 	ui.devicesPageList.List.Axis = layout.Vertical
 	ui.diagPageList.List.Axis = layout.Vertical
 	ui.setPageList.List.Axis = layout.Vertical
+	ui.bypassPageList.List.Axis = layout.Vertical
+	ui.countriesPageList.List.Axis = layout.Vertical
+	ui.paletteList.List.Axis = layout.Vertical
 	ui.appList.List.Axis = layout.Vertical
 	ui.ruleList.List.Axis = layout.Vertical
 	ui.connList.List.Axis = layout.Vertical
@@ -379,12 +438,21 @@ func runGioWindow(dataDir, uiURL string, parentPID int) {
 	ui.listURLEditor.SingleLine = true
 	ui.listFilePathEditor.SingleLine = true
 	ui.listContentEditor.SingleLine = false
+	ui.paletteEditor.SingleLine = true
+	ui.countrySearchEditor.SingleLine = true
+	ui.logSearchEditor.SingleLine = true
+	ui.profileImportEditor.SingleLine = false
+	ui.warpEndpointEditor.SingleLine = true
+	ui.warpSocksEditor.SingleLine = true
+	ui.tunMTUEditor.SingleLine = true
+	ui.tunExcludeEditor.SingleLine = true
+	ui.proxyUpstreamEditor.SingleLine = true
 
-	go func() {
+	safeGo("runGioWindow", func() {
 		w := new(app.Window)
 		w.Option(
 			app.Title(windowTitle),
-			app.Size(unit.Dp(1080), unit.Dp(700)),
+			app.Size(unit.Dp(1180), unit.Dp(740)),
 			app.MinSize(unit.Dp(960), unit.Dp(640)),
 		)
 		ui.w = w
@@ -392,15 +460,15 @@ func runGioWindow(dataDir, uiURL string, parentPID int) {
 
 		if parentPID > 0 {
 			if p, err := os.FindProcess(parentPID); err == nil {
-				go func() {
+				safeGo("runGioWindow#2", func() {
 					_, _ = p.Wait()
 					os.Exit(0)
-				}()
+				})
 			}
 		}
 
 		stopPoll := make(chan struct{})
-		go ui.pollLoop(stopPoll)
+		safeGo("runGioWindow#3", func() { ui.pollLoop(stopPoll) })
 
 		defer func() {
 			if r := recover(); r != nil {
@@ -420,7 +488,7 @@ func runGioWindow(dataDir, uiURL string, parentPID int) {
 				minimized := e.Config.Mode == app.Minimized
 				wasHidden := guiHidden.Swap(minimized)
 				if minimized && !wasHidden {
-					go ReleaseGUIMemory()
+					safeGo("runGioWindow#4", ReleaseGUIMemory)
 				}
 			case app.FrameEvent:
 				ops.Reset()
@@ -438,7 +506,7 @@ func runGioWindow(dataDir, uiURL string, parentPID int) {
 				e.Frame(gtx.Ops)
 			}
 		}
-	}()
+	})
 	app.Main()
 }
 
@@ -467,7 +535,7 @@ func (ui *gioUI) fetchAll(full bool) {
 	streamsPaused := ui.streamsPaused
 	ui.mu.Unlock()
 	statePath := "/api/state?compact=1"
-	if full || curTab == 4 {
+	if full || curTab == 8 {
 		statePath = "/api/state"
 	}
 	st, err := ui.apiCall("GET", statePath, nil)
@@ -480,9 +548,6 @@ func (ui *gioUI) fetchAll(full bool) {
 			st["log"] = ui.cachedLogs
 		}
 		ui.state = st
-		if thm, ok := st["ui_theme"].(string); ok && thm != "" {
-			ui.pendingTheme = thm
-		}
 		psiMap, _ := st["psiphon"].(map[string]any)
 		pState, _ := psiMap["state"].(string)
 		cc, _ := psiMap["egress_region"].(string)
@@ -525,10 +590,72 @@ func (ui *gioUI) fetchAll(full bool) {
 			ui.mu.Unlock()
 		}
 	}
-	if tab == 4 || (full && !havePsiStats) {
+	ui.mu.Lock()
+	haveSettings := ui.settingsData != nil
+	haveProfiles := ui.profilesData != nil
+	haveBrowsers := ui.browsersData != nil
+	havePsiInfo := ui.psiInfoData != nil
+	subBypass := ui.subTabs[4]
+	ui.mu.Unlock()
+
+	if tab == 4 || tab == 7 || (full && !haveSettings) {
+		if sd, err := ui.apiCall("GET", "/api/settings", nil); err == nil && sd != nil {
+			ui.mu.Lock()
+			ui.settingsData = sd
+			needSync := !ui.settingsSynced
+			ui.settingsSynced = true
+			ui.mu.Unlock()
+			if needSync {
+				if vals, ok := sd["values"].(map[string]any); ok {
+					if s, _ := vals["warp.endpoint"].(string); s != "" {
+						ui.queueEditorText(&ui.warpEndpointEditor, s)
+					}
+					if s, _ := vals["warp.socks"].(string); s != "" {
+						ui.queueEditorText(&ui.warpSocksEditor, s)
+					}
+					if v, ok := vals["tun.mtu"].(float64); ok && v > 0 {
+						ui.queueEditorText(&ui.tunMTUEditor, fmt.Sprintf("%.0f", v))
+					}
+					if s, _ := vals["tun.exclude_apps"].(string); s != "" {
+						ui.queueEditorText(&ui.tunExcludeEditor, s)
+					}
+					if s, _ := vals["proxy.upstream"].(string); s != "" {
+						ui.queueEditorText(&ui.proxyUpstreamEditor, s)
+					}
+				}
+			}
+		}
+	}
+	if tab == 4 && subBypass == 0 {
+		if dt, err := ui.apiCall("GET", "/api/dpi/test", nil); err == nil && dt != nil {
+			ui.mu.Lock()
+			ui.dpiTestData = dt
+			ui.mu.Unlock()
+		}
+		if pr, err := ui.apiCall("GET", "/api/psi/probe", nil); err == nil && pr != nil {
+			ui.mu.Lock()
+			ui.probeData = pr
+			ui.mu.Unlock()
+		}
+	}
+	if (tab == 4 && subBypass == 2) || (full && !havePsiInfo) {
+		if pi, err := ui.apiCall("GET", "/api/psi/info", nil); err == nil && pi != nil {
+			ui.mu.Lock()
+			ui.psiInfoData = pi
+			ui.mu.Unlock()
+		}
+	}
+	if tab == 6 || (full && !havePsiStats) {
 		if ps, err := ui.apiCall("GET", "/api/psiphon/stats", nil); err == nil && ps != nil {
 			ui.mu.Lock()
 			ui.psiStatsData = ps
+			ui.mu.Unlock()
+		}
+	}
+	if tab == 7 || (full && !haveProfiles) {
+		if pf, err := ui.apiCall("GET", "/api/profiles", nil); err == nil && pf != nil {
+			ui.mu.Lock()
+			ui.profilesData = pf
 			ui.mu.Unlock()
 		}
 	}
@@ -541,10 +668,17 @@ func (ui *gioUI) fetchAll(full bool) {
 		}
 	}
 	ui.mu.Unlock()
-	if (tab == 3 || tab == 4) && (full || !haveShare) {
+	if tab == 5 && (full || !haveShare) {
 		if sh, err := ui.apiCall("GET", "/api/share", nil); err == nil && sh != nil {
 			ui.mu.Lock()
 			ui.shareInfo = sh
+			ui.mu.Unlock()
+		}
+	}
+	if tab == 5 && (full || !haveBrowsers) {
+		if br, err := ui.apiCall("GET", "/api/browser/info", nil); err == nil && br != nil {
+			ui.mu.Lock()
+			ui.browsersData = toMapSlice(br["list"])
 			ui.mu.Unlock()
 		}
 	}
@@ -622,7 +756,7 @@ func (ui *gioUI) doAsync(toastMsg string, fn func() (map[string]any, error)) {
 	if toastMsg != "" {
 		ui.setToast(toastMsg, false)
 	}
-	go func() {
+	safeGo("gioUI.doAsync", func() {
 		res, err := fn()
 		if err != nil {
 			ui.setToast("Ошибка: "+err.Error(), true)
@@ -634,7 +768,7 @@ func (ui *gioUI) doAsync(toastMsg string, fn func() (map[string]any, error)) {
 			}
 		}
 		ui.fetchAll(true)
-	}()
+	})
 }
 
 func (ui *gioUI) setToast(msg string, isErr bool) {
@@ -665,17 +799,12 @@ func (ui *gioUI) queueEditorText(ed *widget.Editor, txt string) {
 
 func (ui *gioUI) applyPendingUIUpdates() {
 	ui.mu.Lock()
-	thm := ui.pendingTheme
-	ui.pendingTheme = ""
 	var edUpdates map[*widget.Editor]string
 	if len(ui.pendingEditorText) > 0 {
 		edUpdates = ui.pendingEditorText
 		ui.pendingEditorText = map[*widget.Editor]string{}
 	}
 	ui.mu.Unlock()
-	if thm != "" && thm != ui.pal.themeID {
-		ui.pal = paletteByTheme(thm)
-	}
 	for ed, txt := range edUpdates {
 		ed.SetText(txt)
 	}
@@ -694,7 +823,7 @@ func (ui *gioUI) togglePower(pState string) {
 		toastDone = ""
 	}
 	ui.setToast(toastStart, false)
-	go func() {
+	safeGo("gioUI.togglePower", func() {
 		defer ui.powerBusy.Store(false)
 		res, err := ui.apiCall("POST", "/api/psiphon/"+act, nil)
 		if err != nil {
@@ -709,7 +838,7 @@ func (ui *gioUI) togglePower(pState string) {
 			}
 		}
 		ui.fetchAll(true)
-	}()
+	})
 }
 
 func (ui *gioUI) appBtn(key string) *widget.Clickable {
@@ -767,28 +896,50 @@ func (ui *gioUI) handleHotkeys(gtx layout.Context, pState string) {
 	pass.Pop()
 	for {
 		ev, ok := gtx.Event(
+			key.Filter{Name: key.NameEscape},
 			key.Filter{Name: key.NameReturn, Required: key.ModCtrl},
 			key.Filter{Name: key.NameEnter, Required: key.ModCtrl},
+			key.Filter{Name: "K", Required: key.ModCtrl},
 			key.Filter{Name: "F", Required: key.ModCtrl},
 			key.Filter{Name: "1", Required: key.ModCtrl},
 			key.Filter{Name: "2", Required: key.ModCtrl},
 			key.Filter{Name: "3", Required: key.ModCtrl},
 			key.Filter{Name: "4", Required: key.ModCtrl},
 			key.Filter{Name: "5", Required: key.ModCtrl},
+			key.Filter{Name: "6", Required: key.ModCtrl},
+			key.Filter{Name: "7", Required: key.ModCtrl},
+			key.Filter{Name: "8", Required: key.ModCtrl},
+			key.Filter{Name: "9", Required: key.ModCtrl},
 		)
 		if !ok {
 			break
 		}
 		ke, ok := ev.(key.Event)
-		if !ok || ke.State != key.Press || !ke.Modifiers.Contain(key.ModCtrl) {
+		if !ok || ke.State != key.Press {
+			continue
+		}
+		if ke.Name == key.NameEscape {
+			if ui.paletteOpen {
+				ui.paletteOpen = false
+			}
+			continue
+		}
+		if !ke.Modifiers.Contain(key.ModCtrl) {
 			continue
 		}
 		switch ke.Name {
-		case "1", "2", "3", "4", "5":
+		case "K", "k":
+			ui.paletteOpen = !ui.paletteOpen
+			if ui.paletteOpen {
+				ui.paletteEditor.SetText("")
+				gtx.Execute(key.FocusCmd{Tag: &ui.paletteEditor})
+			}
+		case "1", "2", "3", "4", "5", "6", "7", "8", "9":
 			idx := int(ke.Name[0] - '1')
 			if idx >= 0 && idx < len(navTitles) {
 				ui.tab = idx
-				go ui.fetchAll(true)
+				ui.paletteOpen = false
+				safeGo("gioUI.handleHotkeys", func() { ui.fetchAll(true) })
 			}
 		case key.NameReturn, key.NameEnter:
 			ui.togglePower(pState)
@@ -807,10 +958,12 @@ func (ui *gioUI) handleHotkeys(gtx layout.Context, pState string) {
 				}
 			case 2:
 				gtx.Execute(key.FocusCmd{Tag: &ui.streamSearchEditor})
-			case 4:
-				if ui.subTabs[4] == 2 {
-					gtx.Execute(key.FocusCmd{Tag: &ui.diagEditor})
-				}
+			case 3:
+				gtx.Execute(key.FocusCmd{Tag: &ui.countrySearchEditor})
+			case 6:
+				gtx.Execute(key.FocusCmd{Tag: &ui.diagEditor})
+			case 8:
+				gtx.Execute(key.FocusCmd{Tag: &ui.logSearchEditor})
 			}
 		}
 	}
@@ -836,7 +989,7 @@ func (ui *gioUI) submitListForm(confirmTrust bool) {
 		"content":       content,
 		"confirm_trust": confirmTrust,
 	}
-	go func() {
+	safeGo("gioUI.submitListForm", func() {
 		method := "POST"
 		path := "/api/lists"
 		if ui.listEditID != "" {
@@ -876,7 +1029,7 @@ func (ui *gioUI) submitListForm(confirmTrust bool) {
 		ui.queueEditorText(&ui.listContentEditor, "")
 		ui.setToast("Список сохранён", false)
 		ui.fetchAll(true)
-	}()
+	})
 }
 
 func (ui *gioUI) handleEvents(gtx layout.Context) {
@@ -890,22 +1043,29 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 		if ui.navBtns[i].Clicked(gtx) {
 			ui.tab = i
 			ui.pipePopup = 0
-			go ui.fetchAll(true)
+			safeGo("gioUI.handleEvents", func() { ui.fetchAll(true) })
 		}
 	}
 	for tIdx := range ui.subTabBtns {
 		for sIdx := range ui.subTabBtns[tIdx] {
 			if ui.subTabBtns[tIdx][sIdx].Clicked(gtx) {
 				ui.subTabs[tIdx] = sIdx
-				go ui.fetchAll(true)
+				safeGo("gioUI.handleEvents#2", func() { ui.fetchAll(true) })
 			}
 		}
 	}
+	if ui.sidebarToggleBtn.Clicked(gtx) {
+		ui.sidebarCollapsed = !ui.sidebarCollapsed
+	}
+	if ui.paletteBtn.Clicked(gtx) {
+		ui.paletteOpen = true
+		ui.paletteEditor.SetText("")
+		gtx.Execute(key.FocusCmd{Tag: &ui.paletteEditor})
+	}
 	if ui.allCountriesBtn.Clicked(gtx) {
 		ui.tab = 3
-		ui.subTabs[3] = 0
 		ui.pipePopup = 0
-		go ui.fetchAll(true)
+		safeGo("gioUI.handleEvents#3", func() { ui.fetchAll(true) })
 	}
 	if ui.pipeCaptureBtn.Clicked(gtx) {
 		if ui.pipePopup == 1 {
@@ -915,15 +1075,11 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 		}
 	}
 	if ui.pipeWarpBtn.Clicked(gtx) {
-		ui.pipePopup = 0
-		on, _ := st["warp_on"].(bool)
-		act := "on"
-		if on {
-			act = "off"
+		if ui.pipePopup == 3 {
+			ui.pipePopup = 0
+		} else {
+			ui.pipePopup = 3
 		}
-		ui.doAsync("Подложка Cloudflare WARP: "+act, func() (map[string]any, error) {
-			return ui.apiCall("POST", "/api/warp/"+act, nil)
-		})
 	}
 	if ui.pipePsiBtn.Clicked(gtx) {
 		if ui.pipePopup == 2 {
@@ -972,21 +1128,19 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 			return ui.apiCall("POST", "/api/pause", map[string]any{"minutes": 15})
 		})
 	}
+	if ui.pause30Btn.Clicked(gtx) {
+		ui.doAsync("Защита поставлена на паузу на 30 минут", func() (map[string]any, error) {
+			return ui.apiCall("POST", "/api/pause", map[string]any{"minutes": 30})
+		})
+	}
+	if ui.pause60Btn.Clicked(gtx) {
+		ui.doAsync("Защита поставлена на паузу на 60 минут", func() (map[string]any, error) {
+			return ui.apiCall("POST", "/api/pause", map[string]any{"minutes": 60})
+		})
+	}
 	if ui.pauseResumeBtn.Clicked(gtx) {
 		ui.doAsync("Пауза снята — защита возобновлена", func() (map[string]any, error) {
 			return ui.apiCall("POST", "/api/pause", map[string]any{"minutes": 0})
-		})
-	}
-	if ui.themeToggleBtn.Clicked(gtx) {
-		nextTheme := "cyber-amber"
-		title := "Cyber-Amber (Терминал СССР)"
-		if ui.pal.themeID == "cyber-amber" {
-			nextTheme = "obsidian"
-			title = "Tactical Glass (Obsidian Dark)"
-		}
-		ui.pal = paletteByTheme(nextTheme)
-		ui.doAsync("Тема оформления: "+title, func() (map[string]any, error) {
-			return ui.apiCall("POST", "/api/settings", map[string]any{"general.ui_theme": nextTheme})
 		})
 	}
 	if ui.privacyBtn.Clicked(gtx) {
@@ -1044,14 +1198,67 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 	if ui.moreMenuBtn.Clicked(gtx) {
 		ui.homeMenuOpen = !ui.homeMenuOpen
 	}
+	if ui.resetStackBtn.Clicked(gtx) {
+		ui.doAsync("Reset Stack: сетевой стек и DNS сброшены", func() (map[string]any, error) {
+			return ui.apiCall("POST", "/api/stack/reset", nil)
+		})
+	}
+	if ui.cleanChainToggleBtn.Clicked(gtx) {
+		cc, _ := st["clean_chain"].(map[string]any)
+		on, _ := cc["enabled"].(bool)
+		ui.doAsync("Каскад Clean-IP: "+onOffRu(!on), func() (map[string]any, error) {
+			return ui.apiCall("POST", "/api/clean-chain/toggle", map[string]any{"enabled": !on})
+		})
+	}
+	if ui.leakTestBtn.Clicked(gtx) {
+		ui.doAsync("Тест утечек выполнен", func() (map[string]any, error) {
+			res, err := ui.apiCall("POST", "/api/leaktest", nil)
+			if err == nil && res != nil {
+				ui.mu.Lock()
+				ui.leakRes = res
+				ui.mu.Unlock()
+			}
+			return res, err
+		})
+	}
+	for i := range ui.blockCountryBtns {
+		if i < len(nativeCountries) && nativeCountries[i] != "" && ui.blockCountryBtns[i].Clicked(gtx) {
+			cc := nativeCountries[i]
+			ui.doAsync("Чёрный список стран: "+cc, func() (map[string]any, error) {
+				return ui.apiCall("POST", "/api/psi/blocked-countries", map[string]any{"country": cc})
+			})
+		}
+	}
+	if ui.verifyCleanBtn.Clicked(gtx) {
+		ui.doAsync("Проверка связки WARP → Psiphon → WARP запущена…", func() (map[string]any, error) {
+			return ui.apiCall("POST", "/api/clean-chain/verify", nil)
+		})
+	}
+	if ui.cleanAutoChainBtn.Clicked(gtx) {
+		cc, _ := st["clean_chain"].(map[string]any)
+		on, _ := cc["auto_chain"].(bool)
+		ui.doAsync("Auto-Chain (адаптивный входной WARP): "+onOffRu(!on), func() (map[string]any, error) {
+			return ui.apiCall("POST", "/api/clean-chain/toggle", map[string]any{"auto_chain": !on})
+		})
+	}
+	ksModes := [3]string{"off", "auto", "strict"}
+	ksLabels := [3]string{"Выкл", "Авто (при обрыве)", "Строгий (WFP)"}
+	for i := range ui.ksModeBtns {
+		if ui.ksModeBtns[i].Clicked(gtx) {
+			m, lbl := ksModes[i], ksLabels[i]
+			ui.doAsync("WFP Kill Switch: "+lbl, func() (map[string]any, error) {
+				return ui.apiCall("POST", "/api/settings", map[string]any{"routing.kill_switch_mode": m})
+			})
+		}
+	}
 	if ui.webBtn.Clicked(gtx) {
 		openBrowser(ui.apiBase + "/")
 	}
 	if ui.quitBtn.Clicked(gtx) {
-		go func() {
+		safeGo("gioUI.handleEvents#4", func() {
 			_, _ = ui.apiCall("POST", "/api/quit", nil)
 			os.Exit(0)
-		}()
+		})
 	}
 
 	if ui.powerBtn.Clicked(gtx) {
@@ -1078,14 +1285,19 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 		ui.homeMenuOpen = false
 		ui.doAsync("Замеряю скорость туннеля (до 10 с)…", func() (map[string]any, error) {
 			res, err := ui.apiCall("POST", "/api/psi/speedtest", nil)
-			if err == nil && res["ok"] == true {
-				ui.setToast(fmt.Sprintf("Скорость: %.0f КБ/с, пинг %.0f мс (%v)", res["kbps"], res["ms"], res["region"]), false)
+			if err == nil && res != nil {
+				ui.mu.Lock()
+				ui.speedTestRes = res
+				ui.mu.Unlock()
+				if res["ok"] == true {
+					ui.setToast(fmt.Sprintf("Скорость: %.0f КБ/с, пинг %.0f мс (%v)", res["kbps"], res["ms"], res["region"]), false)
+				}
 			}
 			return res, err
 		})
 	}
 
-	homeObs := [5]string{obDirect, obDesync, obWarp, obPsiphon, obBlock}
+	homeObs := [6]string{obDirect, obDesync, obWarp, obPsiphon, obCleanIP, obBlock}
 	for i := range ui.homeRuleObBtns {
 		if ui.homeRuleObBtns[i].Clicked(gtx) {
 			ui.homeRuleOb = homeObs[i]
@@ -1102,7 +1314,7 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 				}
 				q = "/api/route?host=example.com&port=443&app=" + url.QueryEscape(exe)
 			}
-			go func() {
+			safeGo("gioUI.handleEvents#5", func() {
 				res, err := ui.apiCall("GET", q, nil)
 				if err == nil && res != nil {
 					badge, _ := res["badge"].(string)
@@ -1118,7 +1330,7 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 						ui.w.Invalidate()
 					}
 				}
-			}()
+			})
 		}
 	}
 	if ui.homeRuleAddBtn.Clicked(gtx) {
@@ -1162,6 +1374,21 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 
 	// Включение/выключение Системного прокси и TUN изменяет только режим перехвата трафика,
 	// не затрагивая Routing.Mode.
+	if ui.autostartBtn.Clicked(gtx) {
+		on, _ := st["autostart_on"].(bool)
+		act := "on"
+		if on {
+			act = "off"
+		}
+		ui.doAsync("Автозапуск: "+act, func() (map[string]any, error) {
+			return ui.apiCall("POST", "/api/autostart/"+act, nil)
+		})
+	}
+	if ui.ackCorruptBtn.Clicked(gtx) {
+		ui.doAsync("Предупреждение о конфигурации подтверждено", func() (map[string]any, error) {
+			return ui.apiCall("POST", "/api/config/ack-corrupt", nil)
+		})
+	}
 	if ui.sysProxyBtn.Clicked(gtx) {
 		on, _ := st["sysproxy"].(bool)
 		act := "on"
@@ -1187,10 +1414,10 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 		ui.doAsync("Перезапуск от имени администратора для включения TUN…", func() (map[string]any, error) {
 			res, err := ui.apiCall("POST", "/api/tun/elevate", map[string]any{})
 			if err == nil && res != nil && res["restarting"] == true {
-				go func() {
+				safeGo("gioUI.handleEvents#6", func() {
 					time.Sleep(300 * time.Millisecond)
 					os.Exit(0)
-				}()
+				})
 			}
 			return res, err
 		})
@@ -1316,7 +1543,10 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 	if ui.selftestBtn.Clicked(gtx) {
 		ui.doAsync("Выполняется самопроверка…", func() (map[string]any, error) {
 			res, err := ui.apiCall("POST", "/api/selftest", nil)
-			if err == nil {
+			if err == nil && res != nil {
+				ui.mu.Lock()
+				ui.selftestRes = res
+				ui.mu.Unlock()
 				ui.setToast("Самопроверка успешно завершена", false)
 			}
 			return res, err
@@ -1358,7 +1588,7 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 	}
 	if ui.listPreviewBtn.Clicked(gtx) {
 		content := ui.listContentEditor.Text()
-		go func() {
+		safeGo("gioUI.handleEvents#7", func() {
 			res, err := ui.apiCall("POST", "/api/lists/preview", map[string]any{"content": content})
 			if err == nil && res != nil {
 				ui.mu.Lock()
@@ -1368,7 +1598,7 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 					ui.w.Invalidate()
 				}
 			}
-		}()
+		})
 	}
 	if ui.listSaveBtn.Clicked(gtx) {
 		ui.submitListForm(false)
@@ -1416,7 +1646,7 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 		}
 	}
 	if ui.appRefreshBtn.Clicked(gtx) {
-		go ui.fetchAll(true)
+		safeGo("gioUI.handleEvents#8", func() { ui.fetchAll(true) })
 	}
 
 	// Rule builder events (dynamically includes user's favorite countries)
@@ -1571,7 +1801,7 @@ func (ui *gioUI) handleEvents(gtx layout.Context) {
 			})
 		}
 	}
-	maskIDs := [5]string{"auto", "quic", "masque", "bwg", "dns"}
+	maskIDs := [5]string{"quic", "masque", "bwg", "dns", "off"}
 	for i := range ui.warpMaskBtns {
 		if ui.warpMaskBtns[i].Clicked(gtx) {
 			mid := maskIDs[i]

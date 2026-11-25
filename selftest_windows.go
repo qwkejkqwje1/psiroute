@@ -13,7 +13,10 @@ import (
 	"syscall"
 	"time"
 
+	"sync/atomic"
+
 	"golang.org/x/sys/windows/registry"
+	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 )
 
 var (
@@ -166,9 +169,30 @@ func allowForeground(pid int) {
 	}
 }
 
-// platformNetNotify: NotifyAddrChange blocks until an IPv4 address changes.
+// platformNetNotify watches Windows IP address and route table changes using
+// NotifyRouteChange2 (winipcfg.RegisterRouteChangeCallback) plus NotifyAddrChange
+// fallback, avoiding polling delays on Wi-Fi/gateway switches.
 func platformNetNotify(ctx context.Context, w *netWatch) {
+	var lastKick atomic.Int64
+	cb, err := winipcfg.RegisterRouteChangeCallback(func(notificationType winipcfg.MibNotificationType, route *winipcfg.MibIPforwardRow2) {
+		if ctx.Err() != nil {
+			return
+		}
+		now := time.Now().UnixMilli()
+		prev := lastKick.Load()
+		if now-prev < 400 || !lastKick.CompareAndSwap(prev, now) {
+			return
+		}
+		if tunActive.Load() {
+			_ = refreshPhys()
+		}
+		w.Kick("route")
+	})
+	if err == nil && cb != nil {
+		defer cb.Unregister()
+	}
 	if procNotifyAddrChange.Find() != nil {
+		<-ctx.Done()
 		return
 	}
 	for ctx.Err() == nil {
@@ -183,6 +207,9 @@ func platformNetNotify(ctx context.Context, w *netWatch) {
 			case <-time.After(30 * time.Second):
 			}
 			continue
+		}
+		if tunActive.Load() {
+			_ = refreshPhys()
 		}
 		w.Kick("net")
 	}

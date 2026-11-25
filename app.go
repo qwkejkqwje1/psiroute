@@ -40,7 +40,10 @@ type App struct {
 
 	lists     *Lists
 	countries *Countries
-	warp      *Warp // built-in WARP for Psiphon «Через WARP»
+	warp       *Warp          // built-in WARP for Psiphon «Через WARP»
+	cleanChain *CleanChain    // WARP -> VPN -> WARP clean exit IP cascade (clean-ip)
+	fsm        *CoreFSM       // strict core finite state machine + UI snapshot bus
+	wfp        *wfpKillSwitch // OS-level Windows Filtering Platform Kill Switch
 
 	proxyLn net.Listener
 	uiLn    net.Listener
@@ -198,7 +201,10 @@ func NewApp(ctx context.Context, cancel context.CancelFunc, cfgPath, dataDir str
 	a.setupDPIAutoTune()
 	a.lists = newLists(a, filepath.Join(dataDir, "lists"))
 	a.countries = newCountries(a)
+	a.fsm = newCoreFSM()
+	a.wfp = newWFPKillSwitch(dataDir)
 	a.warp = newWarp(a, dataDir)
+	a.cleanChain = newCleanChain(a, dataDir)
 	a.net = newNetWatch(a)
 	theNetWatch = a.net
 	b := make([]byte, 16)
@@ -358,6 +364,7 @@ func (a *App) Start() error {
 
 	// Stage 5 Crash Recovery: inspect psiroute.session.lock from any previous unclean exit.
 	recoverDirtySession(a.dataDir, a.cfg)
+	a.wfp.CleanupOrphans()
 	if !sys {
 		if stale := systemProxyOwnedBy(a.cfg.General.Listen, listen); stale {
 			if err := setSystemProxy(listen, false); err == nil {
@@ -365,10 +372,18 @@ func (a *App) Start() error {
 			}
 		}
 	}
+	if !sys {
+		if dead := clearDeadLoopbackProxy(a.cfg.General.Listen, listen); dead != "" {
+			logf("warn", "Обнаружен мёртвый системный прокси другого VPN (%s) — автоматически отключён", dead)
+		}
+	}
 	writeSessionLock(a.dataDir, listen, sys, a.cfg.tunWanted())
-	go a.serveProxy(ln, nil)
+	if !isRunningTests() {
+		safeGo("autostart-state", func() { refreshAutostartCache() })
+	}
+	safeLoop(a.ctx, "локальный прокси", func() { a.serveProxy(ln, nil) })
 	if uiLn != nil {
-		go a.serveUI(uiLn)
+		safeLoop(a.ctx, "веб-панель", func() { a.serveUI(uiLn) })
 	}
 	goLoop(a.ctx, "основной цикл", a.loop)
 	if share {
@@ -424,7 +439,10 @@ func (a *App) Shutdown() {
 	a.stopProbe()
 	a.countries.StopAll()
 	a.psi.Stop()
+	a.cleanChain.Close()
 	a.warp.Close()
+	a.wfp.Close()
+	a.fsm.Transition(CoreIdle, StageNone, "")
 	for _, l := range []net.Listener{a.proxyLn, a.uiLn} {
 		if l != nil {
 			l.Close()
@@ -537,7 +555,7 @@ func (a *App) reloadConfig() {
 	}
 	if string(before) != string(after) && a.psi.running() {
 		logf("info", "Настройки Psiphon изменились — переподключаюсь")
-		go a.psi.Restart()
+		safeGo("App.reloadConfig", a.psi.Restart)
 	}
 }
 
@@ -550,7 +568,9 @@ func (a *App) setSysProxy(on bool) error {
 	a.sysOn = on
 	a.mu.Unlock()
 	a.cfg.setKey("general.system_proxy", on)
-	_ = a.cfg.save()
+	if serr := a.cfg.saveOrReport("setSysProxy"); serr != nil {
+		return saveFailed(serr)
+	}
 	if on {
 		logf("info", "Системный прокси включён: %s", l)
 	} else {
@@ -567,12 +587,65 @@ func (a *App) ConnectVPN() {
 	if a.IsPaused() {
 		a.SetPause(0)
 	}
+	if a.fsm != nil {
+		a.fsm.Transition(CoreBootstrapping, StageBootstrap, "Запуск подключения")
+	}
 	if a.psi != nil {
 		a.psi.Start()
 	}
 	if a.router != nil {
 		a.router.InvalidateRules()
 	}
+	a.syncWFPKillSwitch()
+}
+
+// syncWFPKillSwitch synchronizes Windows Filtering Platform Kill Switch rules
+// with the configured kill_switch_mode and active tunnel state.
+func (a *App) syncWFPKillSwitch() {
+	if a == nil || a.wfp == nil || a.cfg == nil {
+		return
+	}
+	a.cfg.mu.Lock()
+	mode := normalizeKillSwitchMode(a.cfg.Routing.KillSwitchMode, a.cfg.Routing.KillSwitch)
+	a.cfg.mu.Unlock()
+	vpnUp := a.psi != nil && (a.psi.running() || a.psi.cur.Load() != nil)
+	userStopped := a.psi != nil && a.psi.isUserStopped()
+	tunOn := tunActive.Load()
+	a.wfp.Sync(mode, vpnUp, userStopped, tunOn)
+}
+
+// ResetStack performs an emergency full network stack reset from the Status Bar:
+// flushes DNS/FakeIP lookup caches, resets Clean-IP and Psiphon tunnels,
+// rebinds physical NIC routes in TUN, and updates the CoreFSM.
+func (a *App) ResetStack() {
+	if a == nil {
+		return
+	}
+	logf("warn", "Reset Stack: экстренный сброс сетевого стека")
+	if a.fsm != nil {
+		a.fsm.Transition(CoreReconnecting, StageBootstrap, "Экстренный сброс стека")
+	}
+	theDNS.clear()
+	if dead := clearDeadLoopbackProxy(a.listenAddr()); dead != "" {
+		logf("warn", "Reset Stack: отключён мёртвый системный прокси другого VPN (%s)", dead)
+	}
+	if a.cleanChain != nil {
+		a.cleanChain.Close()
+	}
+	if a.countries != nil {
+		a.countries.StopAll()
+	}
+	if a.router != nil {
+		a.router.InvalidateRules()
+	}
+	a.tun.refresh()
+	if a.psi != nil {
+		a.psi.ResetStrategyMemory()
+	}
+	if a.psi != nil && !a.psi.isUserStopped() {
+		safeGo("App.ResetStack", a.psi.Restart)
+	}
+	a.syncWFPKillSwitch()
 }
 
 // DisconnectVPN полностью отключает VPN-соединение по кнопке Пуск:
@@ -583,12 +656,22 @@ func (a *App) DisconnectVPN() int {
 	if a == nil {
 		return 0
 	}
+	if a.fsm != nil {
+		a.fsm.Transition(CoreStopping, StageNone, "Отключение пользователем")
+	}
+	if a.cleanChain != nil {
+		a.cleanChain.Close()
+	}
 	if a.psi != nil {
 		a.psi.Stop()
 	}
 	if a.countries != nil {
 		a.countries.StopAll()
 	}
+	if a.fsm != nil {
+		a.fsm.Transition(CoreIdle, StageNone, "Отключено пользователем")
+	}
+	a.syncWFPKillSwitch()
 	if a.router != nil {
 		a.router.InvalidateRules()
 	}
@@ -667,6 +750,7 @@ func (a *App) stateCompact(compact bool) map[string]any {
 	bypassLAN := a.cfg.Routing.BypassLAN
 	blockQUIC := a.cfg.Routing.BlockQUIC
 	killSwitch := a.cfg.Routing.KillSwitch
+	killSwitchMode := normalizeKillSwitchMode(a.cfg.Routing.KillSwitchMode, killSwitch)
 	blockSTUN := a.cfg.Routing.BlockSTUN
 	fakeIP := a.cfg.Tun.FakeIP
 	singleCountry := a.cfg.Psiphon.SingleProcessCountries
@@ -677,6 +761,7 @@ func (a *App) stateCompact(compact bool) map[string]any {
 	uiMode := a.cfg.General.UIMode
 	uiTheme := a.cfg.General.UITheme
 	favCountries := append([]string(nil), a.cfg.Psiphon.FavoriteCountries...)
+	blockedCountries := append([]string(nil), a.cfg.Psiphon.BlockedCountries...)
 	cfgErr := a.cfg.corruptErr
 	cfgBackup := a.cfg.corruptBackup
 	a.cfg.mu.Unlock()
@@ -703,7 +788,8 @@ func (a *App) stateCompact(compact bool) map[string]any {
 		"version": version, "mode": mode, "listen": listen, "ui": ui, "sysproxy": sys,
 		"share_on": shareOn, "dns_on": dnsOn, "local_dns_on": localDNSOn, "local_dns_addr": localDNSAddr,
 		"warp_on": warpOn, "warp_mask": warpMask, "bypass_lan": bypassLAN, "block_quic": blockQUIC,
-		"kill_switch": killSwitch, "block_stun": blockSTUN, "fake_ip": fakeIP,
+		"kill_switch": killSwitch, "kill_switch_mode": killSwitchMode, "block_stun": blockSTUN, "fake_ip": fakeIP,
+		"fsm": a.fsm.View(), "wfp": a.wfp.View(), "clean_chain": a.cleanChain.View(),
 		"single_process_countries": singleCountry, "fakeip_count": theFakeIP.count(), "ui_mode": uiMode, "ui_theme": uiTheme,
 		"psiphon": a.psi.view(), "psiphon_slots": a.psi.slots(), "warp": a.warp.view(),
 		"stats": a.stats.snapshot(), "history": a.stats.history(),
@@ -711,8 +797,10 @@ func (a *App) stateCompact(compact bool) map[string]any {
 		"mem": memView(), "net": a.net.view(), "panics": panicsCaught.Load(), "crash_restarts": crashRestarts,
 		"udp": map[string]any{"mode": a.udpMode(), "sessions": udpStats.sessions.Load(), "flows": udpStats.flows.Load(), "quic_desync_sent": quicDesyncSent.Load()},
 		"tun": a.tun.view(), "obfs": a.obfsView(),
-		"countries": a.countries.Status(), "favorite_countries": favCountries,
+		"countries": a.countries.Status(), "favorite_countries": favCountries, "blocked_countries": blockedCountries,
+		"proxy_always_on": true, "proxy_socks5": "socks5://" + listen, "proxy_http": "http://" + listen,
 		"config_error": cfgErr, "config_backup": cfgBackup,
+		"autostart_on": autostartCached(), "autostart_warning": autostartWarning(), "failed_components": failedComponentNames(),
 		"probe_running": a.isProbeRunning(),
 		"paused":        a.IsPaused(), "pause_remaining_sec": a.PauseRemainingSec(), "pause_until": a.pauseUntil.Load(),
 	}
@@ -806,7 +894,7 @@ func (a *App) startProbe() error {
 		return fail(err)
 	}
 	logf("info", "Подбор обхода: проверяю варианты (до 8 минут)")
-	go func() {
+	safeGo("App.startProbe", func() {
 		sc := bufio.NewScanner(out)
 		for sc.Scan() {
 			var r probeResult
@@ -832,7 +920,7 @@ func (a *App) startProbe() error {
 		a.probeMu.Unlock()
 		cancel()
 		logf("info", "Подбор обхода завершён")
-	}()
+	})
 	return nil
 }
 
@@ -893,9 +981,11 @@ func (a *App) applyProbe(id string) error {
 		c.Psiphon.Strategies = list
 	}
 	c.mu.Unlock()
-	_ = c.save()
+	if serr := c.saveOrReport("applyProbe"); serr != nil {
+		return saveFailed(serr)
+	}
 	_ = os.Remove(a.psi.file("psiroute-last"))
 	logf("info", "Применён вариант «%s»", found.Name)
-	go a.psi.Restart()
+	safeGo("App.applyProbe", a.psi.Restart)
 	return nil
 }

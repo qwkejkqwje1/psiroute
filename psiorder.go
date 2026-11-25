@@ -30,9 +30,10 @@ const (
 	shortLife                = 2 * time.Minute  // tunnels lost sooner were cut by the network
 	unstableFor              = 6 * time.Hour    // a method cut twice in a row goes last this long
 	cmdGap                   = 20 * time.Second // button presses closer than this are not passed on
-	bestStrategyShortTimeout = 20                // Эшелон 1: 6–8 с на быстрый прямой протокол (OSSH/TLS/QUIC)
-	combinedRaceTimeout      = 35               // Эшелон 1–2: параллельная гонка протоколов (<= 30 с суммарно)
-	tspuEchelonTimeout       = 35               // Эшелон 2: резистентные к ТСПУ транспорты (Meek CDN + Conduit + Desync)
+	bestStrategyShortTimeout = 15                // Как в 2.3.9-fixed (решение Аллы 2026-11-24 по живому опыту): быстрый прямой протокол первого раунда
+	combinedRaceTimeout      = 25               // Как в 2.3.9-fixed: параллельная гонка протоколов первого раунда
+	tspuEchelonTimeout       = 25               // Как в 2.3.9-fixed: ТСПУ-эшелон первого раунда
+	minSeedOrRSLTimeout      = 35               // Пол при пустой базе сидов / загрузке RSL = бюджет раунда 0; идущую загрузку списка дополнительно прикрывает rslGrace в attemptOnce
 	maxStatSamples           = 15               // rolling window for median calculation
 )
 
@@ -56,6 +57,32 @@ type strategyMemoryFile struct {
 // attemptTimeout is the time one method gets before the next one is tried:
 // the first round goes over all methods quickly, later rounds give more.
 func attemptTimeout(round int) int { return []int{35, 75, 150}[min(max(round, 0), 2)] }
+
+// buildStagedUnionProtocols builds the Stage 2 protocol union for one long-lived controller:
+// always fronted meek + TLS-OSSH + OSSH; QUIC only if preflight confirms UDP; Conduit/in-proxy
+// only when tactics have been received.
+func buildStagedUnionProtocols(udpReachable, tacticsApplied bool) []string {
+	seen := map[string]bool{}
+	var out []string
+	addSet := func(key string) {
+		for _, pr := range psiProtoSets[key] {
+			if !seen[pr] {
+				seen[pr] = true
+				out = append(out, pr)
+			}
+		}
+	}
+	addSet("meek")
+	addSet("tls")
+	addSet("ossh")
+	if udpReachable {
+		addSet("quic")
+	}
+	if tacticsApplied {
+		addSet("conduit")
+	}
+	return out
+}
 
 // userCmd passes a button press (next method, new node) on to the engine
 // unless the previous press or the start of the attempt was less than
@@ -348,6 +375,11 @@ func (p *Psi) buildRoundZeroPlan(ordered []strategyDef) []strategyDef {
 	if len(ordered) <= 1 {
 		return ordered
 	}
+	// Rocky patch (2026-11-21): the forced promotion of a direct/desync
+	// strategy ahead of via-warp is removed. On the user's network the
+	// direct+desync path is dead (100% desync errors), so the promotion
+	// burned the first round on a dead path and starved the working
+	// via-warp strategy. The configured/learned order is now respected.
 	first := ordered[0]
 	var restDirect []strategyDef
 	var separateTransport []strategyDef
@@ -443,4 +475,17 @@ func (p *Psi) markUnstable(id string, on bool) {
 	if p.dataDir != "" {
 		_ = writeFileAtomic(p.file("psiroute-unstable.json"), b, 0o600)
 	}
+}
+
+// ResetStrategyMemory clears persisted per-network strategy scores so direct/DPI
+// strategies are retried cleanly without historical WARP bias.
+func (p *Psi) ResetStrategyMemory() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.stratMem = &strategyMemoryFile{Networks: map[string]map[string]*strategyNetStats{}}
+	p.saveStratMemLocked()
+	p.mu.Unlock()
+	_ = os.Remove(p.file("psiroute-last"))
 }

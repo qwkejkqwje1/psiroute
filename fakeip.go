@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -111,8 +112,22 @@ type fakeIPPool struct {
 	byAddr map[netip.Addr]*fakeEntry
 }
 
+// randomFakeIPStart picks a random starting IP in 198.19.16.1..198.19.240.0
+// (upper half of 198.18.0.0/15), avoiding 198.18.0.x used by Clash/Sing-box/v2rayN/Amnezia.
+func randomFakeIPStart() uint32 {
+	const (
+		hiBase uint32 = 0xc6131001 // 198.19.16.1
+		hiSpan uint32 = 0x0000e000 // ~57,344 addresses before wrap
+	)
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return hiBase
+	}
+	return hiBase + (binary.BigEndian.Uint32(b[:]) % hiSpan)
+}
+
 var theFakeIP = &fakeIPPool{
-	next:   fakeIPBase,
+	next:   randomFakeIPStart(),
 	byHost: map[string]*fakeEntry{},
 	byAddr: map[netip.Addr]*fakeEntry{},
 }
@@ -162,7 +177,7 @@ func (p *fakeIPPool) clear() {
 	p.mu.Lock()
 	p.byHost = map[string]*fakeEntry{}
 	p.byAddr = map[netip.Addr]*fakeEntry{}
-	p.next = fakeIPBase
+	p.next = randomFakeIPStart()
 	p.mu.Unlock()
 }
 
@@ -586,7 +601,9 @@ func (a *App) setLocalDNS(on bool) error {
 			a.dnsUDP = nil
 		}
 		a.cfg.setKey("dns.local_server", false)
-		_ = a.cfg.save()
+		if serr := a.cfg.saveOrReport("setLocalDNS"); serr != nil {
+			return saveFailed(serr)
+		}
 		logf("info", "Локальный DNS-сервер выключен")
 		return nil
 	}
@@ -609,7 +626,12 @@ func (a *App) setLocalDNS(on bool) error {
 	}
 	a.dnsUDP = conn
 	a.cfg.setKey("dns.local_server", true)
-	_ = a.cfg.save()
+	if serr := a.cfg.saveOrReport("setLocalDNS"); serr != nil {
+		_ = conn.Close()
+		a.dnsUDP = nil
+		a.cfg.setKey("dns.local_server", false)
+		return saveFailed(serr)
+	}
 	goSafe("локальный DNS", func() { a.serveLocalDNSUDP(conn) })
 	logf("info", "Локальный DNS-сервер запущен на %s (DoH + FakeIP)", conn.LocalAddr().String())
 	return nil

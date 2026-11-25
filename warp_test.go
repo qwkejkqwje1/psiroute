@@ -380,7 +380,7 @@ func TestWarpSettingsKeys(t *testing.T) {
 	c.Psiphon.Strategies = []string{"quic", "auto"}
 	c.setKey("warp.enabled", true)
 	c.setKey("warp.enabled", true)
-	if got := strings.Join(c.Psiphon.Strategies, ","); got != "via-warp,quic,auto" {
+	if got := strings.Join(c.Psiphon.Strategies, ","); got != "quic,auto,via-warp" {
 		t.Errorf("turning WARP on: %s", got)
 	}
 	c.setKey("warp.mask", "bwg")

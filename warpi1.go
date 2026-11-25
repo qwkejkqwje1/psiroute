@@ -145,28 +145,36 @@ var quicSaltV1 = []byte{0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x
 // quicInitialSize is the size browsers pad their first packet to.
 const quicInitialSize = 1250
 
-func hkdfLabel(secret []byte, label string, n int) []byte {
+func hkdfLabel(secret []byte, label string, n int) ([]byte, error) {
 	info := binary.BigEndian.AppendUint16(nil, uint16(n))
 	full := "tls13 " + label
 	info = append(info, byte(len(full)))
 	info = append(info, full...)
 	info = append(info, 0)
-	out, err := hkdf.Expand(sha256.New, secret, string(info), n)
-	if err != nil {
-		panic(err)
-	}
-	return out
+	return hkdf.Expand(sha256.New, secret, string(info), n)
 }
 
 // quicClientKeys derives the client Initial keys from the destination
 // connection id.
-func quicClientKeys(dcid []byte) (key, iv, hp []byte) {
+func quicClientKeys(dcid []byte) (key, iv, hp []byte, err error) {
 	initial, err := hkdf.Extract(sha256.New, dcid, quicSaltV1)
 	if err != nil {
-		panic(err)
+		return nil, nil, nil, err
 	}
-	client := hkdfLabel(initial, "client in", 32)
-	return hkdfLabel(client, "quic key", 16), hkdfLabel(client, "quic iv", 12), hkdfLabel(client, "quic hp", 16)
+	client, err := hkdfLabel(initial, "client in", 32)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if key, err = hkdfLabel(client, "quic key", 16); err != nil {
+		return nil, nil, nil, err
+	}
+	if iv, err = hkdfLabel(client, "quic iv", 12); err != nil {
+		return nil, nil, nil, err
+	}
+	if hp, err = hkdfLabel(client, "quic hp", 16); err != nil {
+		return nil, nil, nil, err
+	}
+	return key, iv, hp, nil
 }
 
 func quicVarint(b []byte, v uint64) []byte {
@@ -184,7 +192,10 @@ func quicVarint(b []byte, v uint64) []byte {
 // quicSeal encrypts an Initial packet: header ends with the packet number
 // (pnLen bytes, value pn), payload is the plaintext frames.
 func quicSeal(dcid, header []byte, pnLen int, pn uint64, payload []byte) ([]byte, error) {
-	key, iv, hp := quicClientKeys(dcid)
+	key, iv, hp, err := quicClientKeys(dcid)
+	if err != nil {
+		return nil, err
+	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err

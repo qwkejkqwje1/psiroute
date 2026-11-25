@@ -445,7 +445,7 @@ func (s *warpCleanScanner) scanWithProbe(ctx context.Context, targets []string, 
 			break
 		}
 		wg.Add(1)
-		go func(endpoint string) {
+		func(endpoint string) { safeGo("warpCleanScanner.scanWithProbe", func() {
 			defer wg.Done()
 			select {
 			case sem <- struct{}{}:
@@ -459,7 +459,7 @@ func (s *warpCleanScanner) scanWithProbe(ctx context.Context, targets []string, 
 				found = append(found, warpCleanResult{Endpoint: endpoint, RTT: rtt})
 				mu.Unlock()
 			}
-		}(ep)
+		}) }(ep)
 	}
 	wg.Wait()
 	if ctx.Err() != nil {

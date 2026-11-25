@@ -25,6 +25,36 @@ import (
 )
 
 // ---------- Drawing & Widget Helpers ----------
+// maskText masks IPv4 addresses inside s for display (first.*.*.last),
+// leaving other text intact. Restored in the build copy: the author's
+// helper was lost in the 2.3.4 GUI rework, leaving two call sites behind.
+func (ui *gioUI) maskText(s string) string {
+	parts := strings.Split(s, " ")
+	for i, p := range parts {
+		ip := strings.Trim(p, "(),")
+		segs := strings.Split(ip, ".")
+		if len(segs) != 4 {
+			continue
+		}
+		ok := true
+		for _, g := range segs {
+			if g == "" || len(g) > 3 {
+				ok = false
+				break
+			}
+			for _, r := range g {
+				if r < '0' || r > '9' {
+					ok = false
+					break
+				}
+			}
+		}
+		if ok {
+			parts[i] = strings.Replace(p, ip, segs[0]+".*.*."+segs[3], 1)
+		}
+	}
+	return strings.Join(parts, " ")
+}
 
 func fillRect(gtx layout.Context, size image.Point, radius int, fill color.NRGBA) {
 	r := image.Rectangle{Max: size}
@@ -41,8 +71,8 @@ func strokeRect(gtx layout.Context, size image.Point, radius int, width float32,
 func (ui *gioUI) card(gtx layout.Context, inset unit.Dp, content layout.Widget) layout.Dimensions {
 	return layout.Background{}.Layout(gtx,
 		func(gtx layout.Context) layout.Dimensions {
-			rad := gtx.Dp(16)
-			fillRect(gtx, gtx.Constraints.Min, rad, ui.pal.card)
+			rad := gtx.Dp(18)
+			fillGradient(gtx, gtx.Constraints.Min, rad, mix(ui.pal.card, rgb(0xFFFFFF), 0.035), ui.pal.card)
 			strokeRect(gtx, gtx.Constraints.Min, rad, float32(gtx.Dp(1)), ui.pal.border)
 			return layout.Dimensions{Size: gtx.Constraints.Min}
 		},
@@ -55,7 +85,7 @@ func (ui *gioUI) card(gtx layout.Context, inset unit.Dp, content layout.Widget) 
 func (ui *gioUI) subCard(gtx layout.Context, bg, borderCol color.NRGBA, inset unit.Dp, content layout.Widget) layout.Dimensions {
 	return layout.Background{}.Layout(gtx,
 		func(gtx layout.Context) layout.Dimensions {
-			rad := gtx.Dp(8)
+			rad := gtx.Dp(12)
 			fillRect(gtx, gtx.Constraints.Min, rad, bg)
 			strokeRect(gtx, gtx.Constraints.Min, rad, float32(gtx.Dp(1)), borderCol)
 			return layout.Dimensions{Size: gtx.Constraints.Min}
@@ -93,12 +123,15 @@ func (ui *gioUI) segRouteButton(gtx layout.Context, btn *widget.Clickable, txt s
 		bg = tint(solid, 38)
 		textCol = fg
 	}
+	gradSeg := active && style == "primary"
 	return btn.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		pointer.CursorPointer.Add(gtx.Ops)
 		return layout.Background{}.Layout(gtx,
 			func(gtx layout.Context) layout.Dimensions {
-				if bg.A > 0 {
-					fillRect(gtx, gtx.Constraints.Min, gtx.Dp(6), bg)
+				if gradSeg {
+					fillGradient(gtx, gtx.Constraints.Min, gtx.Dp(9), ui.pal.acc, ui.pal.acc2)
+				} else if bg.A > 0 {
+					fillRect(gtx, gtx.Constraints.Min, gtx.Dp(9), bg)
 				}
 				return layout.Dimensions{Size: gtx.Constraints.Min}
 			},
@@ -133,7 +166,7 @@ func (ui *gioUI) flagButton(gtx layout.Context, btn *widget.Clickable, cc, txt s
 		pointer.CursorPointer.Add(gtx.Ops)
 		return layout.Background{}.Layout(gtx,
 			func(gtx layout.Context) layout.Dimensions {
-				rad := gtx.Dp(8)
+				rad := gtx.Dp(11)
 				fillRect(gtx, gtx.Constraints.Min, rad, bg)
 				strokeRect(gtx, gtx.Constraints.Min, rad, float32(gtx.Dp(1)), bdr)
 				return layout.Dimensions{Size: gtx.Constraints.Min}
@@ -190,11 +223,20 @@ func (ui *gioUI) iconButton(gtx layout.Context, btn *widget.Clickable, icon, txt
 			bdr = fg
 		}
 	}
+	gradBtn := style == "primary"
+	g1, g2 := ui.pal.acc, ui.pal.acc2
+	if gradBtn && btn.Hovered() {
+		g1, g2 = mix(g1, rgb(0xFFFFFF), 0.12), mix(g2, rgb(0xFFFFFF), 0.12)
+	}
 	return btn.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		pointer.CursorPointer.Add(gtx.Ops)
 		return layout.Background{}.Layout(gtx,
 			func(gtx layout.Context) layout.Dimensions {
-				rad := gtx.Dp(8)
+				rad := gtx.Dp(11)
+				if gradBtn {
+					fillGradient(gtx, gtx.Constraints.Min, rad, g1, g2)
+					return layout.Dimensions{Size: gtx.Constraints.Min}
+				}
 				fillRect(gtx, gtx.Constraints.Min, rad, bg)
 				strokeRect(gtx, gtx.Constraints.Min, rad, float32(gtx.Dp(1)), bdr)
 				return layout.Dimensions{Size: gtx.Constraints.Min}
@@ -384,6 +426,9 @@ func (ui *gioUI) routeBadge(gtx layout.Context, ob string) layout.Dimensions {
 	case ob == obWarp:
 		bg, fg = ui.pal.warnSoft, ui.pal.warn
 		title = "WARP"
+	case ob == obCleanIP:
+		bg, fg = ui.pal.cleanSoft, ui.pal.clean
+		title = "Clean-IP"
 	case ob == obPsiphon || strings.HasPrefix(ob, "psiphon:"):
 		bg, fg = ui.pal.vioSoft, ui.pal.vio
 		if ob == obPsiphon {
@@ -612,10 +657,10 @@ func (ui *gioUI) heroCard(gtx layout.Context, accent color.NRGBA, content layout
 	gtx.Constraints.Min.X = gtx.Constraints.Max.X
 	return layout.Background{}.Layout(gtx,
 		func(gtx layout.Context) layout.Dimensions {
-			rad := gtx.Dp(16)
+			rad := gtx.Dp(22)
 			sz := gtx.Constraints.Min
-			fillGradient(gtx, sz, rad, mix(ui.pal.card, accent, 0.14), ui.pal.card)
-			strokeRect(gtx, sz, rad, float32(gtx.Dp(1)), mix(ui.pal.border, accent, 0.35))
+			fillGradient(gtx, sz, rad, mix(ui.pal.card, accent, 0.22), mix(ui.pal.card, ui.pal.acc2, 0.04))
+			strokeRect(gtx, sz, rad, float32(gtx.Dp(1)), mix(ui.pal.border, accent, 0.5))
 			return layout.Dimensions{Size: sz}
 		},
 		func(gtx layout.Context) layout.Dimensions {
@@ -648,16 +693,14 @@ func (ui *gioUI) statusPill(gtx layout.Context, pState string) layout.Dimensions
 }
 
 func (ui *gioUI) drawSwitch(gtx layout.Context, on bool) layout.Dimensions {
-	w, h := gtx.Dp(36), gtx.Dp(20)
-	track := ui.pal.hover
+	w, h := gtx.Dp(40), gtx.Dp(22)
 	if on {
-		track = ui.pal.ok
-	}
-	paint.FillShape(gtx.Ops, track, clip.UniformRRect(image.Rect(0, 0, w, h), h/2).Op(gtx.Ops))
-	if !on {
+		fillGradient(gtx, image.Pt(w, h), h/2, ui.pal.acc, ui.pal.acc2)
+	} else {
+		paint.FillShape(gtx.Ops, ui.pal.hover, clip.UniformRRect(image.Rect(0, 0, w, h), h/2).Op(gtx.Ops))
 		strokeRect(gtx, image.Pt(w, h), h/2, float32(gtx.Dp(1)), ui.pal.border)
 	}
-	k := gtx.Dp(14)
+	k := gtx.Dp(16)
 	pad := (h - k) / 2
 	x := pad
 	if on {
@@ -1137,6 +1180,8 @@ func (ui *gioUI) toggleTile(st map[string]any, key string) layout.Widget {
 		return tile(&ui.shareBtn, "lan", "Раздача в сеть (LAN)", "прокси для телефона и ТВ", b("share_on"))
 	case "single":
 		return tile(&ui.singleProcBtn, "chart", "Страны в одном процессе", "экономия ~25 МБ ОЗУ", b("single_process_countries"))
+	case "autostart":
+		return tile(&ui.autostartBtn, "power", "Автозапуск с Windows", "запуск при входе в систему", b("autostart_on"))
 	}
 	return func(gtx layout.Context) layout.Dimensions { return layout.Dimensions{} }
 }
@@ -1184,16 +1229,55 @@ func (ui *gioUI) maintenanceButtons(gtx layout.Context, withQuit bool) layout.Di
 	return flowWrap(gtx, space1, space1, ws...)
 }
 
-// ---------- Main Layout & Responsive Sidebar ----------
+// ---------- Progress Bar & Key-Value Row Helpers ----------
+
+func (ui *gioUI) progressBar(gtx layout.Context, frac float32, col color.NRGBA) layout.Dimensions {
+	if frac < 0 {
+		frac = 0
+	}
+	if frac > 1 {
+		frac = 1
+	}
+	w := gtx.Constraints.Max.X
+	if w <= 0 {
+		w = gtx.Dp(120)
+	}
+	h := gtx.Dp(7)
+	sz := image.Pt(w, h)
+	fillRect(gtx, sz, h/2, ui.pal.hover)
+	fw := int(float32(w) * frac)
+	if fw > 0 {
+		if fw < h {
+			fw = h
+		}
+		fillRect(gtx, image.Pt(fw, h), h/2, col)
+	}
+	return layout.Dimensions{Size: sz}
+}
+
+func (ui *gioUI) kvRow(gtx layout.Context, keyTxt, valTxt string) layout.Dimensions {
+	return layout.Inset{Top: unit.Dp(4), Bottom: unit.Dp(4)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle, Spacing: layout.SpaceBetween}.Layout(gtx,
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return ui.labelLine(gtx, fontSmall, ui.pal.mut, font.Normal, keyTxt)
+			}),
+			layout.Rigid(layout.Spacer{Width: space2}.Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return ui.monoLabel(gtx, fontSmall, ui.pal.text, valTxt)
+			}),
+		)
+	})
+}
+
+// ---------- Main Layout & Aurora Dark 9-Page Responsive Sidebar ----------
 
 func (ui *gioUI) Layout(gtx layout.Context) layout.Dimensions {
 	ui.applyPendingUIUpdates()
-	ui.narrowWindow = gtx.Constraints.Max.X < gtx.Dp(1020)
+	ui.narrowWindow = gtx.Constraints.Max.X < gtx.Dp(980)
 	paint.Fill(gtx.Ops, ui.pal.bg)
 
-	// ВАЖНО (Исправление бага с неработающими кликами в Gio v0.9):
-	// 1. Сначала регистрируем глобальные хоткеи внутри pointer.PassOp{} ДО дерева виджетов,
-	//    чтобы тег &ui.keyTag НИКОГДА не перекрывал мышиный hit-test кнопок поверх окна.
+	// ВАЖНО (Gio v0.9): глобальные хоткеи внутри pointer.PassOp{} ДО дерева виджетов,
+	// чтобы тег &ui.keyTag никогда не перекрывал мышиный hit-test кнопок.
 	ui.mu.Lock()
 	st := ui.state
 	ui.mu.Unlock()
@@ -1201,88 +1285,81 @@ func (ui *gioUI) Layout(gtx layout.Context) layout.Dimensions {
 	pState, _ := psi["state"].(string)
 	ui.handleHotkeys(gtx, pState)
 
-	// 2. Обрабатываем клики по всем кнопкам ДО и ПОСЛЕ построения дерева виджетов,
-	//    чтобы ни одно нажатие не терялось между кадрами.
+	// Обрабатываем события всех основных кнопок
 	ui.handleEvents(gtx)
 
-	sideW := unit.Dp(196)
-	if ui.narrowWindow {
-		sideW = unit.Dp(64)
+	collapsed := ui.sidebarCollapsed || ui.narrowWindow
+	sideW := gtx.Dp(224)
+	if collapsed {
+		sideW = gtx.Dp(64)
 	}
 
-	dims := layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
-		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			w := gtx.Dp(sideW)
-			gtx.Constraints.Min.X = w
-			gtx.Constraints.Max.X = w
-			return ui.layoutSidebar(gtx, ui.narrowWindow)
-		}),
-		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-			return layout.Inset{Top: unit.Dp(12), Bottom: unit.Dp(12), Left: space2, Right: space2}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-				return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-					layout.Rigid(ui.layoutPageHeader),
-					layout.Rigid(ui.layoutToastBanner),
-					layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-						switch ui.tab {
-						case 0:
-							return ui.layoutHomeTab(gtx)
-						case 1:
-							return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-									return ui.layoutSubTabBar(gtx, 1, []string{"Умные правила (Приоритеты 1–4)", "Программы (Split Tunneling)", "Каталог списков и пресетов"})
-								}),
-								layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-									switch ui.subTabs[1] {
-									case 1:
-										return ui.layoutAppsTab(gtx)
-									case 2:
-										return ui.layoutListsStandaloneTab(gtx)
-									default:
-										return ui.layoutRulesTab(gtx)
-									}
-								}),
-							)
-						case 2:
-							// Вкладка «Потоки» активна ТОЛЬКО когда пользователь нажал на неё (ui.tab == 2)
-							return ui.layoutStreamsTab(gtx)
-						case 3:
-							return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-									return ui.layoutSubTabBar(gtx, 3, []string{"Страны, обход DPI и WARP", "Раздача в LAN и устройства"})
-								}),
-								layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-									if ui.subTabs[3] == 1 {
-										return ui.layoutDevicesTab(gtx)
-									}
-									return ui.layoutCountriesDPITab(gtx)
-								}),
-							)
-						default:
-							return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-									return ui.layoutSubTabBar(gtx, 4, []string{"Живой журнал событий", "Настройки сети, DNS и защиты", "Самопроверка и диагностика сайта"})
-								}),
-								layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-									switch ui.subTabs[4] {
-									case 1:
-										return ui.layoutSettingsOnlyTab(gtx)
-									case 2:
-										return ui.layoutTrafficDiagTab(gtx)
-									default:
-										return ui.layoutLiveLogOnlyTab(gtx)
-									}
-								}),
-							)
-						}
-					}),
-				)
-			})
-		}),
+	mainUI := func(gtx layout.Context) layout.Dimensions {
+		return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
+			// Левая навигационная панель (9 разделов, 3 группы)
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				gtx.Constraints.Min.X, gtx.Constraints.Max.X = sideW, sideW
+				gtx.Constraints.Min.Y = gtx.Constraints.Max.Y
+				return ui.layoutSidebar(gtx, collapsed)
+			}),
+			// Основная рабочая область (верхняя панель + тост + содержимое вкладки)
+			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+				return layout.Inset{Top: unit.Dp(10), Bottom: unit.Dp(12), Left: space2, Right: space2}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+						layout.Rigid(ui.layoutAuroraTopBar),
+						layout.Rigid(ui.layoutToastBanner),
+						layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+							switch ui.tab {
+							case 0:
+								return ui.layoutHomeTab(gtx)
+							case 1:
+								return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+									layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+										return ui.layoutSubTabBar(gtx, 1, []string{"Умные правила (Приоритеты 1–4)", "Программы (Split Tunneling)", "Каталог списков и пресетов"})
+									}),
+									layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+										switch ui.subTabs[1] {
+										case 1:
+											return ui.layoutAppsTab(gtx)
+										case 2:
+											return ui.layoutListsStandaloneTab(gtx)
+										default:
+											return ui.layoutRulesTab(gtx)
+										}
+									}),
+								)
+							case 2:
+								return ui.layoutStreamsTab(gtx)
+							case 3:
+								return ui.layoutCountriesTab(gtx)
+							case 4:
+								return ui.layoutBypassTab(gtx)
+							case 5:
+								return ui.layoutDevicesTab(gtx)
+							case 6:
+								return ui.layoutDiagTab(gtx)
+							case 7:
+								return ui.layoutSettingsTab(gtx)
+							default:
+								return ui.layoutLiveLogOnlyTab(gtx)
+							}
+						}),
+					)
+				})
+			}),
+		)
+	}
+
+	if !ui.paletteOpen {
+		return mainUI(gtx)
+	}
+	return layout.Stack{}.Layout(gtx,
+		layout.Expanded(mainUI),
+		layout.Expanded(ui.layoutCommandPalette),
 	)
-	return dims
 }
 
-func (ui *gioUI) layoutPageHeader(gtx layout.Context) layout.Dimensions {
+func (ui *gioUI) layoutAuroraTopBar(gtx layout.Context) layout.Dimensions {
 	ui.mu.Lock()
 	st := ui.state
 	ui.mu.Unlock()
@@ -1297,54 +1374,50 @@ func (ui *gioUI) layoutPageHeader(gtx layout.Context) layout.Dimensions {
 	if tab < 0 || tab >= len(navTitles) {
 		tab = 0
 	}
-	return layout.Inset{Bottom: space2}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
-			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-				return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return ui.labelLine(gtx, fontHero, ui.pal.text, font.Bold, navTitles[tab])
-					}),
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return ui.labelLine(gtx, fontSmall, ui.pal.mut, font.Normal, navHints[tab])
-					}),
-				)
-			}),
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return ui.subCard(gtx, ui.pal.accSoft, tint(ui.pal.acc, 90), unit.Dp(6), func(gtx layout.Context) layout.Dimensions {
-					return ui.monoLabel(gtx, fontSmall, ui.pal.acc, "PsiRoute v"+version)
-				})
-			}),
-			layout.Rigid(layout.Spacer{Width: space1}.Layout),
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return ui.statusPill(gtx, pState)
-			}),
-			layout.Rigid(layout.Spacer{Width: space1}.Layout),
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return ui.copyChip(gtx, "hdr", "Прокси", host+":"+port)
-			}),
-			layout.Rigid(layout.Spacer{Width: space1}.Layout),
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				thmLbl := "Тема: Obsidian"
-				thmStyle := ""
-				if ui.pal.themeID == "cyber-amber" {
-					thmLbl = "Тема: Cyber-Amber"
-					thmStyle = "warn"
-				}
-				return ui.pillButton(gtx, &ui.themeToggleBtn, thmLbl, ui.pal.themeID == "cyber-amber", thmStyle)
-			}),
-			layout.Rigid(layout.Spacer{Width: space1}.Layout),
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				lbl := "Чистый экран"
-				if ui.privacyMode {
-					lbl = "IP скрыты ●"
-				}
-				return ui.pillButton(gtx, &ui.privacyBtn, lbl, ui.privacyMode, "teal")
-			}),
-			layout.Rigid(layout.Spacer{Width: space1}.Layout),
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return ui.iconButton(gtx, &ui.webBtn, "globe", "Веб-панель", false, "")
-			}),
-		)
+
+	return layout.Inset{Bottom: unit.Dp(10)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		gtx.Constraints.Min.X = gtx.Constraints.Max.X
+		return ui.card(gtx, unit.Dp(10), func(gtx layout.Context) layout.Dimensions {
+			return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+				layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+					return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							return ui.labelLine(gtx, fontTitle, ui.pal.text, font.Bold, navTitles[tab])
+						}),
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							return ui.labelLine(gtx, fontMicro, ui.pal.mut, font.Normal, navHints[tab])
+						}),
+					)
+				}),
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return ui.statusPill(gtx, pState)
+				}),
+				layout.Rigid(layout.Spacer{Width: space1}.Layout),
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return ui.copyChip(gtx, "hdr", "Прокси", host+":"+port)
+				}),
+				layout.Rigid(layout.Spacer{Width: space1}.Layout),
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return ui.iconButton(gtx, &ui.paletteBtn, "search", "Ctrl+K", false, "")
+				}),
+				layout.Rigid(layout.Spacer{Width: space1}.Layout),
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					lbl := "Чистый экран"
+					if ui.privacyMode {
+						lbl = "IP скрыты ●"
+					}
+					return ui.pillButton(gtx, &ui.privacyBtn, lbl, ui.privacyMode, "teal")
+				}),
+				layout.Rigid(layout.Spacer{Width: space1}.Layout),
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return ui.pillButton(gtx, &ui.resetStackBtn, "Reset Stack", false, "warn")
+				}),
+				layout.Rigid(layout.Spacer{Width: space1}.Layout),
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return ui.iconButton(gtx, &ui.webBtn, "globe", "Веб", false, "")
+				}),
+			)
+		})
 	})
 }
 
@@ -1359,8 +1432,7 @@ func (ui *gioUI) layoutSidebar(gtx layout.Context, collapsed bool) layout.Dimens
 
 	pState := "stopped"
 	reg := ""
-	var spDown, spUp, memTot, memApp float64
-	tunOn, warpOn := false, false
+	var spDown, spUp, memTot, memApp, liveN float64
 	if st != nil {
 		if psi, ok := st["psiphon"].(map[string]any); ok {
 			if s, ok := psi["state"].(string); ok && s != "" {
@@ -1373,15 +1445,14 @@ func (ui *gioUI) layoutSidebar(gtx layout.Context, collapsed bool) layout.Dimens
 				spDown, _ = spd["down"].(float64)
 				spUp, _ = spd["up"].(float64)
 			}
+			if tot, ok := stats["total"].(map[string]any); ok {
+				liveN, _ = tot["live"].(float64)
+			}
 		}
 		if mem, ok := st["mem"].(map[string]any); ok {
 			memTot, _ = mem["total"].(float64)
 			memApp, _ = mem["app"].(float64)
 		}
-		if tm, ok := st["tun"].(map[string]any); ok {
-			tunOn, _ = tm["on"].(bool)
-		}
-		warpOn, _ = st["warp_on"].(bool)
 	}
 	stCol := ui.statusColor(pState)
 
@@ -1389,20 +1460,20 @@ func (ui *gioUI) layoutSidebar(gtx layout.Context, collapsed bool) layout.Dimens
 		title string
 		tabs  []int
 	}{
-		{"КОМАНДНЫЙ ЦЕНТР", []int{0}},
-		{"МАРШРУТИЗАЦИЯ", []int{1, 2}},
-		{"СЕТЬ И СИСТЕМА", []int{3, 4}},
+		{"УПРАВЛЕНИЕ", []int{0, 1, 2}},
+		{"СЕТЬ", []int{3, 4, 5}},
+		{"СИСТЕМА", []int{6, 7, 8}},
 	}
 
 	renderNavItem := func(idx int) layout.FlexChild {
 		return layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			return layout.Inset{Bottom: unit.Dp(3)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return layout.Inset{Bottom: unit.Dp(2)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 				active := ui.tab == idx
 				bg := color.NRGBA{}
 				fg := ui.pal.mut
 				w := font.Medium
 				if active {
-					bg, fg, w = ui.pal.accSoft, ui.pal.acc, font.SemiBold
+					bg, fg, w = ui.pal.accSoft, ui.pal.text, font.SemiBold
 				} else if ui.navBtns[idx].Hovered() {
 					bg, fg = ui.pal.hover, ui.pal.text
 				}
@@ -1411,27 +1482,31 @@ func (ui *gioUI) layoutSidebar(gtx layout.Context, collapsed bool) layout.Dimens
 					return layout.Background{}.Layout(gtx,
 						func(gtx layout.Context) layout.Dimensions {
 							if bg.A > 0 {
-								fillRect(gtx, gtx.Constraints.Min, gtx.Dp(8), bg)
+								fillRect(gtx, gtx.Constraints.Min, gtx.Dp(10), bg)
 							}
-							if active && gtx.Constraints.Min.Y > gtx.Dp(16) {
-								bar := image.Rect(0, gtx.Dp(7), gtx.Dp(3), gtx.Constraints.Min.Y-gtx.Dp(7))
-								paint.FillShape(gtx.Ops, ui.pal.acc, clip.UniformRRect(bar, gtx.Dp(2)).Op(gtx.Ops))
+							if active && gtx.Constraints.Min.Y > gtx.Dp(14) {
+								bar := image.Rect(0, gtx.Dp(6), gtx.Dp(3), gtx.Constraints.Min.Y-gtx.Dp(6))
+								paint.FillShape(gtx.Ops, ui.pal.acc2, clip.UniformRRect(bar, gtx.Dp(2)).Op(gtx.Ops))
 							}
 							return layout.Dimensions{Size: gtx.Constraints.Min}
 						},
 						func(gtx layout.Context) layout.Dimensions {
 							gtx.Constraints.Min.X = gtx.Constraints.Max.X
-							return layout.Inset{Top: unit.Dp(7), Bottom: unit.Dp(7), Left: unit.Dp(12), Right: unit.Dp(10)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+							return layout.Inset{Top: unit.Dp(7), Bottom: unit.Dp(7), Left: unit.Dp(10), Right: unit.Dp(10)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+								icCol := fg
+								if active {
+									icCol = ui.pal.acc2
+								}
 								if collapsed {
 									return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-										return drawIcon(gtx, navIcons[idx], unit.Dp(18), fg)
+										return drawIcon(gtx, navIcons[idx], unit.Dp(17), icCol)
 									})
 								}
 								return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
 									layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-										return drawIcon(gtx, navIcons[idx], unit.Dp(16), fg)
+										return drawIcon(gtx, navIcons[idx], unit.Dp(15), icCol)
 									}),
-									layout.Rigid(layout.Spacer{Width: unit.Dp(10)}.Layout),
+									layout.Rigid(layout.Spacer{Width: unit.Dp(9)}.Layout),
 									layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 										return ui.labelLine(gtx, fontBody, fg, w, navTitles[idx])
 									}),
@@ -1439,7 +1514,10 @@ func (ui *gioUI) layoutSidebar(gtx layout.Context, collapsed bool) layout.Dimens
 										if idx == 0 {
 											return dotWidget(gtx, unit.Dp(7), stCol)
 										}
-										return ui.labelLine(gtx, fontMicro, ui.pal.dim, font.Normal, fmt.Sprintf("^%d", idx+1))
+										if idx == 2 && liveN > 0 {
+											return ui.miniTag(gtx, ui.pal.acc2, fmt.Sprintf("%.0f", liveN))
+										}
+										return layout.Dimensions{}
 									}),
 								)
 							})
@@ -1455,12 +1533,12 @@ func (ui *gioUI) layoutSidebar(gtx layout.Context, collapsed bool) layout.Dimens
 		for gi, grp := range navGroups {
 			if !collapsed {
 				gTitle := grp.title
-				topPad := unit.Dp(10)
+				topPad := unit.Dp(8)
 				if gi == 0 {
 					topPad = unit.Dp(2)
 				}
 				navChildren = append(navChildren, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					return layout.Inset{Top: topPad, Bottom: unit.Dp(4), Left: unit.Dp(10)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					return layout.Inset{Top: topPad, Bottom: unit.Dp(3), Left: unit.Dp(10)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 						return ui.labelLine(gtx, fontMicro, ui.pal.dim, font.Bold, gTitle)
 					})
 				}))
@@ -1475,12 +1553,12 @@ func (ui *gioUI) layoutSidebar(gtx layout.Context, collapsed bool) layout.Dimens
 		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 			// Brand Header
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return layout.Inset{Bottom: space2, Left: space1, Top: space1}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				return layout.Inset{Bottom: unit.Dp(10), Left: unit.Dp(4), Top: unit.Dp(4)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 					return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
 						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 							s := gtx.Dp(34)
 							sz := image.Pt(s, s)
-							fillGradient(gtx, sz, gtx.Dp(9), ui.pal.acc, ui.pal.vio)
+							fillGradient(gtx, sz, gtx.Dp(10), ui.pal.acc, ui.pal.acc2)
 							is := gtx.Dp(18)
 							t := op.Offset(image.Pt((s-is)/2, (s-is)/2)).Push(gtx.Ops)
 							drawIcon(gtx, "shield", unit.Dp(18), rgb(0xFFFFFF))
@@ -1494,10 +1572,10 @@ func (ui *gioUI) layoutSidebar(gtx layout.Context, collapsed bool) layout.Dimens
 							return layout.Inset{Left: unit.Dp(10)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 								return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 									layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-										return ui.labelLine(gtx, fontTitle, ui.pal.text, font.Bold, "PsiRoute")
+										return ui.labelLine(gtx, fontSub, ui.pal.text, font.Bold, "PsiRoute")
 									}),
 									layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-										return ui.labelLine(gtx, fontSmall, ui.pal.acc, font.Bold, "Версия v"+version+" · PORTABLE")
+										return ui.monoLabel(gtx, fontMicro, ui.pal.acc2, "v"+version+" · GIO")
 									}),
 								)
 							})
@@ -1505,59 +1583,60 @@ func (ui *gioUI) layoutSidebar(gtx layout.Context, collapsed bool) layout.Dimens
 					)
 				})
 			}),
-			// Grouped Navigation
+			// Grouped 9-page Navigation
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return layout.Flex{Axis: layout.Vertical}.Layout(gtx, navChildren...)
 			}),
 			layout.Flexed(1, layout.Spacer{}.Layout),
-			// Compact System Health Card at Sidebar Footer
+			// Compact Status Card
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				if collapsed {
 					return layout.Dimensions{}
 				}
 				gtx.Constraints.Min.X = gtx.Constraints.Max.X
-				return ui.subCard(gtx, ui.pal.card2, ui.pal.border, unit.Dp(10), func(gtx layout.Context) layout.Dimensions {
-					badges := []string{"Psiphon"}
-					if tunOn {
-						badges = append(badges, "TUN")
-					}
-					if warpOn {
-						badges = append(badges, "WARP")
-					}
-					return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-							return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle, Spacing: layout.SpaceBetween}.Layout(gtx,
-								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-									return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
-										layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-											return dotWidget(gtx, unit.Dp(7), stCol)
-										}),
-										layout.Rigid(layout.Spacer{Width: unit.Dp(6)}.Layout),
-										layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-											return ui.labelLine(gtx, fontSmall, stCol, font.Bold, stateTitle(pState))
-										}),
-									)
-								}),
-								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-									if reg == "" {
-										return layout.Dimensions{}
-									}
-									return ui.labelLine(gtx, fontSmall, ui.pal.text, font.Bold, cnameShort(reg))
-								}),
-							)
-						}),
-						layout.Rigid(layout.Spacer{Height: unit.Dp(6)}.Layout),
-						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-							return ui.labelLine(gtx, fontMicro, ui.pal.mut, font.Normal,
-								fmt.Sprintf("↓ %s · ↑ %s", fmtSpeed(spDown), fmtSpeed(spUp)))
-						}),
-						layout.Rigid(layout.Spacer{Height: unit.Dp(3)}.Layout),
-						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-							return ui.labelLine(gtx, fontMicro, ui.pal.dim, font.Normal,
-								fmt.Sprintf("ОЗУ: %.0f МБ (ядро %.0f) · %s", memTot/1048576, memApp/1048576, strings.Join(badges, " + ")))
-						}),
-					)
+				return layout.Inset{Bottom: unit.Dp(6)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					return ui.subCard(gtx, ui.pal.card2, ui.pal.border, unit.Dp(8), func(gtx layout.Context) layout.Dimensions {
+						return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle, Spacing: layout.SpaceBetween}.Layout(gtx,
+									layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+										return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+											layout.Rigid(func(gtx layout.Context) layout.Dimensions { return dotWidget(gtx, unit.Dp(7), stCol) }),
+											layout.Rigid(layout.Spacer{Width: unit.Dp(6)}.Layout),
+											layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+												return ui.labelLine(gtx, fontSmall, stCol, font.Bold, stateTitle(pState))
+											}),
+										)
+									}),
+									layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+										if reg == "" {
+											return layout.Dimensions{}
+										}
+										return ui.labelLine(gtx, fontSmall, ui.pal.text, font.Bold, cnameShort(reg))
+									}),
+								)
+							}),
+							layout.Rigid(layout.Spacer{Height: unit.Dp(4)}.Layout),
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								return ui.monoLabel(gtx, fontMicro, ui.pal.mut, fmt.Sprintf("↓ %s · ↑ %s", fmtSpeed(spDown), fmtSpeed(spUp)))
+							}),
+							layout.Rigid(layout.Spacer{Height: unit.Dp(2)}.Layout),
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								return ui.labelLine(gtx, fontMicro, ui.pal.dim, font.Normal,
+									fmt.Sprintf("ОЗУ: %.0f МБ (ядро %.0f)", memTot/1048576, memApp/1048576))
+							}),
+						)
+					})
 				})
+			}),
+			// Collapse Sidebar Toggle Button
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				gtx.Constraints.Min.X = gtx.Constraints.Max.X
+				lbl := "Свернуть меню"
+				if collapsed {
+					lbl = ""
+				}
+				return ui.iconButton(gtx, &ui.sidebarToggleBtn, "swap", lbl, false, "")
 			}),
 		)
 	})
@@ -1570,9 +1649,27 @@ func (ui *gioUI) layoutToastBanner(gtx layout.Context) layout.Dimensions {
 	until := ui.toastUntil
 	st := ui.state
 	ui.mu.Unlock()
+	showAck := false
 	if (msg == "" || time.Now().After(until)) && st != nil {
+		// Priority: damaged config (until the user confirms it, A-17), components
+		// that were switched off after repeated crashes (A-06), autostart warning (A-05).
 		if cfgErr, _ := st["config_error"].(string); cfgErr != "" {
 			msg = cfgErr
+			isErr = true
+			showAck = true
+			until = time.Now().Add(time.Minute)
+		} else if failed, _ := st["failed_components"].([]any); len(failed) > 0 {
+			names := make([]string, 0, len(failed))
+			for _, f := range failed {
+				if s, ok := f.(string); ok {
+					names = append(names, s)
+				}
+			}
+			msg = "Остановлены после сбоев: " + strings.Join(names, ", ") + ". Остальные функции работают; перезапустите Psiroute, а при повторе отправьте журнал разработчику"
+			isErr = true
+			until = time.Now().Add(time.Minute)
+		} else if aw, _ := st["autostart_warning"].(string); aw != "" {
+			msg = aw
 			isErr = true
 			until = time.Now().Add(time.Minute)
 		}
@@ -1580,7 +1677,7 @@ func (ui *gioUI) layoutToastBanner(gtx layout.Context) layout.Dimensions {
 	if msg == "" || time.Now().After(until) {
 		return layout.Dimensions{}
 	}
-	bg, fg, ic := ui.pal.accSoft, ui.pal.acc, "check"
+	bg, fg, ic := ui.pal.accSoft, ui.pal.acc2, "check"
 	if isErr {
 		bg, fg, ic = ui.pal.errSoft, ui.pal.err, "stop"
 	}
@@ -1598,12 +1695,20 @@ func (ui *gioUI) layoutToastBanner(gtx layout.Context) layout.Dimensions {
 					}
 					return ui.label(gtx, fontBody, fg, font.SemiBold, msg)
 				}),
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					if !showAck {
+						return layout.Dimensions{}
+					}
+					return layout.Inset{Left: space1}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+						return ui.pillButton(gtx, &ui.ackCorruptBtn, "Подтвердить", false, "teal")
+					})
+				}),
 			)
 		})
 	})
 }
 
-// layoutSubTabBar рисует современный сегмент-переключатель подвкладок внутри рельсы card2.
+// layoutSubTabBar рисует сегмент-переключатель подвкладок.
 func (ui *gioUI) layoutSubTabBar(gtx layout.Context, tabIdx int, titles []string) layout.Dimensions {
 	return layout.Inset{Bottom: unit.Dp(10)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		return ui.subCard(gtx, ui.pal.card, ui.pal.border, unit.Dp(4), func(gtx layout.Context) layout.Dimensions {

@@ -13,6 +13,7 @@ type traceInfo struct {
 	IP   string
 	Loc  string // country code
 	Colo string // Cloudflare datacenter
+	Warp string // "on" | "plus" | "off"
 }
 
 // getTrace fetches https://www.cloudflare.com/cdn-cgi/trace through the given
@@ -21,6 +22,7 @@ type traceInfo struct {
 func getTrace(ctx context.Context, dial dialFunc) (traceInfo, error) {
 	var tr traceInfo
 	c := &http.Client{
+		Timeout:   15 * time.Second, // A-12: the context stays, this is a second guard
 		Transport: &http.Transport{DialContext: dial, TLSHandshakeTimeout: 10 * time.Second},
 	}
 	defer c.CloseIdleConnections()
@@ -46,6 +48,8 @@ func getTrace(ctx context.Context, dial dialFunc) (traceInfo, error) {
 			tr.Loc = v
 		case "colo":
 			tr.Colo = v
+		case "warp":
+			tr.Warp = v
 		}
 	}
 	return tr, sc.Err()

@@ -56,10 +56,10 @@ func (a *App) diagnose(ctx context.Context, host string, port int) map[string]an
 	var wg sync.WaitGroup
 	for i, ob := range obs {
 		wg.Add(1)
-		go func(i int, ob string) {
+		func(i int, ob string) { safeGo("App.diagnose", func() {
 			defer wg.Done()
 			results[i] = a.checkOutbound(ctx, ob, host, port, doh)
-		}(i, ob)
+		}) }(i, ob)
 	}
 	wg.Wait()
 	best := ""

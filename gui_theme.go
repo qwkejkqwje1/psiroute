@@ -10,10 +10,10 @@ import (
 	"gioui.org/unit"
 )
 
-// Дизайн-система PsiRoute 2.0.5:
-//   - По умолчанию: "obsidian" (Tactical Glass / Obsidian Dark — глубокий графит #0B0E14, индиго #6366F1, бирюза #06B6D4)
-//   - Опциональный переключатель: "cyber-amber" (USSR Retrofuturism / Cyber-Amber Terminal HUD — угольный #0D0F0E, янтарный люминофор #FFB000)
-//   - Единая модульная сетка кратно 8dp и контраст текста >= 7:1.
+// Дизайн-система PsiRoute «Aurora Dark» (единая с веб-панелью ui/index.html):
+//   - Глубокий ночной фон #070914, акцентный градиент #7C5CFF → #00D1FF,
+//     карточки со скруглением 16–18dp и мягкой подсветкой состояния.
+//   - Только тёмная тема (Dark-only), модульная сетка кратно 8dp, контраст >= 7:1.
 const (
 	fontMicro = unit.Sp(10.5)
 	fontSmall = unit.Sp(11.5)
@@ -29,93 +29,68 @@ const (
 )
 
 type gioPalette struct {
-	dark     bool
-	themeID  string
-	bg       color.NRGBA // основной фон рабочей области
-	side     color.NRGBA // фон боковой панели
-	card     color.NRGBA // основная поверхность карточек
-	card2    color.NRGBA // углублённая поверхность (инпуты, метрики, плитки)
-	hover    color.NRGBA // состояние наведения
-	border   color.NRGBA // тонкая граница 1dp
-	borderHi color.NRGBA // акцентная граница при фокусе/выделении
-	text     color.NRGBA // основной текст (WCAG >= 7:1)
-	mut      color.NRGBA // вторичный текст
-	dim      color.NRGBA // третичный текст / подписи
-	acc      color.NRGBA // основной акцент
-	accSoft  color.NRGBA
-	ok       color.NRGBA // успех / прямое / подключено (Emerald)
-	okSoft   color.NRGBA
-	warn     color.NRGBA // предупреждение / WARP / Янтарь (Amber)
-	warnSoft color.NRGBA
-	err      color.NRGBA // ошибка / блокировка (Coral Rose)
-	errSoft  color.NRGBA
-	vio      color.NRGBA // Psiphon VPN (Violet)
-	vioSoft  color.NRGBA
-	teal     color.NRGBA // DPI-обход (Cyan Teal)
-	tealSoft color.NRGBA
+	dark      bool
+	themeID   string
+	bg        color.NRGBA // основной фон рабочей области
+	side      color.NRGBA // фон боковой панели
+	card      color.NRGBA // основная поверхность карточек
+	card2     color.NRGBA // углублённая поверхность (инпуты, метрики, плитки)
+	hover     color.NRGBA // состояние наведения
+	border    color.NRGBA // тонкая граница 1dp
+	borderHi  color.NRGBA // акцентная граница при фокусе/выделении
+	text      color.NRGBA // основной текст (WCAG >= 7:1)
+	mut       color.NRGBA // вторичный текст
+	dim       color.NRGBA // третичный текст / подписи
+	acc       color.NRGBA // основной акцент (фиолетовый #7C5CFF)
+	accSoft   color.NRGBA
+	acc2      color.NRGBA // второй цвет градиента (голубой #00D1FF)
+	ok        color.NRGBA // успех / прямое / подключено (Emerald #22D3A0)
+	okSoft    color.NRGBA
+	warn      color.NRGBA // предупреждение / WARP / Янтарь (#FBBF24)
+	warnSoft  color.NRGBA
+	err       color.NRGBA // ошибка / блокировка (Coral Rose #FB5E7C)
+	errSoft   color.NRGBA
+	vio       color.NRGBA // Psiphon VPN (Violet #8B7BFF)
+	vioSoft   color.NRGBA
+	teal      color.NRGBA // DPI-обход (Cyan Teal #22D3EE)
+	tealSoft  color.NRGBA
+	clean     color.NRGBA // Clean-IP каскад (#2DD4BF)
+	cleanSoft color.NRGBA
 }
 
 func paletteFor(_ bool) gioPalette {
 	return paletteByTheme("obsidian")
 }
 
-func paletteByTheme(theme string) gioPalette {
-	switch strings.ToLower(strings.TrimSpace(theme)) {
-	case "cyber-amber", "amber", "ussr", "retro":
-		return gioPalette{
-			dark:     true,
-			themeID:  "cyber-amber",
-			bg:       rgb(0x0B0D0C),
-			side:     rgb(0x101412),
-			card:     rgb(0x151A17),
-			card2:    rgb(0x1C231F),
-			hover:    rgb(0x252E29),
-			border:   rgb(0x2B3630),
-			borderHi: rgb(0xFFB000),
-			text:     rgb(0xF6F3E8),
-			mut:      rgb(0xB5B09C),
-			dim:      rgb(0x787566),
-			acc:      rgb(0xFFB000),
-			accSoft:  rgba(0xFFB000, 38),
-			ok:       rgb(0x22C55E),
-			okSoft:   rgba(0x22C55E, 36),
-			warn:     rgb(0xF59E0B),
-			warnSoft: rgba(0xF59E0B, 36),
-			err:      rgb(0xEF4444),
-			errSoft:  rgba(0xEF4444, 36),
-			vio:      rgb(0xFFB000),
-			vioSoft:  rgba(0xFFB000, 38),
-			teal:     rgb(0x14B8A6),
-			tealSoft: rgba(0x14B8A6, 36),
-		}
-	default:
-		// Obsidian Pro v2.2 (#080B12 bg, #0B0F18 side, #111623 card, #161D2E card2)
-		return gioPalette{
-			dark:     true,
-			themeID:  "obsidian",
-			bg:       rgb(0x080B12),
-			side:     rgb(0x0B0F18),
-			card:     rgb(0x111623),
-			card2:    rgb(0x161D2E),
-			hover:    rgb(0x1E273D),
-			border:   rgb(0x232E47),
-			borderHi: rgb(0x6366F1),
-			text:     rgb(0xEDF2F7),
-			mut:      rgb(0x94A3B8),
-			dim:      rgb(0x64748B),
-			acc:      rgb(0x6366F1),
-			accSoft:  rgba(0x6366F1, 40),
-			ok:       rgb(0x10B981),
-			okSoft:   rgba(0x10B981, 36),
-			warn:     rgb(0xF59E0B),
-			warnSoft: rgba(0xF59E0B, 36),
-			err:      rgb(0xF43F5E),
-			errSoft:  rgba(0xF43F5E, 36),
-			vio:      rgb(0x8B5CF6),
-			vioSoft:  rgba(0x8B5CF6, 40),
-			teal:     rgb(0x06B6D4),
-			tealSoft: rgba(0x06B6D4, 36),
-		}
+func paletteByTheme(_ string) gioPalette {
+	return gioPalette{
+		dark:      true,
+		themeID:   "obsidian",
+		bg:        rgb(0x070914),
+		side:      rgb(0x0A0D1B),
+		card:      rgb(0x0F1426),
+		card2:     rgb(0x151B30),
+		hover:     rgb(0x1D2542),
+		border:    rgb(0x252E4D),
+		borderHi:  rgb(0x7C5CFF),
+		text:      rgb(0xEAEEFB),
+		mut:       rgb(0xA3ACCB),
+		dim:       rgb(0x7F89AD),
+		acc:       rgb(0x7C5CFF),
+		accSoft:   rgba(0x7C5CFF, 52),
+		acc2:      rgb(0x00D1FF),
+		ok:        rgb(0x22D3A0),
+		okSoft:    rgba(0x22D3A0, 36),
+		warn:      rgb(0xFBBF24),
+		warnSoft:  rgba(0xFBBF24, 36),
+		err:       rgb(0xFB5E7C),
+		errSoft:   rgba(0xFB5E7C, 36),
+		vio:       rgb(0x8B7BFF),
+		vioSoft:   rgba(0x8B7BFF, 44),
+		teal:      rgb(0x22D3EE),
+		tealSoft:  rgba(0x22D3EE, 36),
+		clean:     rgb(0x2DD4BF),
+		cleanSoft: rgba(0x2DD4BF, 38),
 	}
 }
 
@@ -193,6 +168,23 @@ func fmtSpeed(bps float64) string {
 	return fmt.Sprintf("%.0f КБ/с", bps/1024)
 }
 
+func fmtDur(sec float64) string {
+	s := int(sec)
+	if s < 0 {
+		s = 0
+	}
+	h := s / 3600
+	m := (s % 3600) / 60
+	x := s % 60
+	if h > 0 {
+		return fmt.Sprintf("%dч %02dм", h, m)
+	}
+	if m > 0 {
+		return fmt.Sprintf("%dм %02dс", m, x)
+	}
+	return fmt.Sprintf("%dс", x)
+}
+
 func (ui *gioUI) statusColor(pState string) color.NRGBA {
 	switch pState {
 	case "connected":
@@ -207,11 +199,12 @@ func (ui *gioUI) statusColor(pState string) color.NRGBA {
 	return ui.pal.acc
 }
 
-// routeColor реализует единую семантическую кодировку маршрутов (Часть 3.1):
+// routeColor реализует единую семантическую кодировку маршрутов:
 //   - Изумрудный (ok)     — Direct (Напрямую)
 //   - Бирюзовый (teal)    — Direct-DPI (Обход ТСПУ)
 //   - Янтарный (warn)     — Cloudflare WARP (UDP/MASQUE)
 //   - Фиолетовый (vio)    — Psiphon / Psiphon:CC (VPN со сменой страны)
+//   - Мятный (clean)      — Clean-IP (WARP → VPN → WARP)
 //   - Рубиновый (err)     — Block (Блокировать)
 func (ui *gioUI) routeColor(ob string) color.NRGBA {
 	switch {
@@ -221,6 +214,8 @@ func (ui *gioUI) routeColor(ob string) color.NRGBA {
 		return ui.pal.teal
 	case ob == obWarp:
 		return ui.pal.warn
+	case ob == obCleanIP:
+		return ui.pal.clean
 	case ob == obPsiphon || strings.HasPrefix(ob, obPsiphon+":"):
 		return ui.pal.vio
 	case ob == obBlock:
@@ -241,12 +236,16 @@ func routeShortRu(ob string) string {
 		return "Обход DPI"
 	case ob == obWarp:
 		return "WARP"
+	case ob == obCleanIP:
+		return "Clean-IP"
 	case ob == obPsiphon:
 		return "Psiphon VPN"
 	case strings.HasPrefix(ob, obPsiphon+":"):
 		return "VPN " + strings.ToUpper(strings.TrimPrefix(ob, obPsiphon+":"))
 	case ob == obBlock:
 		return "Блок"
+	case ob == obProxy:
+		return "Прокси"
 	case ob == obAuto || ob == "":
 		return "Авто"
 	}
@@ -268,7 +267,7 @@ func onOffStatus(on bool, detail string) string {
 }
 
 func cnameShort(cc string) string {
-	if cc == "" || cc == "auto" {
+	if cc == "" || strings.EqualFold(cc, "auto") {
 		return "Авто"
 	}
 	return strings.ToUpper(cc)

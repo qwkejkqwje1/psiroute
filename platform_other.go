@@ -87,3 +87,5 @@ func isRunningTests() bool {
 	base := strings.ToLower(filepath.Base(os.Args[0]))
 	return strings.HasSuffix(base, ".test.exe") || strings.HasSuffix(base, ".test")
 }
+
+func clearDeadLoopbackProxy(ourAddrs ...string) string { return "" }

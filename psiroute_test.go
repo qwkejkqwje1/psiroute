@@ -345,6 +345,9 @@ func TestConfigSetKeyAndValues(t *testing.T) {
 		"psiphon.parallel": true, "psiphon.standby": true,
 		"psiphon.health_interval_secs": false, "psiphon.min_speed_kbps": false,
 		"psiphon.dpi": true, "psiphon.single_process_countries": false,
+		// 5 keys added by the merge (42 in total): tuning preset, seed mirror and Psiphon identity
+		"psiphon.preset": true, "psiphon.mirror_url": false,
+		"psiphon.propagation_channel_id": true, "psiphon.sponsor_id": true, "psiphon.client_platform": true,
 		"desync.enabled": false, "desync.method": false,
 		"warp.enabled": true, "warp.socks": true,
 		"warp.engine": true, "warp.mask": false, "warp.endpoint": false,
@@ -352,10 +355,14 @@ func TestConfigSetKeyAndValues(t *testing.T) {
 		"dns.enabled": false, "dns.local_server": false, "dns.local_addr": false, "udp.mode": false,
 		"tun.enabled": false, "tun.mtu": false, "tun.dns_hijack": false, "tun.fake_ip": false, "tun.ipv6": false, "tun.exclude_apps": false,
 		"routing.failover": false, "routing.learn": false,
-		"routing.bypass_lan": false, "routing.block_quic": false, "routing.kill_switch": false, "routing.block_stun": false,
+		"routing.bypass_lan": false, "routing.block_quic": false, "routing.kill_switch": false, "routing.kill_switch_mode": false, "routing.block_stun": false,
+		"clean_chain.enabled": false, "clean_chain.auto_chain": false,
 		"general.watch_config": false, "general.system_proxy": false, "general.ui_mode": false,
 	}
 	vals := c.values()
+	if len(restartKeys) != 42 {
+		t.Fatalf("test table must cover 42 keys, has %d", len(restartKeys))
+	}
 	if len(vals) != len(restartKeys) {
 		t.Fatalf("values() has %d keys, test table has %d", len(vals), len(restartKeys))
 	}
@@ -379,6 +386,14 @@ func TestConfigSetKeyAndValues(t *testing.T) {
 				v = "split"
 			case "general.ui_mode": // only native or browser
 				v = "browser"
+			case "routing.kill_switch_mode": // off | auto | strict
+				v = "strict"
+			case "psiphon.preset": // only fast | balanced | patient are kept
+				v = PresetFast
+			case "psiphon.mirror_url": // https URL with a host
+				v = "https://mirror.example.com/seeds.txt"
+			case "psiphon.propagation_channel_id", "psiphon.sponsor_id": // exactly 16 hex chars
+				v = "0123456789ABCDEF"
 			}
 		}
 		if got := c.setKey(key, v); got != wantRestart {

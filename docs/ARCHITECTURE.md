@@ -1,116 +1,26 @@
-# Архитектура PsiRoute
+# Архитектура PsiRoute Go (v2.3.0)
 
-## Идея
-Psiphon-ядро (Go, `psiphon-tunnel-core`) **не переписываем** — это годы работы над обфускацией (OSSH, TLS-OSSH, meek/CDN-fronting, QUIC, Conduit/inproxy). Rust-приложение — это **оркестратор + сетевой стек + роутер + UI**:
+## Каноничный стек
+- **Ядро**: единый бинарь на Go (`package main`), встроенный `psiphon-tunnel-core`, userspace `wireguard-go` + `gvisor/netstack`, Wintun (`wintun.dll`) для режима TUN.
+- **Каноничный UI**: нативный аппаратно-ускоренный **Go/Gio GUI** (Obsidian Pro / тактический интерфейс «пульт управления», 5 экранов + закреплённый Status Bar).
+- **Web UI**: облегчённая веб-панель мониторинга и управления на `http://127.0.0.1:9090` поверх единого HTTP API с CSRF-токеном `X-Psiroute`.
+- **Портативность**: все кэши, конфиги, списки, временные файлы и отчёты строго изолированы в `dataDir` рядом с `psiroute.exe`.
 
-```
- Приложения ──► [TUN (wintun/utun/tun)] ─┐
- Браузер ────► [Mixed inbound SOCKS5/HTTP :7890] ─┤
-                                           ▼
-                                  ┌─── ROUTER (правила) ───┐
-                                  ▼        ▼        ▼      ▼
-                              DIRECT  DIRECT+DPI  PSIPHON  BLOCK
-                                         (frag)      │
-                                                     ▼
-                     psiphon-tunnel-core (сайдкар, SOCKS :1080 локально)
-                                 │ UpstreamProxyURL (только если прямой путь заблокирован)
-                                 ▼
-                 ┌──────── BOOTSTRAP RACER (гонка путей) ────────┐
-                 ▼                ▼                 ▼             ▼
-              напрямую      DPI-frag SOCKS    VLESS-WS-TLS     WARP (boringtun
-                                              (CF Worker)      + AWG-junk) SOCKS
-```
+## Конечный автомат ядра (`core_fsm.go`)
+Единый FSM координирует состояние туннелей и публикует неизменяемые снапшоты состояния (`CoreFSMSnapshot`) в UI:
+`Idle → Bootstrapping → Connecting → Connected → Degraded → Reconnecting → Stopping`
+Шкала стадий запуска: `Bootstrap → Obfs → Tunnel → Check → Ready`.
 
-## Крейты (cargo workspace)
-| Крейт | Назначение | Ключевые зависимости |
-|---|---|---|
-| `psi-config` | TOML-конфиг, профили, пресеты, пути (`directories`) | serde, toml |
-| `psi-core` | Общие трейты: `Outbound`, `Inbound`, `Event`-шина (tokio broadcast), SOCKS5/HTTP inbound | tokio, bytes |
-| `psi-psiphon` | Управление сайдкаром: генерация config.json, запуск, парсинг JSON-notices, страны | tokio::process, serde_json |
-| `psi-vless` | VLESS поверх WS+TLS, early-data (0-RTT) | tokio-tungstenite, rustls, uuid |
-| `psi-dpi` | Обход DPI в userspace: split/фрагментация TLS ClientHello, DoH | rustls (работаем с байтами), hickory-proto + h2 (DoH через DpiOutbound) |
-| `psi-warp` | Регистрация WARP, WireGuard (boringtun) + AmneziaWG-junk, перебор эндпоинтов, SOCKS-выход через smoltcp | boringtun, smoltcp, x25519-dalek, rustls, rand |
-| `psi-bootstrap` | Гонка стратегий, кэш победителя на сеть, reconnect/auto-promote | netdev, tokio-util (CancellationToken), sha2 |
-| `psi-router` | Движок правил: domain/suffix/keyword/regex, CIDR, geoip(mmdb и v2ray geoip.dat), geosite(v2ray geosite.dat), process, port | maxminddb, ip_network_table, regex, aho-corasick, prost, quick_cache, arc-swap |
-| `psi-tun` | TUN + userspace TCP/IP (ipstack), fake-ip DNS, защита от петель | tun-rs, ipstack |
-| `psi-engine` | Движок-библиотека: `Engine::start(cfg) -> Handle{events, cmd}`; используется Tauri in-process + бинарь `psiroute-cli` | всё выше |
-| `app` | Tauri 2 GUI + трей | tauri 2, svelte/solid (лёгкий фронт) |
+## Интерфейс транспортов (`ChainDialer`) и каскад Clean-IP (`clean_chain.go`)
+Все выходы (`direct`, `direct-dpi`, `psiphon`, `psiphon:XX`, `warp`, `clean-ip`) реализуют единый контракт `ChainDialer` без создания дополнительных TUN-адаптеров в Windows:
+- **Звено 1 (`EntryWarp`)**: userspace WireGuard netstack (MTU `1280`), привязанный к физическому адаптеру Windows (`IP_UNICAST_IF`) с обфускацией AmneziaWG `I1–I5`. В адаптивном режиме `Auto-Chain` подключается автоматически только при блокировке прямого входа.
+- **Звено 2 (`Psiphon` / VLESS)**: транзитный туннель в выбранную страну.
+- **Звено 3 (`ExitWarp`)**: второй независимый userspace WireGuard netstack (MTU `1200`, собственный `warp-exit-identity.json`), работающий поверх `udpgw` TCP-моста через Звено 2 (`tunnelUDPBind`).
+- **MTU & TCP MSS Clamping (`tun.go`, `tun_util.go`)**: при активном `clean-ip` каскаде TCP MSS принудительно зажимается до `<= 1140` (IPv4) / `<= 1120` (IPv6) на входе и выходе единственного Wintun-адаптера.
 
-## Контракты (не ломать)
-```rust
-// psi-core
-#[async_trait] pub trait Outbound: Send + Sync {
-    fn tag(&self) -> &str;
-    async fn connect_tcp(&self, dst: &Target) -> Result<BoxStream>; // BoxStream: AsyncRead+AsyncWrite+Unpin+Send
-    async fn health(&self) -> Health; // латентность/ок
-}
-pub enum Target { Domain(String, u16), Ip(SocketAddr) }
-pub enum Event { State(ConnState), Log(String), Stats{up:u64, down:u64}, Regions(Vec<String>), Route{dst:String, outbound:String} }
-```
-`ConnState`: `Idle | Bootstrapping{strategy} | Connecting{region} | Connected{region, via} | Error(String)`.
-
-```rust
-// psi-dpi
-pub enum SplitAt { Fixed(usize), Sni, SniPlusOne }
-pub enum Strategy { Split(SplitAt), TlsRec(SplitAt), Disorder{at: SplitAt, ttl: u8}, Oob(SplitAt), HttpHost }
-pub struct StrategyPlan { pub actions: Vec<Strategy> } // presets(): tlsrec+split(sni), disorder(1), split(1)+oob, tlsrec(sni)+disorder(sni)
-pub struct DpiOutbound; // impl Outbound; перехватывает первую запись и применяет StrategyPlan
-pub struct DohResolver;  // resolve(name) -> Vec<IpAddr>; DoH-трафик идёт через DpiOutbound
-```
-
-```rust
-// psi-warp
-pub struct WarpRegistration; // register()/register_via(&dyn Outbound), import_conf(&str) -> ImportedProfile
-pub struct WarpOutbound;     // impl Outbound; TCP через smoltcp поверх boringtun
-pub async fn scan(&WarpRegistration, &JunkConfig) -> Result<Vec<EndpointResult>>; // 200 пар, 50 параллельно, топ-3 RTT
-pub fn inject_reserved(&mut [u8], [u8; 3]) -> bool; // байты 1..4 каждого WG-пакета
-```
-
-```rust
-// psi-bootstrap
-pub struct NetworkFingerprint; // current() -> hash(шлюз + MAC/SSID), NetworkID Psiphon и ключ кэша
-#[async_trait] pub trait Strategy { fn tag(&self) -> &str; async fn prepare(&self) -> Option<Bridge>; }
-pub struct Bootstrap; // race() -> Winner; run_forever() = кэш + stagger/head-start + reconnect 20 с + auto_promote
-pub struct Winner { /* tag, PsiphonInstance, Bridge */ }
-pub async fn wait_lost(state, lost_after) -> bool;
-```
-
-## Psiphon: как подключаем
-- Бинарь `psiphon-tunnel-core` ConsoleClient (собираем в CI из github.com/Psiphon-Labs/psiphon-tunnel-core, `go build ./ConsoleClient`).
-- config.json генерирует Rust: `PropagationChannelId`, `SponsorId`, `RemoteServerListUrl`, `RemoteServerListSignaturePublicKey`, `EgressRegion` (страна, "" = лучшая), `LocalSocksProxyPort`, `LocalHttpProxyPort`, `UpstreamProxyURL` (socks5://127.0.0.1:PORT от VLESS/WARP/DPI-моста), `LimitTunnelProtocols` (опционально), `DataRootDirectory`, `EmitBytesTransferred: true`, `EmitDiagnosticNotices`.
-- ID и ключи — из публичных клиентов/документации, хранятся в `config.local.toml`, в git не попадают.
-- Notices (JSON-строки в stderr): `Tunnels{count}` → Connected; `AvailableEgressRegions{regions}` → список стран в UI; `ActiveTunnel`; `BytesTransferred` → скорость; `ListeningSocksProxyPort`.
-- Смена страны = перезапуск сайдкара с новым `EgressRegion` (быстро: data dir сохраняет серверный список).
-
-## Bootstrap racer (главное для РФ)
-Стратегии запускаются **параллельно со сдвигом 300 мс** (happy-eyeballs), побеждает первая, давшая `Tunnels{count>=1}`; остальные гасятся:
-1. `direct` — Psiphon как есть.
-2. `dpi` — Psiphon через локальный DPI-мост (фрагментация ClientHello для TLS/meek-протоколов).
-3. `vless` — Psiphon через свой CF Worker (TCP-протоколы Psiphon проходят через `cloudflare:sockets`).
-4. `warp` — Psiphon через WARP (WireGuard+AWG-junk).
-5. (опц.) `psiphon-inproxy` — Conduit/in-proxy режим самого Psiphon.
-Победитель кэшируется по «отпечатку сети» (hash шлюза+SSID) → следующий запуск начинает с него, остальные через 1.5 с. **Скорость**: после подключения цепочка не меняется; если победил `direct`, лишних хопов нет. Фоновая проверка раз в N минут может «повысить» на более короткий путь.
-
-## Маршрутизация (просто для пользователя, мощно внутри)
-Режимы-пресеты (1 клик): 
-- **«Умный (РФ)»** — российские домены/IP напрямую, заблокированное → Psiphon, реклама → block.
-- **«Только заблокированное»** — списки runetfreedom/antifilter → Psiphon, остальное напрямую.
-- **«Всё через VPN»**.
-- **«Свои правила»** — редактор: правило = условие + действие (`direct | dpi | psiphon | vless | warp | block`), drag-n-drop порядок, тест «куда пойдёт домен X».
-Источники списков (автообновление): `runetfreedom/russia-v2ray-rules-dat` (geosite/geoip RU, ru-blocked), `itdoginfo/allow-domains`, MaxMind/DB-IP mmdb.
-
-## Важные ограничения
-- CF Worker не может `connect()` к IP Cloudflare и не делает UDP → используем только для TCP-протоколов Psiphon/правил. Для Psiphon QUIC — не через Worker.
-- TUN требует прав администратора (Windows: wintun.dll рядом с exe; сервис-помощник).
-- Петли: исходящие сокеты сайдкаров/движка привязываются к физическому интерфейсу (`IP_UNICAST_IF` на Windows, `SO_BINDTODEVICE` на Linux), процесс psiphon исключён из TUN.
-
-## Готовые решения (референсы, не копировать слепо)
-- `Psiphon-Labs/psiphon-tunnel-core` — ядро (сайдкар).
-- `bepass-org/warp-plus` (Go) — WARP + сканер + режим Psiphon-over-WARP с выбором страны: ближайший аналог идеи.
-- `aramperes/onetun` (Rust) — boringtun + smoltcp → TCP-форвардинг (основа psi-warp).
-- `tun2proxy/tun2proxy`, `narrowlink/ipstack` (Rust) — TUN → SOCKS (основа psi-tun).
-- `hufrea/byedpi`, `bol-van/zapret`, `xvzc/SpoofDPI`, `ValdikSS/GoodbyeDPI` — техники обхода DPI (psi-dpi).
-- `amnezia-vpn/amneziawg-go` — junk/I1-пакеты (обфускация WG).
-- `runetfreedom/russia-v2ray-rules-dat`, `itdoginfo/allow-domains` — списки РФ.
-- `zizifn/edgetunnel`, `cmliu/edgetunnel` — VLESS на CF Workers (PROXYIP, early-data).
-- `SagerNet/sing-box` — эталон правил/TUN/fake-ip (подсматривать логику).
+## Защита от утечек на Windows (`wfp_windows.go`, `tun_windows.go`, `tun.go`, `netwatch_windows.go`)
+1. **WFP Kill Switch (`wfp_windows.go`)**: 3 режима (`off`, `auto`, `strict`) через Windows Filtering Platform (`fwpuclnt.dll`) с разрешением loopback, RFC1918 LAN, самого `psiroute.exe` и адаптера Wintun, плюс автоматическая очистка сиротских фильтров при старте после аварийного завершения.
+2. **IPv6 Blackhole (`tun_windows.go`, `tun.go`)**: при `tun.ipv6 = false` маршруты `::/1` и `8000::/1` всё равно перехватываются на TUN, а все IPv6-пакеты сбрасываются внутри gVisor, исключая утечку нативного IPv6 провайдера.
+3. **Строгий Split-DNS (`tun.go`, `dns.go`)**: перехват TCP/UDP 53, блокировка DoT (853) и публичных DoH IP/доменов, запрет отката DNS-запросов туннелируемых доменов в `obDirect` при включённом Kill Switch или обрыве Psiphon, сброс `DnsFlushResolverCache`.
+4. **Событийный мониторинг сети (`netwatch_windows.go`)**: подписка на `NotifyRouteChange2` (`iphlpapi.dll`) для мгновенной реакции на смену шлюза/Wi-Fi и перепривязку `IP_UNICAST_IF` без задержек поллинга.
+5. **Умный Watchdog (`psi.go`)**: детектирование «тихой блокировки» ТСПУ (передача контрольного чанка `>= 32 КБ` через туннель и переключение стратегии при 2 сбоях подряд).

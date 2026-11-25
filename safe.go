@@ -6,8 +6,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -50,30 +52,126 @@ func catchPanic(where string, f func()) (panicked bool) {
 	return false
 }
 
-// goSafe runs f in a goroutine that survives a panic in f.
-func goSafe(where string, f func()) {
+// safeGo runs f in a goroutine that survives a panic: the panic and its stack
+// go to the log (reportPanic) and only this task is lost. Every background
+// launch in the program goes through it (audit A-06).
+func safeGo(name string, f func()) {
 	go func() {
-		defer recoverLog(where)
+		defer recoverLog(name)
 		f()
 	}()
 }
 
-// goLoop runs a long-lived loop and starts it again after a panic, so one
-// bad moment does not silently switch off stats, config watching or WARP.
-func goLoop(ctx context.Context, where string, f func()) {
-	go func() {
-		for {
-			if !catchPanic(where, f) || ctx.Err() != nil {
-				return
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(2 * time.Second):
-			}
+// goSafe is the older name of safeGo, kept for existing call sites.
+func goSafe(where string, f func()) { safeGo(where, f) }
+
+const (
+	loopMaxCrashes   = 5                // crashes per window before the component is marked failed
+	loopCrashWindow  = time.Minute      // sliding window for the counter
+	loopBackoffStart = 500 * time.Millisecond
+	loopBackoffMax   = 30 * time.Second
+)
+
+// loopCrashTracker counts crashes of one long-lived component inside a sliding
+// window. It is separate from the goroutine so tests can drive it with a fake
+// clock.
+type loopCrashTracker struct {
+	times []time.Time
+}
+
+// note records a crash at now and reports how many crashes lie inside the
+// window (including this one).
+func (t *loopCrashTracker) note(now time.Time) int {
+	keep := t.times[:0]
+	for _, x := range t.times {
+		if now.Sub(x) < loopCrashWindow {
+			keep = append(keep, x)
 		}
+	}
+	t.times = append(keep, now)
+	return len(t.times)
+}
+
+// loopBackoff is the pause before restart number n (1 = first crash).
+func loopBackoff(n int) time.Duration {
+	d := loopBackoffStart
+	for i := 1; i < n; i++ {
+		d *= 2
+		if d >= loopBackoffMax {
+			return loopBackoffMax
+		}
+	}
+	return d
+}
+
+var failedComponents sync.Map // name -> time.Time when marked failed
+
+// componentFailed reports whether a long-lived component was switched off
+// after too many crashes.
+func componentFailed(name string) bool {
+	_, ok := failedComponents.Load(name)
+	return ok
+}
+
+// failedComponentNames lists components marked failed, sorted.
+func failedComponentNames() []string {
+	var out []string
+	failedComponents.Range(func(k, _ any) bool {
+		out = append(out, k.(string))
+		return true
+	})
+	sort.Strings(out)
+	return out
+}
+
+// runLoopSupervised runs f until it returns without a panic, ctx ends, or the
+// component fails (loopMaxCrashes crashes inside loopCrashWindow). Between
+// crashes it waits with exponential backoff. sleep is injectable for tests.
+// It returns true if the component was marked failed.
+func runLoopSupervised(ctx context.Context, name string, f func(), now func() time.Time, sleep func(context.Context, time.Duration)) (failed bool) {
+	var tr loopCrashTracker
+	crashes := 0
+	for {
+		if !catchPanic(name, f) || ctx.Err() != nil {
+			return false
+		}
+		crashes++
+		if n := tr.note(now()); n >= loopMaxCrashes {
+			failedComponents.Store(name, now())
+			logf("error", "Компонент «%s» остановлен: %d сбоев за минуту. Остальные функции Psiroute работают; перезапустите программу, а если сбой повторяется — отправьте psiroute.log разработчику", name, n)
+			return true
+		}
+		d := loopBackoff(crashes)
+		logf("warn", "Компонент «%s» перезапустится через %s (сбой %d из %d за минуту)", name, d, tr.note2(), loopMaxCrashes)
+		sleep(ctx, d)
+		if ctx.Err() != nil {
+			return false
+		}
+	}
+}
+
+// note2 is the current number of crashes in the window, without adding one.
+func (t *loopCrashTracker) note2() int { return len(t.times) }
+
+func sleepCtx(ctx context.Context, d time.Duration) {
+	select {
+	case <-ctx.Done():
+	case <-time.After(d):
+	}
+}
+
+// safeLoop starts a long-lived loop in a goroutine and restarts it after a
+// panic with backoff; after loopMaxCrashes crashes in a minute the component
+// is marked failed and the process keeps living.
+func safeLoop(ctx context.Context, name string, f func()) {
+	go func() {
+		defer recoverLog(name)
+		runLoopSupervised(ctx, name, f, time.Now, sleepCtx)
 	}()
 }
+
+// goLoop is the older name of safeLoop, kept for existing call sites.
+func goLoop(ctx context.Context, where string, f func()) { safeLoop(ctx, where, f) }
 
 func crashLogPath(dir string) string { return filepath.Join(dir, "crash.log") }
 

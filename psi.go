@@ -59,19 +59,6 @@ const (
 	speedURL = "https://speed.cloudflare.com/__down?bytes=20000000"
 )
 
-// psiBootstrapTXTDomains — резервные домены DNS TXT для доставки подписанных
-// записей серверов Psiphon (server entries) при шатдаунах S3-списков (Priority 4).
-var psiBootstrapTXTDomains = []string{
-	"_psiroute-se.psiphon-mirror.net",
-	"_serverentries.psiroute-bootstrap.org",
-}
-
-// psiBootstrapMirrorURLs — резервные HTTPS-зеркала для загрузки подписанных
-// списков server entries при недоступности штатного RSL (Priority 4).
-var psiBootstrapMirrorURLs = []string{
-	"https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core/master/ServerEntries",
-}
-
 // psiPingTargets — независимые цели для проверки связности внутри туннеля.
 // Туннель считается потерявшим связь только в том случае, если не ответили ВСЕ цели.
 var psiPingTargets = []struct {
@@ -116,10 +103,13 @@ type strategyDef struct {
 }
 
 var psiStrategies = []strategyDef{
+	{ID: "direct-dpi", Title: "Прямой + DPI-обход TLS (без WARP)", Transport: "desync", Protos: "tls", Upstream: "None"},
+	{ID: "desync-meek", Title: "CDN Meek + DPI-обход (без WARP)", Transport: "desync", Protos: "meek", Upstream: "None"},
+	{ID: "desync-ossh", Title: "OSSH / Shadowsocks + TCP-дробление", Transport: "desync", Protos: "ossh", Upstream: "None"},
 	{ID: "auto", Title: "Авто (все протоколы)", Transport: "direct", Upstream: "None"},
 	{ID: "conduit", Title: "Conduit (через добровольцев)", Transport: "direct", Protos: "conduit", Upstream: "None"},
 	{ID: "meek", Title: "Через CDN (meek)", Transport: "direct", Protos: "meek", Upstream: "None"},
-	{ID: "tls", Title: "TLS", Transport: "direct", Protos: "tls", Upstream: "None"},
+	{ID: "tls", Title: "TLS (сильное дробление ClientHello)", Transport: "direct", Protos: "tls", DPI: "strong", Upstream: "None"},
 	{ID: "quic", Title: "QUIC", Transport: "direct", Protos: "quic", DPI: "off", Upstream: "None"},
 	{ID: "ossh", Title: "OSSH и Shadowsocks", Transport: "direct", Protos: "ossh", Upstream: "None"},
 	{ID: "via-warp", Title: "Через WARP", Transport: "warp", Upstream: "Warp"},
@@ -216,6 +206,18 @@ type Psi struct {
 	notes               chan psiNotice
 	cmd                 chan string
 	cancel              context.CancelFunc
+	timeline            *connTimeline
+	preflight           *preflightCache
+	lastPreflight       *CarrierReport
+	preflightProbes     *preflightProbes
+	preflightCarriersFn func() []Carrier
+	seedProbe           func(ctx context.Context, c Carrier, rawURL string, n int) (int, error) // tests; nil = probeRangeOverCarrier
+	seedSourcesMu       sync.Mutex
+	stage               string
+	tacticsApplied      bool
+	tacticsTag          string
+	rslInProgress       atomic.Bool
+	tacticsInProgress   atomic.Bool
 	done                chan struct{}
 }
 
@@ -229,10 +231,101 @@ func newPsi(app *App, dataDir string) *Psi {
 		notes:       make(chan psiNotice, 64),
 		cmd:         make(chan string, 4),
 		warnSeen:    map[string]bool{},
+		timeline:    newConnTimeline(defaultTimelineCapacity),
+		preflight:   newPreflightCache(preflightCacheTTL),
 	}
 	p.loadSavedNetID()
+	p.loadOptionalSeedBundle()
 	psiphon.SetNoticeWriter(psiphon.NewNoticeReceiver(p.onNotice))
 	return p
+}
+
+// tl returns the connection timeline, lazily initializing it if needed.
+func (p *Psi) tl() *connTimeline {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.timeline == nil {
+		p.timeline = newConnTimeline(defaultTimelineCapacity)
+	}
+	return p.timeline
+}
+
+// RunPreflight executes Stage 0 carrier preflight (<= 8 s, parallel) with
+// per-network TTL caching and records a summary event in the connection timeline.
+func (p *Psi) RunPreflight(ctx context.Context, force bool) *CarrierReport {
+	if p == nil {
+		return nil
+	}
+	netKey := p.currentNetKey()
+	p.mu.Lock()
+	if p.preflight == nil {
+		p.preflight = newPreflightCache(preflightCacheTTL)
+	}
+	cache := p.preflight
+	probes := p.preflightProbes
+	carriersFn := p.preflightCarriersFn
+	p.mu.Unlock()
+
+	nowFn := time.Now
+	if probes != nil && probes.Now != nil {
+		nowFn = probes.Now
+	}
+	if !force {
+		if cached := cache.Get(netKey, nowFn()); cached != nil {
+			p.mu.Lock()
+			p.lastPreflight = cached.Clone()
+			p.mu.Unlock()
+			return cached
+		}
+	}
+	var carriers []Carrier
+	if carriersFn != nil {
+		carriers = carriersFn()
+	} else {
+		carriers = p.buildCarriers()
+	}
+	rep := runPreflight(ctx, netKey, carriers, probes)
+	cache.Set(netKey, rep)
+	p.mu.Lock()
+	p.lastPreflight = rep.Clone()
+	p.mu.Unlock()
+
+	outcome := "ok"
+	if rep.ClassifiedCode != "" {
+		outcome = "info"
+	}
+	p.tl().Record(connTimelineEvent{
+		Stage:      "preflight",
+		DurationMs: rep.DurationMs,
+		Outcome:    outcome,
+		DiagCode:   rep.ClassifiedCode,
+		Detail:     "ranking=" + strings.Join(rep.Ranking, ","),
+	})
+	return rep
+}
+
+func (p *Psi) invalidatePreflight(netKey string) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	cache := p.preflight
+	p.mu.Unlock()
+	if cache != nil {
+		cache.Invalidate(netKey)
+	}
+}
+
+func (p *Psi) lastPreflightReport() *CarrierReport {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastPreflight.Clone()
 }
 
 // loadSavedNetID восстанавливает сохранённый счётчик ручной смены узла (manualEpoch)
@@ -344,7 +437,7 @@ func (p *Psi) Start() {
 	if p.app != nil {
 		p.app.tun.refresh()
 	}
-	go func() {
+	safeGo("Psi.Start", func() {
 		defer close(done)
 		for catchPanic("Psiphon", func() { p.run(ctx) }) && ctx.Err() == nil {
 			p.set(func() { p.state = "reconnecting" })
@@ -353,7 +446,7 @@ func (p *Psi) Start() {
 			case <-time.After(3 * time.Second):
 			}
 		}
-	}()
+	})
 }
 
 func (p *Psi) Stop() {
@@ -427,14 +520,14 @@ func (p *Psi) ensureLocalDesyncProxy() string {
 	addr := p.desyncProxyAddr
 	p.mu.Unlock()
 
-	go func() {
+	safeGo("Psi.ensureLocalDesyncProxy", func() {
 		for {
 			c, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			go serveWorkerSocks(p.app.ctx, c, func(ctx context.Context, network, targetAddr string) (net.Conn, error) {
-				method := "split"
+			safeGo("Psi.ensureLocalDesyncProxy#2", func() { serveWorkerSocks(p.app.ctx, c, func(ctx context.Context, network, targetAddr string) (net.Conn, error) {
+				method := "auto"
 				if p.app != nil && p.app.cfg != nil {
 					p.app.cfg.mu.Lock()
 					if p.app.cfg.Desync.Method != "" {
@@ -442,11 +535,53 @@ func (p *Psi) ensureLocalDesyncProxy() string {
 					}
 					p.app.cfg.mu.Unlock()
 				}
-				return dialObfs(ctx, network, targetAddr, method)
-			})
+				conn, derr := dialObfs(ctx, network, targetAddr, method)
+				if derr != nil {
+					return nil, derr
+				}
+				return &psiRawSplitConn{Conn: conn}, nil
+			}) })
 		}
-	}()
+	})
 	return addr
+}
+
+// psiRawSplitConn fragments the first non-TLS / non-HTTP write (e.g. OSSH or
+// Shadowsocks handshake) into tiny 1–4 byte TCP chunks with 2 ms pacing to
+// break TSPU first-packet entropy/signature classification without WARP.
+type psiRawSplitConn struct {
+	net.Conn
+	done atomic.Bool
+}
+
+func (c *psiRawSplitConn) Write(p []byte) (int, error) {
+	if c.done.Swap(true) || len(p) <= 6 {
+		return c.Conn.Write(p)
+	}
+	// TLS ClientHello (0x16 0x03) and HTTP are already fragmented by obfsConn inside dialObfs.
+	if (p[0] == 0x16 && p[1] == 0x03) || obfsLooksHTTP(p) {
+		return c.Conn.Write(p)
+	}
+	if tc, ok := c.Conn.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+	}
+	splitLimit := min(len(p), 48)
+	written := 0
+	for written < splitLimit {
+		chunk := min(3, splitLimit-written)
+		n, err := c.Conn.Write(p[written : written+chunk])
+		written += n
+		if err != nil {
+			return written, err
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if written < len(p) {
+		n, err := c.Conn.Write(p[written:])
+		written += n
+		return written, err
+	}
+	return written, nil
 }
 
 func (p *Psi) Restart() {
@@ -548,6 +683,29 @@ func (p *Psi) rotateNetID() {
 
 func (p *Psi) run(ctx context.Context) {
 	fails := 0
+	prevCarrier := ""
+	p.set(func() { p.stage = "stage0_preflight" })
+	rep := p.RunPreflight(ctx, false)
+	// Stage 1: check seed health and optionally fetch from user-configured mirror over healthy carriers.
+	p.set(func() { p.stage = "stage1_seed" })
+	sh := p.SeedHealth()
+	var mirrorURL string
+	if p.app != nil && p.app.cfg != nil {
+		p.app.cfg.mu.Lock()
+		mirrorURL = p.app.cfg.Psiphon.MirrorURL
+		p.app.cfg.mu.Unlock()
+	}
+	if !sh.Healthy && mirrorURL != "" {
+		var carriers []Carrier
+		if p.preflightCarriersFn != nil {
+			carriers = p.preflightCarriersFn()
+		} else {
+			carriers = p.buildCarriers()
+		}
+		_ = p.AcquireSeedsParallel(ctx, carriers, mirrorURL, nil)
+	}
+	_ = rep
+	p.set(func() { p.stage = "stage2_connect" })
 	for ctx.Err() == nil {
 		netKey := p.currentNetKey()
 		ordered := p.orderForNetwork(netKey, p.enabled(), p.lastGood())
@@ -558,6 +716,12 @@ func (p *Psi) run(ctx context.Context) {
 				p.diagCode = "no_strategies"
 				p.diagReason = "Все способы подключения отключены"
 				p.diagAdvice = "Включите хотя бы один способ подключения в настройках Psiphon"
+			})
+			p.tl().Record(connTimelineEvent{
+				Stage:    "error",
+				Outcome:  "failed",
+				DiagCode: "no_strategies",
+				Detail:   "Все способы подключения отключены",
 			})
 			select {
 			case <-ctx.Done():
@@ -618,20 +782,76 @@ func (p *Psi) run(ctx context.Context) {
 		} else {
 			logf("info", "Psiphon [%s]: пробую «%s»", netKey, s.Title)
 		}
+		carrier := carrierNameForStrategy(s)
+		if prevCarrier != "" && (prevCarrier == carrierDirect || prevCarrier == carrierDirectDPI) && (carrier == carrierWARP || carrier == carrierWorker || carrier == carrierProxy) {
+			p.set(func() { p.stage = "stage3_escalate" })
+			p.RunPreflight(ctx, false)
+		}
+		prevCarrier = carrier
+		attemptStart := time.Now()
+		protos := protocolsForStrategy(s)
+		p.mu.Lock()
+		attemptNum := p.attempt
+		p.mu.Unlock()
+		p.tl().RecordAttempt(carrier, protos)
+		p.tl().Record(connTimelineEvent{
+			Stage:      "attempt_start",
+			Carrier:    carrier,
+			StrategyID: s.ID,
+			Protocols:  protos,
+			Attempt:    attemptNum,
+			Outcome:    "info",
+			Detail:     s.Title,
+		})
 		wasUnstable := p.isUnstable(s.ID)
 		wasConnected, err := p.attemptOnce(ctx, s, timeout)
 		if ctx.Err() != nil {
 			return
 		}
+		attemptDurMs := time.Since(attemptStart).Milliseconds()
 		switch {
 		case errors.Is(err, errRotate), errors.Is(err, errForceRotate), errors.Is(err, errNetChange):
+			p.tl().Record(connTimelineEvent{
+				Stage:      "attempt_end",
+				Carrier:    carrier,
+				StrategyID: s.ID,
+				Protocols:  protos,
+				Attempt:    attemptNum,
+				DurationMs: attemptDurMs,
+				Outcome:    "rotate",
+				Detail:     err.Error(),
+			})
+			if errors.Is(err, errNetChange) {
+				p.invalidatePreflight("")
+				p.RunPreflight(ctx, true)
+			}
 			p.set(func() { p.state = "reconnecting" })
 			continue
 		case errors.Is(err, errNext):
+			p.tl().Record(connTimelineEvent{
+				Stage:      "attempt_end",
+				Carrier:    carrier,
+				StrategyID: s.ID,
+				Protocols:  protos,
+				Attempt:    attemptNum,
+				DurationMs: attemptDurMs,
+				Outcome:    "next",
+			})
 			fails++
 			p.set(func() { p.state = "reconnecting" })
 			continue
 		case errors.Is(err, errUnstable):
+			p.tl().Record(connTimelineEvent{
+				Stage:      "attempt_end",
+				Carrier:    carrier,
+				StrategyID: s.ID,
+				Protocols:  protos,
+				Attempt:    attemptNum,
+				DurationMs: attemptDurMs,
+				Outcome:    "unstable",
+				DiagCode:   "handshake_reset",
+				Detail:     err.Error(),
+			})
 			if wasUnstable || len(ordered) == 1 {
 				fails++
 			}
@@ -655,6 +875,21 @@ func (p *Psi) run(ctx context.Context) {
 			p.diagReason = reason
 			p.diagAdvice = advice
 		})
+		outcome := "failed"
+		if errors.Is(err, errTimeout) {
+			outcome = "timeout"
+		}
+		p.tl().Record(connTimelineEvent{
+			Stage:      "attempt_end",
+			Carrier:    carrier,
+			StrategyID: s.ID,
+			Protocols:  protos,
+			Attempt:    attemptNum,
+			DurationMs: attemptDurMs,
+			Outcome:    outcome,
+			DiagCode:   code,
+			Detail:     reason,
+		})
 		logf("warn", "Psiphon «%s»: %s (%s)", s.Title, msg, reason)
 		if len(ordered) == 1 || fails >= len(round0Plan) && (fails-len(round0Plan))%len(ordered) == 0 {
 			wait := time.Duration(min(5<<min(fails/max(len(ordered), 1), 5), 120)) * time.Second
@@ -673,10 +908,23 @@ func (p *Psi) configFor(s strategyDef, timeout int) *psiphon.Config {
 	region := strings.ToUpper(c.Psiphon.Country)
 	pool := c.Psiphon.Parallel
 	dpi := c.Psiphon.DPI
+	preset := normalizePreset(c.Psiphon.Preset)
+	propID := strings.TrimSpace(c.Psiphon.PropagationChannelID)
+	sponsorID := strings.TrimSpace(c.Psiphon.SponsorID)
+	platform := strings.TrimSpace(c.Psiphon.ClientPlatform)
 	warp := c.Warp.Socks
 	builtinWarp := c.Warp.Engine != "socks"
 	upstream := c.Proxy.Upstream
 	c.mu.Unlock()
+	if propID == "" || validateHexID16(propID) != nil {
+		propID = psiPropagationChannelID
+	}
+	if sponsorID == "" || validateHexID16(sponsorID) != nil {
+		sponsorID = psiSponsorID
+	}
+	if platform == "" {
+		platform = psiPlatform
+	}
 	if pool < 1 {
 		pool = 1
 	}
@@ -689,14 +937,14 @@ func (p *Psi) configFor(s strategyDef, timeout int) *psiphon.Config {
 		EgressRegion:                       region,
 		DisableLocalSocksProxy:             true,
 		DisableLocalHTTPProxy:              true,
-		PropagationChannelId:               psiPropagationChannelID,
-		SponsorId:                          psiSponsorID,
+		PropagationChannelId:               propID,
+		SponsorId:                          sponsorID,
 		RemoteServerListDownloadFilename:   "remote_server_list",
 		RemoteServerListSignaturePublicKey: psiRSLKey,
 		RemoteServerListURLs:               psiRSLURLs(),
 		EmitDiagnosticNotices:              true,
 		NetworkID:                          p.netID(),
-		ClientPlatform:                     psiPlatform,
+		ClientPlatform:                     platform,
 		DataRootDirectory:                  dir,
 		TunnelPoolSize:                     pool,
 		EstablishTunnelPausePeriodSeconds:  ptr(2),
@@ -704,6 +952,7 @@ func (p *Psi) configFor(s strategyDef, timeout int) *psiphon.Config {
 	if timeout > 0 {
 		cfg.EstablishTunnelTimeoutSeconds = &timeout
 	}
+	seedEmptyOrRSL := p.importedServerEntriesCount() == 0 || p.rslInProgress.Load()
 	switch s.Transport {
 	case "warp":
 		if builtinWarp && p.app != nil {
@@ -725,6 +974,15 @@ func (p *Psi) configFor(s strategyDef, timeout int) *psiphon.Config {
 	} else if set := psiProtoSets[s.Protos]; len(set) > 0 {
 		cfg.LimitTunnelProtocols = append([]string(nil), set...)
 	}
+	carrier := carrierNameForStrategy(s)
+	lastRep := p.lastPreflightReport()
+	roundGuess := 0
+	if timeout >= 150 {
+		roundGuess = 2
+	} else if timeout >= 75 {
+		roundGuess = 1
+	}
+	applyTuning(cfg, preset, carrier, lastRep, roundGuess, seedEmptyOrRSL)
 	if cfg.UpstreamProxyURL != "" {
 		cfg.UpstreamProxyAllowAllServerEntrySources = ptr(true)
 		return cfg
@@ -762,7 +1020,7 @@ func applyDPI(c *psiphon.Config, mode string) {
 	case "strong":
 		frag(1000, 3000, 1, 10, 5000, 30000)
 	default:
-		frag(300, 1500, 1, 60, 500, 10000)
+		frag(256, 1400, 1, 16, 1000, 8000)
 	}
 	c.TLSFragmentClientHelloProbability = ptr(1.0)
 }
@@ -837,6 +1095,8 @@ func (p *Psi) checkDirectNetAlive(ctx context.Context) bool {
 func (p *Psi) attemptOnce(ctx context.Context, s strategyDef, timeout int) (connected bool, err error) {
 	netKey := p.currentNetKey()
 	startAttempt := time.Now()
+	carrier := carrierNameForStrategy(s)
+	protos := protocolsForStrategy(s)
 	cfg := p.configFor(s, timeout)
 	if err := cfg.Commit(true); err != nil {
 		return false, err
@@ -846,14 +1106,6 @@ func (p *Psi) attemptOnce(ctx context.Context, s strategyDef, timeout int) (conn
 	}
 	defer psiphon.CloseDataStore()
 
-	// Priority 4: If built-in RSL downloads failed or 0 candidate servers are known,
-	// attempt emergency bootstrap via DNS TXT & signed mirrors before opening controller.
-	p.mu.Lock()
-	needBootstrap := p.rslFailed > 0 || p.candidates == 0
-	p.mu.Unlock()
-	if needBootstrap && p.importedServerEntriesCount() == 0 {
-		_ = p.bootstrapEmergencyServerEntries(ctx, defaultBootstrapEd25519PubHex)
-	}
 	p.loadSavedServerEntriesIntoStore(cfg)
 
 	ctl, err := psiphon.NewController(cfg)
@@ -865,10 +1117,10 @@ func (p *Psi) attemptOnce(ctx context.Context, s strategyDef, timeout int) (conn
 	}
 	actx, cancel := context.WithCancel(ctx)
 	runDone := make(chan struct{})
-	go func() {
+	safeGo("Psi.attemptOnce", func() {
 		ctl.Run(actx)
 		close(runDone)
-	}()
+	})
 	defer func() {
 		// Graceful handover only on automatic rotation; manual Stop drops standby immediately.
 		if !p.isUserStopped() {
@@ -901,12 +1153,16 @@ func (p *Psi) attemptOnce(ctx context.Context, s strategyDef, timeout int) (conn
 	defer health.Stop()
 
 	var upAt time.Time
+	var pendingConnMs int
+	var rslGraceExtended bool
 	quick := 0
 	var holdC <-chan time.Time
 
 	defer func() {
 		if !upAt.IsZero() {
-			p.recordStrategyLifetime(netKey, p.effectiveStrategyID(s), time.Since(upAt))
+			life := time.Since(upAt)
+			p.recordStrategyLifetime(netKey, p.effectiveStrategyID(s), life)
+			p.tl().RecordHold(life)
 		}
 	}()
 
@@ -924,11 +1180,12 @@ func (p *Psi) attemptOnce(ctx context.Context, s strategyDef, timeout int) (conn
 				if count > 0 && p.cur.Load() == nil {
 					connected = true
 					connMs := int(time.Since(startAttempt).Milliseconds())
+					pendingConnMs = connMs
 					p.cur.Store(ctl)
 					effID := p.effectiveStrategyID(s)
-					p.recordStrategySuccess(netKey, effID, connMs)
 					p.set(func() {
 						p.state = "connected"
+						p.stage = "stage4_hold"
 						p.lastErr = ""
 						p.diagCode = ""
 						p.diagReason = ""
@@ -938,9 +1195,28 @@ func (p *Psi) attemptOnce(ctx context.Context, s strategyDef, timeout int) (conn
 					if p.app != nil {
 						p.app.tun.refresh()
 					}
+					p.mu.Lock()
+					activeProto := p.protocol
+					p.mu.Unlock()
+					p.tl().RecordConnect(carrier, activeProto, connMs)
+					connProtos := protos
+					if activeProto != "" {
+						connProtos = []string{activeProto}
+					}
+					p.tl().Record(connTimelineEvent{
+						Stage:      "connected",
+						Carrier:    carrier,
+						StrategyID: effID,
+						Protocols:  connProtos,
+						DurationMs: int64(connMs),
+						Outcome:    "ok",
+					})
 					logf("info", "Psiphon подключён: «%s» (%d мс, сеть %s)", s.Title, connMs, netKey)
 					upAt, holdC = time.Now(), time.After(holdOK)
-					go p.onConnected(actx, s, ctl)
+					{
+						actx, s, ctl := actx, s, ctl // snapshot: the loop reuses these names
+						safeGo("Psi.attemptOnce#2", func() { p.onConnected(actx, s, ctl) })
+					}
 				} else if count == 0 && p.cur.Load() != nil {
 					p.cur.Store(nil)
 					p.set(func() { p.state = "reconnecting"; p.since = time.Time{} })
@@ -948,6 +1224,14 @@ func (p *Psi) attemptOnce(ctx context.Context, s strategyDef, timeout int) (conn
 					holdC = nil
 					if life := time.Since(upAt); !upAt.IsZero() {
 						p.recordStrategyLifetime(netKey, p.effectiveStrategyID(s), life)
+						p.tl().RecordHold(life)
+						p.tl().Record(connTimelineEvent{
+							Stage:      "disconnected",
+							Carrier:    carrier,
+							StrategyID: p.effectiveStrategyID(s),
+							DurationMs: life.Milliseconds(),
+							Outcome:    "failed",
+						})
 						if life < shortLife {
 							quick++
 							logf("warn", "Psiphon «%s»: туннели продержались всего %s", s.Title, humanDur(life))
@@ -961,6 +1245,19 @@ func (p *Psi) attemptOnce(ctx context.Context, s strategyDef, timeout int) (conn
 					}
 				}
 			case "EstablishTunnelTimeout":
+				if !rslGraceExtended && (p.rslInProgress.Load() || p.tacticsInProgress.Load()) {
+					rslGraceExtended = true
+					logf("info", "Psiphon «%s»: загрузка списка серверов/тактик ещё идёт — продлеваю ожидание", s.Title)
+					continue
+				}
+				p.tl().Record(connTimelineEvent{
+					Stage:      "timeout",
+					Carrier:    carrier,
+					StrategyID: s.ID,
+					Protocols:  protos,
+					DurationMs: time.Since(startAttempt).Milliseconds(),
+					Outcome:    "timeout",
+				})
 				return connected, errTimeout
 			case "Exiting":
 				return connected, errors.New("Psiphon завершил работу")
@@ -1008,6 +1305,27 @@ func (p *Psi) attemptOnce(ctx context.Context, s strategyDef, timeout int) (conn
 		case <-holdC:
 			holdC = nil
 			effID := p.effectiveStrategyID(s)
+			// Stage 4: record strategy as good ONLY after 64 KB transfer succeeds and tunnel held >= 3 min.
+			if cerr := p.probeChunk64KB(ctx); cerr != nil {
+				p.tl().RecordStall16KB()
+				p.tl().Record(connTimelineEvent{
+					Stage:      "stall_16kb",
+					Carrier:    carrier,
+					StrategyID: effID,
+					Outcome:    "failed",
+					Detail:     cerr.Error(),
+				})
+				logf("warn", "Psiphon «%s»: 64 КБ проверка после удержания не прошла (%v) — способ не запоминается", s.Title, cerr)
+				continue
+			}
+			p.recordStrategySuccess(netKey, effID, pendingConnMs)
+			p.tl().Record(connTimelineEvent{
+				Stage:      "hold_ok",
+				Carrier:    carrier,
+				StrategyID: effID,
+				DurationMs: int64(holdOK / time.Millisecond),
+				Outcome:    "ok",
+			})
 			if p.dataDir != "" {
 				_ = writeFileAtomic(p.file("psiroute-last"), []byte(effID), 0o600)
 			}
@@ -1025,6 +1343,23 @@ func (p *Psi) attemptOnce(ctx context.Context, s strategyDef, timeout int) (conn
 				continue
 			}
 			ms, herr := p.ping(ctx)
+			if herr == nil {
+				// Smart Watchdog: verify real >= 64 KB chunk transfer every 3rd health tick
+				// to detect TSPU silent drops after ~16 KB while TCP socket stays alive.
+				if healthOK > 0 && healthOK%3 == 0 {
+					if cerr := p.probeChunk64KB(ctx); cerr != nil {
+						p.tl().RecordStall16KB()
+						p.tl().Record(connTimelineEvent{
+							Stage:      "stall_16kb",
+							Carrier:    carrier,
+							StrategyID: s.ID,
+							Outcome:    "failed",
+							Detail:     cerr.Error(),
+						})
+						herr = fmt.Errorf("тихая блокировка >64 КБ: %w", cerr)
+					}
+				}
+			}
 			if herr != nil {
 				if !p.checkDirectNetAlive(ctx) {
 					logf("warn", "Psiphon: прямая сеть недоступна — ожидаю восстановления интернета, туннель не сбрасываю")
@@ -1033,19 +1368,31 @@ func (p *Psi) attemptOnce(ctx context.Context, s strategyDef, timeout int) (conn
 						p.diagReason = "Нет прямого доступа к интернету"
 						p.diagAdvice = "Проверьте подключение к Wi-Fi или провайдеру"
 					})
+					if p.app != nil && p.app.fsm != nil {
+						p.app.fsm.Transition(CoreDegraded, StageCheck, "Нет прямого доступа к интернету")
+					}
 					health.Reset(10 * time.Second)
 					continue
 				}
 				healthFails++
 				healthOK = 0
-				logf("warn", "Psiphon: проверка связи не прошла (%d/3): %s", healthFails, short(herr.Error(), 120))
-				if healthFails >= 3 {
+				if p.app != nil && p.app.fsm != nil {
+					p.app.fsm.Transition(CoreDegraded, StageCheck, short(herr.Error(), 90))
+				}
+				logf("warn", "Psiphon: проверка связи не прошла (%d/2): %s", healthFails, short(herr.Error(), 120))
+				if healthFails >= 2 {
+					if p.app != nil && p.app.fsm != nil {
+						p.app.fsm.Transition(CoreReconnecting, StageTunnel, "Переключение транспорта после 2 сбоев Watchdog")
+					}
 					return connected, errRotate
 				}
 			} else {
 				healthFails = 0
 				healthOK++
 				p.set(func() { p.healthMs = ms })
+				if p.app != nil && p.app.fsm != nil {
+					p.app.fsm.Transition(CoreConnected, StageReady, "")
+				}
 			}
 			health.Reset(adaptiveHealthInterval(baseHealthSec(), healthOK, healthFails))
 		}
@@ -1093,6 +1440,14 @@ func (p *Psi) onConnected(ctx context.Context, s strategyDef, controller *psipho
 			}
 		})
 		logf("info", "Psiphon: выход %s (%s, %s)", tr.IP, tr.Loc, tr.Colo)
+		p.app.cfg.mu.Lock()
+		pinnedReg := strings.TrimSpace(p.app.cfg.Psiphon.Country)
+		p.app.cfg.mu.Unlock()
+		if pinnedReg == "" && tr.Loc != "" && p.app.cfg.isCountryBlocked(tr.Loc) {
+			logf("warn", "Psiphon: страна выхода %s в чёрном списке — автоматически меняю узел", tr.Loc)
+			p.send("manual-rotate")
+			return
+		}
 	}
 	ms, _ := p.ping(ctx)
 	p.mu.Lock()
@@ -1226,17 +1581,17 @@ func (p *Psi) Dial(ctx context.Context, network, addr string) (net.Conn, error) 
 			err error
 		}
 		ch := make(chan res, 1)
-		go func() {
+		safeGo("Psi.Dial", func() {
 			c, err := ctl.Dial(addr, nil)
 			ch <- res{c, err}
-		}()
+		})
 		select {
 		case <-ctx.Done():
-			go func() {
+			safeGo("Psi.Dial#2", func() {
 				if r := <-ch; r.c != nil {
 					r.c.Close()
 				}
-			}()
+			})
 			return nil, ctx.Err()
 		case r := <-ch:
 			if r.err == nil {
@@ -1314,11 +1669,21 @@ func (p *Psi) pingOneTarget(ctx context.Context, host, path string) (int, error)
 	return int(time.Since(t0).Milliseconds()), nil
 }
 
+// probeChunk64KB verifies that the active tunnel can transfer at least 64 KB
+// of payload data (detecting TSPU silent drops that stall flows after ~16 KB).
+func (p *Psi) probeChunk64KB(ctx context.Context) error {
+	if p == nil {
+		return errors.New("psiphon nil")
+	}
+	_, _, err := probeChunk64KBWithDial(ctx, p.Dial, probeChunkURL)
+	return err
+}
+
 // speed downloads for up to d and returns KB/s (0 when under 32 KB came in).
 func (p *Psi) speed(ctx context.Context, d time.Duration) (int, error) {
 	ctx, cancel := context.WithTimeout(ctx, d+10*time.Second)
 	defer cancel()
-	cl := &http.Client{Transport: &http.Transport{DialContext: p.DialBalanced}}
+	cl := &http.Client{Timeout: d + 15*time.Second, Transport: &http.Transport{DialContext: p.DialBalanced}} // A-12: ctx stays, the client timeout is a second guard
 	defer cl.CloseIdleConnections()
 	req, err := http.NewRequestWithContext(ctx, "GET", speedURL, nil)
 	if err != nil {
@@ -1376,106 +1741,7 @@ func (p *Psi) serverEntriesFile() string {
 	return p.file("psiphon-server-entries.txt")
 }
 
-// bootstrapEmergencyServerEntries fetches and verifies emergency Psiphon server
-// entries via DNS TXT records and signed HTTPS mirrors when built-in S3 remote
-// server list URLs are blocked during network shutdowns (Priority 4).
-func (p *Psi) bootstrapEmergencyServerEntries(ctx context.Context, pubKeyHex string) int {
-	if p == nil {
-		return 0
-	}
-	p.mu.Lock()
-	if time.Since(p.lastBootstrapAt) < 45*time.Second {
-		p.mu.Unlock()
-		return 0
-	}
-	p.lastBootstrapAt = time.Now()
-	p.mu.Unlock()
-
-	totalAdded := 0
-	tryImportPayload := func(raw, src string) int {
-		raw = strings.TrimSpace(raw)
-		if raw == "" {
-			return 0
-		}
-		verified, ok := verifySignedBootstrapPayload(raw, pubKeyHex)
-		if !ok {
-			return 0
-		}
-		raw = verified
-		raw = strings.TrimPrefix(raw, "psiroute-se:")
-		added, _, _, err := p.importServerEntriesWithoutRestart(raw, src)
-		if err != nil {
-			return 0
-		}
-		return added
-	}
-
-	// 1. Try DNS TXT bootstrap domains over DoH
-	for _, dom := range psiBootstrapTXTDomains {
-		if ctx.Err() != nil {
-			break
-		}
-		tctx, cancel := context.WithTimeout(ctx, 4*time.Second)
-		var txts []string
-		var err error
-		if p.app != nil {
-			txts, err = p.app.lookupDNSTXT(tctx, dom)
-		} else {
-			txts, err = dohLookupTXT(tctx, dom)
-		}
-		cancel()
-		if err == nil && len(txts) > 0 {
-			assembled := assembleChunkedTXTRecords(txts)
-			if n := tryImportPayload(assembled, "dns-txt:"+dom); n > 0 {
-				totalAdded += n
-			}
-			for _, t := range txts {
-				if n := tryImportPayload(t, "dns-txt:"+dom); n > 0 {
-					totalAdded += n
-				}
-			}
-		}
-	}
-
-	// 2. Try signed HTTPS mirrors over Desync client
-	for _, murl := range psiBootstrapMirrorURLs {
-		if ctx.Err() != nil || totalAdded > 0 {
-			break
-		}
-		var body string
-		var err error
-		if p.mirrorFetchFunc != nil {
-			body, err = p.mirrorFetchFunc(ctx, murl)
-		} else {
-			mctx, cancel := context.WithTimeout(ctx, 6*time.Second)
-			req, rerr := http.NewRequestWithContext(mctx, "GET", murl, nil)
-			if rerr == nil {
-				if resp, derr := dohClient.Do(req); derr == nil {
-					b, _ := io.ReadAll(io.LimitReader(resp.Body, 512<<10))
-					resp.Body.Close()
-					if resp.StatusCode == http.StatusOK {
-						body = string(b)
-					} else {
-						err = fmt.Errorf("HTTP %d", resp.StatusCode)
-					}
-				} else {
-					err = derr
-				}
-			}
-			cancel()
-		}
-		if err == nil && body != "" {
-			if n := tryImportPayload(body, "mirror:"+murl); n > 0 {
-				totalAdded += n
-			}
-		}
-	}
-
-	if totalAdded > 0 {
-		logf("info", "Psiphon: резервная доставка (DNS TXT / зеркала) загрузила %d новых server entries", totalAdded)
-	}
-	return totalAdded
-}
+// (Dead hardcoded emergency bootstrap removed in Step 2; see psi_seed.go for multi-carrier seed pipeline.)
 
 // persistConnectedNodeHint сохраняет метаданные успешного подключения в кэш dataDir (Раздел 3.3 ТЗ).
 func (p *Psi) persistConnectedNodeHint() {
@@ -1503,6 +1769,24 @@ func (p *Psi) persistConnectedNodeHint() {
 
 // validateServerEntryHex декодирует и проверяет запись сервера через protocol.DecodeServerEntryFields
 // из psiphon-tunnel-core (Баг №5: проверка обязательных полей IP, порт/ключи, регион/протоколы).
+// isGlobalServerIP reports whether ip is a public unicast address that a server
+// entry may legitimately use.
+func isGlobalServerIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	switch {
+	case ip.IsUnspecified(), ip.IsLoopback(), ip.IsPrivate(),
+		ip.IsLinkLocalUnicast(), ip.IsLinkLocalMulticast(), ip.IsInterfaceLocalMulticast(),
+		ip.IsMulticast():
+		return false
+	}
+	return ip.IsGlobalUnicast()
+}
+
 func validateServerEntryHex(hexLine string) (ipAddr string, ok bool) {
 	hexLine = strings.TrimSpace(hexLine)
 	if len(hexLine) < 32 {
@@ -1514,7 +1798,10 @@ func validateServerEntryHex(hexLine string) (ipAddr string, ok bool) {
 	}
 	ipStr, _ := fields["ipAddress"].(string)
 	ipStr = strings.TrimSpace(ipStr)
-	if ipStr == "" || net.ParseIP(ipStr) == nil {
+	// Audit A-04: a seed entry must point at a public internet address. Loopback,
+	// private, link-local, unspecified and multicast addresses would turn an
+	// imported entry into a way to make the program connect into the local network.
+	if ipStr == "" || !isGlobalServerIP(net.ParseIP(ipStr)) {
 		return "", false
 	}
 	hasPort := fields["sshObfuscatedPort"] != nil || fields["sshPort"] != nil ||
@@ -1534,11 +1821,19 @@ func (p *Psi) importServerEntriesWithoutRestart(raw, source string) (added, dup,
 		ip  string
 	}
 	var validEntries []candEntry
+	seen := 0
 	for _, token := range strings.FieldsFunc(raw, func(r rune) bool {
 		return r == '\n' || r == '\r' || r == ',' || r == ';' || r == ' ' || r == '\t'
 	}) {
 		token = strings.TrimSpace(token)
 		if token == "" {
+			continue
+		}
+		// Audit A-04: one import takes at most seedImportMaxEntries records;
+		// the rest are counted as skipped so a huge paste cannot stall the app.
+		seen++
+		if seen > seedImportMaxEntries {
+			invalid++
 			continue
 		}
 		hexToken := ""
@@ -1562,8 +1857,11 @@ func (p *Psi) importServerEntriesWithoutRestart(raw, source string) (added, dup,
 		}
 		validEntries = append(validEntries, candEntry{hex: hexToken, ip: ipAddr})
 	}
+	if seen > seedImportMaxEntries {
+		logf("warn", "Psiphon: импорт serverEntries (%s): принято только первые %d записей из %d — остальные пропущены. Импортируйте остаток отдельным списком", source, seedImportMaxEntries, seen)
+	}
 	if len(validEntries) == 0 {
-		return 0, 0, invalid, errors.New("не найдено валидных записей серверов Psiphon (проверка protocol.DecodeServerEntryFields не пройдена)")
+		return 0, 0, invalid, errors.New("не найдено валидных записей серверов Psiphon (адрес должен быть публичным, а запись — корректной по protocol.DecodeServerEntryFields)")
 	}
 
 	existingHex := map[string]bool{}
@@ -1608,7 +1906,7 @@ func (p *Psi) importServerEntriesWithoutRestart(raw, source string) (added, dup,
 func (p *Psi) importServerEntriesDetailed(raw, source string) (added, dup, invalid int, err error) {
 	added, dup, invalid, err = p.importServerEntriesWithoutRestart(raw, source)
 	if err == nil && added > 0 && p.running() {
-		go p.Restart()
+		safeGo("Psi.importServerEntriesDetailed", p.Restart)
 	}
 	return added, dup, invalid, err
 }
@@ -1765,31 +2063,57 @@ func (p *Psi) onNotice(b []byte) {
 	case "CandidateServers":
 		cnt := num(n.Data["count"])
 		p.set(func() { p.candidates = cnt })
+		p.tl().Record(connTimelineEvent{Stage: "notice", Outcome: "info", Detail: fmt.Sprintf("CandidateServers=%d", cnt)})
 		if cnt == 0 {
-			logf("warn", "Psiphon: в базе 0 подходящих серверов-кандидатов — запрашиваю резервные DNS TXT / подписанные зеркала")
-			if p.app != nil && p.app.ctx != nil {
-				goSafe("psiphon-bootstrap", func() {
-					_ = p.bootstrapEmergencyServerEntries(p.app.ctx, defaultBootstrapEd25519PubHex)
-				})
-			}
+			info := diagInfoForCode(DiagNoSeed)
+			p.set(func() {
+				p.diagCode = DiagNoSeed
+				p.diagReason = info.Message
+				p.diagAdvice = info.ManualAction
+			})
+			logf("warn", "Psiphon: в базе 0 подходящих серверов-кандидатов — требуется загрузка списка через рабочий носитель или ручной импорт")
 		} else {
 			logf("info", "Psiphon: серверов-кандидатов: %d", cnt)
 		}
+	case "RemoteServerListResourceDownloadedBytes":
+		p.rslInProgress.Store(true)
 	case "RemoteServerListResourceDownloaded":
+		p.rslInProgress.Store(false)
 		p.set(func() { p.rslFailed = 0 })
+		p.tl().Record(connTimelineEvent{Stage: "notice", Outcome: "ok", Detail: "RemoteServerListResourceDownloaded"})
 		logf("info", "Psiphon: список серверов обновлён")
 	case "RemoteServerListResourceDownloadFailed":
+		p.rslInProgress.Store(false)
 		p.mu.Lock()
 		p.rslFailed++
 		fails := p.rslFailed
 		p.mu.Unlock()
+		p.tl().Record(connTimelineEvent{Stage: "notice", Outcome: "failed", Detail: fmt.Sprintf("RemoteServerListResourceDownloadFailed#%d", fails)})
 		if fails == 1 || fails%3 == 0 {
-			logf("warn", "Psiphon: не удалось скачать список серверов с основного адреса (попытка %d) — переключаюсь на резервный источник / DNS TXT", fails)
-			if p.app != nil && p.app.ctx != nil {
-				goSafe("psiphon-bootstrap-rsl", func() {
-					_ = p.bootstrapEmergencyServerEntries(p.app.ctx, defaultBootstrapEd25519PubHex)
-				})
+			logf("warn", "Psiphon: не удалось скачать список серверов с основного адреса (попытка %d)", fails)
+		}
+	case "RequestingTactics":
+		p.tacticsInProgress.Store(true)
+	case "RequestedTactics", "ApplicationParameters":
+		p.tacticsInProgress.Store(false)
+		p.set(func() { p.tacticsApplied = true })
+		p.tl().Record(connTimelineEvent{Stage: "notice", Outcome: "ok", Detail: "tactics_applied"})
+		logf("info", "Psiphon: тактики успешно получены и применены")
+	case "Info":
+		if msg, _ := n.Data["message"].(string); strings.Contains(msg, "applied ") && strings.Contains(msg, "parameters with tag") {
+			p.tacticsInProgress.Store(false)
+			tag := ""
+			if i := strings.Index(msg, "tag '"); i >= 0 {
+				rest := msg[i+5:]
+				if j := strings.IndexByte(rest, '\''); j >= 0 {
+					tag = rest[:j]
+				}
 			}
+			p.set(func() {
+				p.tacticsApplied = true
+				p.tacticsTag = maskTimelineSecrets(tag)
+			})
+			p.tl().Record(connTimelineEvent{Stage: "notice", Outcome: "ok", Detail: "tactics_applied"})
 		}
 	case "UpstreamProxyError":
 		msg, _ := n.Data["message"].(string)
@@ -1800,6 +2124,7 @@ func (p *Psi) onNotice(b []byte) {
 			p.diagReason = "Ошибка внешнего прокси или WARP: " + msg
 			p.diagAdvice = "Проверьте работоспособность прокси-сервера или перезапустите WARP"
 		})
+		p.tl().Record(connTimelineEvent{Stage: "notice", Outcome: "failed", DiagCode: "upstream_dead", Detail: "UpstreamProxyError: " + msg})
 		logf("warn", "Psiphon: ошибка внешнего прокси: %s", msg)
 	case "Warning", "Error":
 		msg, _ := n.Data["message"].(string)
@@ -1873,6 +2198,9 @@ func (p *Psi) statsView() map[string]any {
 	enabled := p.enabled()
 	ordered := p.orderForNetwork(netKey, enabled, p.lastGood())
 	now := time.Now()
+	timelineEvents := p.tl().Events()
+	timelineCounters := p.tl().Counters()
+	preflightRep := p.lastPreflightReport()
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1935,8 +2263,11 @@ func (p *Psi) statsView() map[string]any {
 		"balanced_dials":   p.balancedDials.Load(),
 		"active_conns_0":   p.activeConns0.Load(),
 		"active_conns_1":   p.activeConns1.Load(),
-		"strategies":       stratRows,
-		"networks":         networksSummary,
+		"strategies":        stratRows,
+		"networks":          networksSummary,
+		"timeline":          timelineEvents,
+		"timeline_counters": timelineCounters,
+		"preflight":         preflightRep,
 	}
 }
 
