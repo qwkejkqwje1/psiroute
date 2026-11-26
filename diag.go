@@ -90,6 +90,10 @@ func errStr(err error) string {
 
 func (a *App) checkOutbound(ctx context.Context, ob, host string, port int, doh []string) map[string]any {
 	r := map[string]any{"outbound": ob, "ok": false, "stage": "connect", "connect_ms": 0, "tls_ms": 0, "ttfb_ms": 0, "kbps": 0, "error": ""}
+	if ob == obPsiphon && (a.psi == nil || (!a.psi.running() && a.psi.cur.Load() == nil && a.psi.primaryDialHook == nil)) {
+		r["error"] = "Psiphon не подключён"
+		return r
+	}
 	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
 	addr := net.JoinHostPort(host, strconv.Itoa(port))

@@ -201,12 +201,22 @@ func ensureWintun(a *App) error {
 	arch := map[string]string{"amd64": "amd64", "arm64": "arm64", "386": "x86", "arm": "arm"}[runtime.GOARCH]
 	logf("info", "TUN: скачиваю драйвер Wintun с wintun.net…")
 	var lastErr error
-	dials := []func(ctx context.Context, network, addr string) (net.Conn, error){tunDialBound}
-	if a.psi.running() {
-		dials = append(dials, a.psi.Dial)
+	type namedDial struct {
+		name string
+		dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	}
+	dials := []namedDial{
+		{"direct", tunDialBound},
+		{"desync", dialDesync},
+	}
+	if a != nil && a.warp != nil && a.warp.builtin() {
+		dials = append(dials, namedDial{"warp", a.warp.Dial})
+	}
+	if a != nil && a.psi != nil && a.psi.cur.Load() != nil {
+		dials = append(dials, namedDial{"psiphon", a.psi.Dial})
 	}
 	for _, d := range dials {
-		data, err := downloadWintun(d, arch)
+		data, err := downloadWintun(d.dial, arch)
 		if err == nil {
 			saved := false
 			if tmpDst != "" {
@@ -231,8 +241,14 @@ func ensureWintun(a *App) error {
 }
 
 func downloadWintun(dial func(ctx context.Context, network, addr string) (net.Conn, error), arch string) ([]byte, error) {
-	cl := &http.Client{Timeout: 90 * time.Second, Transport: &http.Transport{DialContext: dial, ForceAttemptHTTP2: true}}
-	resp, err := cl.Get(wintunURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cl := &http.Client{Timeout: 20 * time.Second, Transport: &http.Transport{DialContext: dial, ForceAttemptHTTP2: true}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, wintunURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := cl.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -345,6 +361,99 @@ func bindPhys(network, address string, c syscall.RawConn) error {
 			_ = windows.SetsockoptInt(h, windows.IPPROTO_IPV6, tunIPv6UnicastIf, int(i6))
 		}
 	})
+}
+
+// disableUDPConnResetFD disables ICMP PORT_UNREACHABLE / NET_UNREACHABLE errors
+// (WSAECONNRESET / WSAENETRESET) on unconnected Windows UDP sockets.
+func disableUDPConnResetFD(fd uintptr) {
+	const sioUDPNetReset = 0x9800000F // SIO_UDP_NETRESET
+	h := windows.Handle(fd)
+	var ret, flag uint32
+	sz := uint32(unsafe.Sizeof(flag))
+	_ = windows.WSAIoctl(h, windows.SIO_UDP_CONNRESET, (*byte)(unsafe.Pointer(&flag)), sz, nil, 0, &ret, nil, 0)
+	ret, flag = 0, 0
+	_ = windows.WSAIoctl(h, sioUDPNetReset, (*byte)(unsafe.Pointer(&flag)), sz, nil, 0, &ret, nil, 0)
+}
+
+func disableUDPConnResetRaw(c syscall.RawConn) error {
+	return c.Control(func(fd uintptr) {
+		disableUDPConnResetFD(fd)
+	})
+}
+
+// bindPhysSocketFD pins a raw OS socket FD (TCP or UDP) to the active physical
+// adapter using IP_UNICAST_IF / IPV6_UNICAST_IF when TUN is active.
+func bindPhysSocketFD(fd int) (string, error) {
+	i4, i6 := physIdx4.Load(), physIdx6.Load()
+	if i4 == 0 && i6 == 0 {
+		_ = refreshPhys()
+		i4, i6 = physIdx4.Load(), physIdx6.Load()
+	}
+	if i4 == 0 && i6 == 0 {
+		return "", errors.New("физический сетевой адаптер не найден")
+	}
+	h := windows.Handle(fd)
+	var err4, err6 error
+	ok := false
+	if i4 != 0 {
+		err4 = windows.SetsockoptInt(h, windows.IPPROTO_IP, tunIPUnicastIf, int(tunHtonl(i4)))
+		if err4 == nil {
+			ok = true
+		}
+	}
+	if i6 != 0 {
+		err6 = windows.SetsockoptInt(h, windows.IPPROTO_IPV6, tunIPv6UnicastIf, int(i6))
+		if err6 == nil {
+			ok = true
+		}
+	}
+	if !ok {
+		if err4 != nil {
+			return "", err4
+		}
+		return "", err6
+	}
+	if alias, _ := physAlias.Load().(string); alias != "" {
+		return alias, nil
+	}
+	return fmt.Sprintf("if#%d", i4), nil
+}
+
+// physDNSServers returns DNS server IPs configured on the physical adapter
+// (excluding loopback and Wintun's own DNS addresses).
+func physDNSServers() []string {
+	i4, i6 := physIdx4.Load(), physIdx6.Load()
+	if i4 == 0 && i6 == 0 {
+		_ = refreshPhys()
+		i4, i6 = physIdx4.Load(), physIdx6.Load()
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, idx := range []uint32{i4, i6} {
+		if idx == 0 {
+			continue
+		}
+		luid, err := winipcfg.LUIDFromIndex(idx)
+		if err != nil {
+			continue
+		}
+		ips, err := luid.DNS()
+		if err != nil {
+			continue
+		}
+		for _, ip := range ips {
+			ip = ip.Unmap()
+			if !ip.IsValid() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip == tunDNS4 || ip == tunDNS6 {
+				continue
+			}
+			s := ip.String()
+			if !seen[s] {
+				seen[s] = true
+				out = append(out, s)
+			}
+		}
+	}
+	return out
 }
 
 // ---------- which process owns a flow ----------

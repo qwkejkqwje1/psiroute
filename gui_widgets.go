@@ -71,8 +71,8 @@ func strokeRect(gtx layout.Context, size image.Point, radius int, width float32,
 func (ui *gioUI) card(gtx layout.Context, inset unit.Dp, content layout.Widget) layout.Dimensions {
 	return layout.Background{}.Layout(gtx,
 		func(gtx layout.Context) layout.Dimensions {
-			rad := gtx.Dp(18)
-			fillGradient(gtx, gtx.Constraints.Min, rad, mix(ui.pal.card, rgb(0xFFFFFF), 0.035), ui.pal.card)
+			rad := gtx.Dp(16)
+			fillGradient(gtx, gtx.Constraints.Min, rad, mix(ui.pal.card, rgb(0xFFFFFF), 0.045), ui.pal.card)
 			strokeRect(gtx, gtx.Constraints.Min, rad, float32(gtx.Dp(1)), ui.pal.border)
 			return layout.Dimensions{Size: gtx.Constraints.Min}
 		},

@@ -929,7 +929,7 @@ func (a *App) api(w http.ResponseWriter, r *http.Request) {
 	case p == "rules/export":
 		a.rulesExportAPI(w, r)
 	case p == "conns/recent":
-		writeJSON(w, map[string]any{"ok": true, "recent": a.stats.recentList()})
+		writeJSON(w, map[string]any{"ok": true, "recent": a.stats.recentList(), "conns": a.stats.connsList()})
 	case (p == "conns/quick-rule" || p == "rules/from-conn") && post:
 		a.quickConnRuleAPI(w, r)
 

@@ -26,13 +26,15 @@ type Warp struct {
 	app     *App
 	dataDir string
 
-	mu    sync.Mutex
-	ln    net.Listener
-	id    *warpIdentity
-	state string // idle | connecting | connected | error
-	text  string // what the UI shows
-	since time.Time
-	ready chan struct{} // closed when a tunnel comes up
+	mu      sync.Mutex
+	ln      net.Listener
+	id      *warpIdentity
+	state   string // idle | connecting | connected | error
+	text    string // what the UI shows
+	since   time.Time
+	ready   chan struct{} // closed when a tunnel comes up
+	stateCh chan struct{} // closed whenever state changes (including error)
+	errSeq  uint64        // incremented when state transitions to error
 
 	cur     atomic.Pointer[warpTunnel]
 	want    chan struct{}
@@ -48,7 +50,14 @@ type Warp struct {
 }
 
 func newWarp(a *App, dataDir string) *Warp {
-	return &Warp{app: a, dataDir: dataDir, state: "idle", ready: make(chan struct{}), want: make(chan struct{}, 1)}
+	return &Warp{
+		app:     a,
+		dataDir: dataDir,
+		state:   "idle",
+		ready:   make(chan struct{}),
+		stateCh: make(chan struct{}),
+		want:    make(chan struct{}, 1),
+	}
 }
 
 func (w *Warp) idPath() string { return filepath.Join(w.dataDir, "warp-identity.json") }
@@ -73,7 +82,16 @@ func (w *Warp) cfgKey() string {
 	c := w.app.cfg
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return fmt.Sprint(c.Warp.Enabled, c.Warp.Engine, c.Warp.Mask, c.Warp.Endpoint)
+	return fmt.Sprint(c.Warp.Enabled, c.Warp.Engine, c.Warp.Mask, c.Warp.Endpoint, c.Warp.License)
+}
+
+func (w *Warp) licenseKey() string {
+	if w == nil || w.app == nil || w.app.cfg == nil {
+		return ""
+	}
+	w.app.cfg.mu.Lock()
+	defer w.app.cfg.mu.Unlock()
+	return strings.TrimSpace(w.app.cfg.Warp.License)
 }
 
 func (w *Warp) settings() (mask, endpoint string) {
@@ -145,6 +163,9 @@ func (w *Warp) Dial(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 func (w *Warp) wait(ctx context.Context, d time.Duration) (*warpTunnel, error) {
+	w.mu.Lock()
+	startErrSeq := w.errSeq
+	w.mu.Unlock()
 	timer := time.NewTimer(d)
 	defer timer.Stop()
 	for {
@@ -152,10 +173,20 @@ func (w *Warp) wait(ctx context.Context, d time.Duration) (*warpTunnel, error) {
 			return t, nil
 		}
 		w.mu.Lock()
-		ready, st, text := w.ready, w.state, w.text
+		if w.ready == nil {
+			w.ready = make(chan struct{})
+		}
+		if w.stateCh == nil {
+			w.stateCh = make(chan struct{})
+		}
+		ready, stateCh, st, text, seq := w.ready, w.stateCh, w.state, w.text, w.errSeq
 		w.mu.Unlock()
+		if st == "error" && seq > startErrSeq && text != "" {
+			return nil, errors.New("WARP: " + text)
+		}
 		select {
 		case <-ready:
+		case <-stateCh:
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-timer.C:
@@ -287,6 +318,14 @@ func (w *Warp) identity() (*warpIdentity, error) {
 		}
 		logf("info", "WARP: зарегистрировано бесплатное устройство")
 	}
+	if lic := w.licenseKey(); lic != "" && id.License != lic {
+		if lerr := warpApplyLicense(w.apiClients(), id, lic); lerr != nil {
+			logf("warn", "WARP+: не удалось активировать лицензию: %v", lerr)
+		} else {
+			_ = saveWarpIdentity(w.idPath(), id)
+			logf("info", "WARP+: лицензия применена (тип аккаунта: %s)", id.Account)
+		}
+	}
 	w.mu.Lock()
 	w.id = id
 	w.mu.Unlock()
@@ -316,6 +355,12 @@ func (w *Warp) connectMask(ctx context.Context, id *warpIdentity, m warpMask, ca
 		ch := make(chan *warpTunnel, len(batch))
 		for _, ep := range batch {
 			safeGo("Warp.connectMask", func() {
+				sent := false
+				defer func() {
+					if !sent {
+						ch <- nil
+					}
+				}()
 				t, err := openWarpTunnel(id, ep, m)
 				if err == nil && t.probe(bctx) != nil {
 					t.Close()
@@ -325,6 +370,7 @@ func (w *Warp) connectMask(ctx context.Context, id *warpIdentity, m warpMask, ca
 					t = nil
 				}
 				ch <- t
+				sent = true
 			})
 		}
 		var win *warpTunnel
@@ -381,6 +427,160 @@ func (w *Warp) connectMask(ctx context.Context, id *warpIdentity, m warpMask, ca
 	return nil, errors.New("ни одна точка входа Cloudflare не ответила")
 }
 
+type warpRaceRes struct {
+	t     *warpTunnel
+	colo  string
+	close func()
+	err   error
+}
+
+func (r warpRaceRes) tunnelColo() string {
+	if r.colo != "" {
+		return r.colo
+	}
+	if r.t != nil {
+		return r.t.colo
+	}
+	return ""
+}
+
+func (r warpRaceRes) closeTunnel() {
+	if r.close != nil {
+		r.close()
+	} else if r.t != nil {
+		r.t.Close()
+	}
+}
+
+// collectWarpRaceWinner picks the first foreign WARP tunnel immediately; if the
+// first arriving tunnel is domestic/filtered (e.g. DME), it holds it as fallback
+// for up to foreignGrace so concurrent branches can land a foreign node (ARN/FRA).
+func collectWarpRaceWinner(
+	ctx context.Context,
+	rcancel context.CancelFunc,
+	ch <-chan warpRaceRes,
+	total int,
+	foreignGrace time.Duration,
+) (*warpTunnel, error) {
+	if rcancel == nil {
+		rcancel = func() {}
+	}
+	var winner *warpTunnel
+	var winItem *warpRaceRes
+	var fallback *warpRaceRes
+	var lastErr error
+	var graceTimer *time.Timer
+	var graceC <-chan time.Time
+	defer func() {
+		if graceTimer != nil {
+			graceTimer.Stop()
+		}
+	}()
+
+	received := 0
+	for received < total {
+		select {
+		case r := <-ch:
+			received++
+			if r.t != nil {
+				colo := r.tunnelColo()
+				if warpNodeOK(colo) {
+					if fallback != nil {
+						fallback.closeTunnel()
+						fallback = nil
+					}
+					rCopy := r
+					winItem = &rCopy
+					winner = r.t
+					rcancel()
+					goto drain
+				}
+				if fallback == nil {
+					rCopy := r
+					fallback = &rCopy
+					if foreignGrace > 0 {
+						logf("info", "WARP: гонка нашла фильтруемый узел %s (%s) — даю другим веткам %.1fс на поиск зарубежного узла", r.t.ep, colo, foreignGrace.Seconds())
+						graceTimer = time.NewTimer(foreignGrace)
+						graceC = graceTimer.C
+					} else {
+						winItem = fallback
+						winner = fallback.t
+						fallback = nil
+						rcancel()
+						goto drain
+					}
+				} else {
+					r.closeTunnel()
+				}
+			} else if r.err != nil {
+				lastErr = r.err
+			}
+		case <-graceC:
+			graceC = nil
+			if fallback != nil {
+				logf("info", "WARP: зарубежный узел за время ожидания не ответил, использую %s (%s)", fallback.t.ep, fallback.tunnelColo())
+				winItem = fallback
+				winner = fallback.t
+				fallback = nil
+			}
+			rcancel()
+			goto drain
+		case <-ctx.Done():
+			rcancel()
+			if fallback != nil {
+				fallback.closeTunnel()
+				fallback = nil
+			}
+			// Drain late race results asynchronously so none leak open WireGuard devices.
+			if remaining := total - received; remaining > 0 {
+				safeGo("Warp.connectOnce.drain", func() {
+					for i := 0; i < remaining; i++ {
+						if r, ok := <-ch; ok && r.t != nil {
+							r.closeTunnel()
+						}
+					}
+				})
+			}
+			return nil, ctx.Err()
+		}
+	}
+
+drain:
+	if graceTimer != nil {
+		graceTimer.Stop()
+	}
+	rcancel()
+	if winner == nil && fallback != nil {
+		winItem = fallback
+		winner = fallback.t
+		fallback = nil
+	}
+	for received < total {
+		select {
+		case r := <-ch:
+			received++
+			if r.t != nil && (winItem == nil || r.t != winner) {
+				r.closeTunnel()
+			}
+		case <-ctx.Done():
+			if remaining := total - received; remaining > 0 {
+				safeGo("Warp.connectOnce.drainAfter", func() {
+					for i := 0; i < remaining; i++ {
+						if r, ok := <-ch; ok && r.t != nil && (winItem == nil || r.t != winner) {
+							r.closeTunnel()
+						}
+					}
+				})
+			}
+			received = total
+		}
+	}
+	if winner != nil {
+		return winner, nil
+	}
+	return nil, lastErr
+}
+
 // connectOnce tries the maskings (auto: the one that worked last, then
 // warpMaskOrder; three rounds of endpoints each) and the endpoints.
 // Runs the Cloudflare Clean IP Auto-Scanner beforehand when no fixed endpoint
@@ -415,6 +615,50 @@ func (w *Warp) connectOnce(ctx context.Context) (*warpTunnel, error) {
 	}
 	cands := warpCandidates(id, fixed)
 	var last error
+	// In auto mode, race the top AWG/QUIC/MASQUE masks concurrently.
+	// If a branch finishes first with a domestic/filtered colo (e.g. DME), keep it as
+	// fallback and grant remaining branches a short grace window to land a foreign node (ARN/FRA).
+	if auto && len(ids) > 1 {
+		raceN := min(3, len(ids))
+		raceIDs := ids[:raceN]
+		w.setState("connecting", "гонка подключений WARP (QUIC / MASQUE / AWG)…")
+		rctx, rcancel := context.WithCancel(ctx)
+		ch := make(chan warpRaceRes, len(raceIDs))
+		for _, mid := range raceIDs {
+			m, merr := makeWarpMask(mid)
+			if merr != nil {
+				ch <- warpRaceRes{err: merr}
+				continue
+			}
+			cs := cands
+			if len(cs) > 8 {
+				cs = cs[:8]
+			}
+			safeGo("Warp.connectOnce.race", func() {
+				sent := false
+				defer func() {
+					if !sent {
+						ch <- warpRaceRes{err: errors.New("паника при подключении ветки WARP")}
+					}
+				}()
+				t, cerr := w.connectMask(rctx, id, m, cs)
+				ch <- warpRaceRes{t: t, err: cerr}
+				sent = true
+			})
+		}
+		winner, raceErr := collectWarpRaceWinner(ctx, rcancel, ch, len(raceIDs), 3*time.Second)
+		if winner != nil {
+			w.remember(id, winner)
+			return winner, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if raceErr != nil {
+			last = raceErr
+		}
+		ids = ids[raceN:]
+	}
 	for k, mid := range ids {
 		if !w.builtin() {
 			return nil, errors.New("встроенный WARP выключен")
@@ -622,17 +866,33 @@ func (w *Warp) up(t *warpTunnel) {
 	w.mu.Lock()
 	w.state, w.since = "connected", time.Now()
 	w.text = fmt.Sprintf("подключён через %s, узел %s, маскировка: %s", t.ep, node, t.mask.Title)
-	close(w.ready)
+	if w.ready != nil {
+		close(w.ready)
+	}
 	w.ready = make(chan struct{})
+	if w.stateCh != nil {
+		close(w.stateCh)
+	}
+	w.stateCh = make(chan struct{})
 	w.mu.Unlock()
 	if w.app != nil {
 		w.app.tun.refresh()
+		if w.app.cfg != nil && w.app.cfg.tunWanted() && !tunActive.Load() {
+			safeGo("Warp.up.tun", func() { _ = w.app.tun.start(w.app) })
+		}
 	}
 }
 
 func (w *Warp) setState(st, text string) {
 	w.mu.Lock()
 	w.state, w.text = st, text
+	if st == "error" {
+		w.errSeq++
+		if w.stateCh != nil {
+			close(w.stateCh)
+		}
+		w.stateCh = make(chan struct{})
+	}
 	w.mu.Unlock()
 }
 

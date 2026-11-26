@@ -856,20 +856,27 @@ func (e *tunEngine) serveUDP(c net.Conn, dst netip.Addr, dport int, sport uint16
 	}
 
 	host := theFakeIP.Lookup(dst)
+	revGuessed := false
 	if host == "" {
 		host = e.rev.get(dst)
+		if host != "" {
+			revGuessed = true
+		}
 	}
 	if host == "" {
 		host = theRevDNS.get(dst)
+		if host != "" {
+			revGuessed = true
+		}
 	}
 	if hijack && !self && dport == 443 && isKnownPublicDoHHost(host) {
 		return
 	}
 
-	// Читаем первую датаграмму заранее, чтобы на UDP:443 при отсутствии FakeIP/RevDNS
-	// расшифровать QUIC Initial (RFC 9001) и узнать реальный SNI до выбора маршрута!
+	// Читаем первую датаграмму заранее, чтобы на UDP:443 при отсутствии FakeIP/SNI
+	// (или при домене из общего RevDNS CDN) расшифровать QUIC Initial (RFC 9001) и узнать реальный SNI до выбора маршрута!
 	var firstPayload []byte
-	if (host == "" || isFakeIP(dst)) && dport == 443 && !self {
+	if (host == "" || isFakeIP(dst) || revGuessed) && dport == 443 && !self {
 		bufPtr := getUDPBuf()
 		buf := *bufPtr
 		_ = c.SetReadDeadline(time.Now().Add(200 * time.Millisecond))

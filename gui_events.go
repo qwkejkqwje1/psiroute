@@ -90,6 +90,7 @@ type gioUI struct {
 	rulesTemplatesOpen  bool
 	streamsPaused       bool
 	streamRuleForApp    bool
+	streamSortMode      int // 0=recent, 1=traffic desc, 2=traffic asc, 3=name asc
 	streamSearchEditor  widget.Editor
 	recentStreams       []map[string]any
 	frozenLiveStreams   []map[string]any

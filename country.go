@@ -580,7 +580,12 @@ func dialCountryController(ctx context.Context, controller *psiphon.Controller, 
 		err  error
 	}
 	results := make(chan result, 1)
-	safeGo("dialCountryController", func() { conn, err := controller.Dial(addr, nil); results <- result{conn, err} })
+	safeGoReply("dialCountryController", results, func(rec any) result {
+		return result{err: fmt.Errorf("паника при подключении %s: %v", addr, rec)}
+	}, func() result {
+		conn, err := controller.Dial(addr, nil)
+		return result{conn, err}
+	})
 	select {
 	case r := <-results:
 		return r.conn, r.err

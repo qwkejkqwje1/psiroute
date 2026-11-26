@@ -231,7 +231,7 @@ func probeChunk64KBWithDial(
 	if targetURL == "" {
 		targetURL = probeChunkURL
 	}
-	tctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	tctx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()
 	t0 := time.Now()
 	cl := &http.Client{Timeout: 15 * time.Second, Transport: &http.Transport{DialContext: dial}}
@@ -248,7 +248,7 @@ func probeChunk64KBWithDial(
 	if resp.StatusCode >= 400 {
 		return 0, int(time.Since(t0).Milliseconds()), fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	n, rerr := io.Copy(io.Discard, io.LimitReader(resp.Body, probeChunkReqBytes))
+	n, rerr := readProbeBodyWithProgress(tctx, cancel, resp.Body, probeChunkReqBytes, 3*time.Second)
 	rttMs := int(time.Since(t0).Milliseconds())
 	if int(n) < probeChunkMinBytes {
 		if rerr != nil {
@@ -343,6 +343,61 @@ var preflightDNSHosts = []string{preflightListHost, preflightDNSHostB}
 // hosts disagree with DoH.
 func dnsPoisonedVerdict(poisonedHosts []string) bool { return len(poisonedHosts) >= 2 }
 
+var (
+	errProbeIdleStall = errors.New("обрыв/зависание передачи (таймаут простоя)")
+	errSlowTransfer   = errors.New("канал слишком медленный (данные поступали без обрыва)")
+)
+
+// readProbeBodyWithProgress reads up to limit bytes while distinguishing a true
+// mid-stream stall (no bytes arriving for idleTimeout) from an active slow link
+// that keeps trickling bytes until the outer context deadline expires.
+func readProbeBodyWithProgress(
+	tctx context.Context,
+	cancel context.CancelFunc,
+	r io.Reader,
+	limit int64,
+	idleTimeout time.Duration,
+) (int64, error) {
+	var idleStalled atomic.Bool
+	var timer *time.Timer
+	if idleTimeout > 0 {
+		timer = time.AfterFunc(idleTimeout, func() {
+			idleStalled.Store(true)
+			cancel()
+		})
+		defer timer.Stop()
+	}
+	buf := make([]byte, 8<<10)
+	var total int64
+	var chunks int
+	for total < limit {
+		toRead := limit - total
+		if toRead > int64(len(buf)) {
+			toRead = int64(len(buf))
+		}
+		n, err := r.Read(buf[:toRead])
+		if n > 0 {
+			total += int64(n)
+			chunks++
+			if timer != nil {
+				timer.Reset(idleTimeout)
+			}
+		}
+		if err != nil {
+			if idleStalled.Load() {
+				return total, errProbeIdleStall
+			}
+			// If outer budget expired while multiple active chunks arrived without stalling,
+			// classify it as slow transfer rather than a TSPU 16 KB cut.
+			if (errors.Is(err, context.DeadlineExceeded) || errors.Is(tctx.Err(), context.DeadlineExceeded)) && chunks >= 2 && total > 0 {
+				return total, fmt.Errorf("%w: %v", errSlowTransfer, err)
+			}
+			return total, err
+		}
+	}
+	return total, nil
+}
+
 // probeSample is the outcome of one 64 KB transfer test at one destination.
 type probeSample struct {
 	N   int
@@ -353,7 +408,11 @@ type probeSample struct {
 func (s probeSample) ok() bool { return s.Err == nil && s.N >= probeChunkMinBytes }
 
 // cutNear16KB: the transfer stopped inside the ~16 KB TSPU window.
+// Active slow trickles that hit the budget without stalling (errSlowTransfer) are excluded.
 func (s probeSample) cutNear16KB() bool {
+	if errors.Is(s.Err, errSlowTransfer) {
+		return false
+	}
 	return !s.ok() && s.N >= throttleCutMinBytes && s.N <= throttleCutMaxBytes
 }
 
@@ -372,7 +431,7 @@ func probeRangeOverCarrier(ctx context.Context, c Carrier, rawURL string, n int)
 	if n <= 0 {
 		n = probeChunkMinBytes
 	}
-	tctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	tctx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()
 	cl := &http.Client{
 		Timeout:       15 * time.Second,
@@ -393,7 +452,7 @@ func probeRangeOverCarrier(ctx context.Context, c Carrier, rawURL string, n int)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		return 0, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	got, rerr := io.Copy(io.Discard, io.LimitReader(resp.Body, int64(n)))
+	got, rerr := readProbeBodyWithProgress(tctx, cancel, resp.Body, int64(n), 3*time.Second)
 	if int(got) < n {
 		if rerr != nil {
 			return int(got), rerr

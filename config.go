@@ -84,8 +84,9 @@ type Config struct {
 		Enabled  bool   `json:"enabled"`
 		Engine   string `json:"engine"`   // builtin (in-process, the default) | socks (external)
 		Socks    string `json:"socks"`    // external WARP SOCKS5, e.g. 127.0.0.1:18181
-		Mask     string `json:"mask"`     // built-in: handshake masking auto | quic | masque | bwg | dns | off
-		Endpoint string `json:"endpoint"` // built-in: Cloudflare endpoint ip:port, "" = auto
+		Mask     string `json:"mask"`              // built-in: handshake masking auto | quic | masque | bwg | dns | off
+		Endpoint string `json:"endpoint"`          // built-in: Cloudflare endpoint ip:port, "" = auto
+		License  string `json:"license,omitempty"` // optional Cloudflare WARP+ license key
 	} `json:"warp"`
 	CleanChain struct {
 		Enabled   bool `json:"enabled"`    // WARP -> VPN -> WARP clean exit IP cascade
@@ -652,6 +653,7 @@ func (c *Config) values() map[string]any {
 		"warp.engine":                      c.Warp.Engine,
 		"warp.mask":                        c.Warp.Mask,
 		"warp.endpoint":                    c.Warp.Endpoint,
+		"warp.license":                     c.Warp.License,
 		"proxy.enabled":                    c.Proxy.Enabled,
 		"proxy.upstream":                   c.Proxy.Upstream,
 		"dns.enabled":                      c.DNS.Enabled,
@@ -769,6 +771,8 @@ func (c *Config) setKey(key string, v any) (restart bool) {
 		c.Warp.Mask = toStr(v)
 	case "warp.endpoint":
 		c.Warp.Endpoint = strings.TrimSpace(toStr(v))
+	case "warp.license":
+		c.Warp.License = strings.TrimSpace(toStr(v))
 	case "warp.socks":
 		c.Warp.Socks = toStr(v)
 		restart = true

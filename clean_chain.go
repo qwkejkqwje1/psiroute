@@ -12,8 +12,10 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
@@ -51,12 +53,52 @@ func (e simpleWarpEndpoint) SrcIP() netip.Addr { return netip.Addr{} }
 // UDP socket to the physical network adapter (bindPhys / IP_UNICAST_IF),
 // preventing routing loops through Wintun when TUN mode is enabled.
 type physUDPBind struct {
-	mu   sync.Mutex
-	pc   net.PacketConn
-	port uint16
+	mu     sync.Mutex
+	pc     net.PacketConn
+	port   uint16
+	closed atomic.Bool
 }
 
 func newPhysUDPBind() conn.Bind { return &physUDPBind{} }
+
+// isTransientUDPRecvErr reports whether a ReadFrom error on a shared WireGuard
+// UDP socket represents a transient per-packet ICMP or socket error (such as
+// Windows WSAECONNRESET / WSAENETRESET / WSAEMSGSIZE after AmneziaWG junk)
+// rather than socket closure. Returning such errors to wireguard-go kills
+// RoutineReceiveIncoming because net.OpError.Temporary() is false.
+func isTransientUDPRecvErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) {
+		return false
+	}
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		return true
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		switch errno {
+		case syscall.EINTR, syscall.EAGAIN,
+			syscall.ECONNRESET, syscall.ENETRESET,
+			syscall.EHOSTUNREACH, syscall.ENETUNREACH, syscall.EMSGSIZE,
+			10040, // WSAEMSGSIZE
+			10051, // WSAENETUNREACH
+			10052, // WSAENETRESET
+			10054, // WSAECONNRESET
+			10055, // WSAENOBUFS
+			10065: // WSAEHOSTUNREACH
+			return true
+		}
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "wsaeconnreset") ||
+		strings.Contains(s, "wsaenetreset") ||
+		strings.Contains(s, "wsamsgsize") ||
+		strings.Contains(s, "message too long") ||
+		strings.Contains(s, "unreachable")
+}
 
 func (b *physUDPBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	b.mu.Lock()
@@ -65,15 +107,26 @@ func (b *physUDPBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		_ = b.pc.Close()
 		b.pc = nil
 	}
-	lc := net.ListenConfig{Control: bindPhys}
+	b.closed.Store(false)
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			_ = disableUDPConnResetRaw(c)
+			return bindPhys(network, address, c)
+		},
+	}
 	addr := fmt.Sprintf(":%d", port)
 	pc, err := lc.ListenPacket(context.Background(), "udp4", addr)
-	if err != nil {
-		// Fall back to default UDP socket if physical binding is unavailable.
-		pc, err = net.ListenPacket("udp4", addr)
-		if err != nil {
-			return nil, 0, err
+	if err != nil && !tunActive.Load() {
+		// Fall back to default UDP socket only when TUN is off so WARP never loops into Wintun.
+		lcFallback := net.ListenConfig{
+			Control: func(network, address string, c syscall.RawConn) error {
+				return disableUDPConnResetRaw(c)
+			},
 		}
+		pc, err = lcFallback.ListenPacket(context.Background(), "udp4", addr)
+	}
+	if err != nil {
+		return nil, 0, err
 	}
 	b.pc = pc
 	actual := port
@@ -85,22 +138,28 @@ func (b *physUDPBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		if len(bufs) == 0 {
 			return 0, nil
 		}
-		n, raddr, err := pc.ReadFrom(bufs[0])
-		if err != nil {
-			return 0, err
-		}
-		sizes[0] = n
-		if ua, ok := raddr.(*net.UDPAddr); ok {
-			if ap, ok := netip.AddrFromSlice(ua.IP); ok {
-				eps[0] = simpleWarpEndpoint{ap: netip.AddrPortFrom(ap.Unmap(), uint16(ua.Port))}
+		for {
+			n, raddr, err := pc.ReadFrom(bufs[0])
+			if err != nil {
+				if !b.closed.Load() && isTransientUDPRecvErr(err) {
+					continue
+				}
+				return 0, err
 			}
+			sizes[0] = n
+			if ua, ok := raddr.(*net.UDPAddr); ok {
+				if ap, ok := netip.AddrFromSlice(ua.IP); ok {
+					eps[0] = simpleWarpEndpoint{ap: netip.AddrPortFrom(ap.Unmap(), uint16(ua.Port))}
+				}
+			}
+			return 1, nil
 		}
-		return 1, nil
 	}
 	return []conn.ReceiveFunc{rf}, actual, nil
 }
 
 func (b *physUDPBind) Close() error {
+	b.closed.Store(true)
 	b.mu.Lock()
 	pc := b.pc
 	b.pc = nil

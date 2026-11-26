@@ -1547,9 +1547,15 @@ func (l *Lists) RefreshOne(ctx context.Context, id string) (map[string]any, erro
 		l.mu.Lock()
 		l.data[u] = d
 		l.mu.Unlock()
+		if l.app != nil && l.app.router != nil {
+			l.app.router.InvalidateRules()
+		}
 		return map[string]any{"ok": true, "id": id, "url": u, "domains": d.domainCount(), "subnets": d.subnetCount()}, nil
 	}
 	l.fetchOne(ctx, u)
+	if l.app != nil && l.app.router != nil {
+		l.app.router.InvalidateRules()
+	}
 	l.mu.RLock()
 	d := l.data[u]
 	l.mu.RUnlock()

@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"gioui.org/font"
@@ -33,6 +34,7 @@ func (ui *gioUI) layoutStreamsTab(gtx layout.Context) layout.Dimensions {
 	recentExtra := ui.recentStreams
 	paused := ui.streamsPaused
 	ruleForApp := ui.streamRuleForApp
+	sortMode := ui.streamSortMode
 	ui.mu.Unlock()
 
 	pauseBtn := ui.appBtn("streams|pause-toggle")
@@ -81,7 +83,8 @@ func (ui *gioUI) layoutStreamsTab(gtx layout.Context) layout.Dimensions {
 		recentConns = recentExtra
 	}
 
-	// Объединяем живые и недавние потоки (помечая живые флагом _live=true)
+	// Объединяем живые и недавние потоки (живые сверху с флагом _live=true, без дублей в recent)
+	liveKeys := make(map[string]struct{}, len(liveConns))
 	allStreams := make([]map[string]any, 0, len(liveConns)+len(recentConns))
 	for _, lc := range liveConns {
 		cp := make(map[string]any, len(lc)+1)
@@ -89,9 +92,20 @@ func (ui *gioUI) layoutStreamsTab(gtx layout.Context) layout.Dimensions {
 			cp[k] = v
 		}
 		cp["_live"] = true
+		appNm, _ := cp["app"].(string)
+		h, _ := cp["host"].(string)
+		if sni, _ := cp["sni"].(string); sni != "" {
+			h = sni
+		}
+		liveKeys[appNm+"\x00"+h] = struct{}{}
 		allStreams = append(allStreams, cp)
 	}
 	for _, rc := range recentConns {
+		appNm, _ := rc["app"].(string)
+		h, _ := rc["host"].(string)
+		if _, exists := liveKeys[appNm+"\x00"+h]; exists {
+			continue
+		}
 		allStreams = append(allStreams, rc)
 	}
 
@@ -139,6 +153,69 @@ func (ui *gioUI) layoutStreamsTab(gtx layout.Context) layout.Dimensions {
 			}
 		}
 		filteredConns = append(filteredConns, c)
+	}
+
+	sortRecentBtn := ui.appBtn("streams|sort-recent")
+	sortTrDescBtn := ui.appBtn("streams|sort-traffic-desc")
+	sortTrAscBtn := ui.appBtn("streams|sort-traffic-asc")
+	sortNameBtn := ui.appBtn("streams|sort-name")
+	if sortRecentBtn.Clicked(gtx) {
+		ui.mu.Lock()
+		ui.streamSortMode = 0
+		sortMode = 0
+		ui.mu.Unlock()
+	}
+	if sortTrDescBtn.Clicked(gtx) {
+		ui.mu.Lock()
+		ui.streamSortMode = 1
+		sortMode = 1
+		ui.mu.Unlock()
+	}
+	if sortTrAscBtn.Clicked(gtx) {
+		ui.mu.Lock()
+		ui.streamSortMode = 2
+		sortMode = 2
+		ui.mu.Unlock()
+	}
+	if sortNameBtn.Clicked(gtx) {
+		ui.mu.Lock()
+		ui.streamSortMode = 3
+		sortMode = 3
+		ui.mu.Unlock()
+	}
+
+	streamHost := func(m map[string]any) string {
+		if sni, _ := m["sni"].(string); sni != "" {
+			return sni
+		}
+		h, _ := m["host"].(string)
+		return h
+	}
+	streamBytes := func(m map[string]any) float64 {
+		dnB, _ := m["down"].(float64)
+		upB, _ := m["up"].(float64)
+		return dnB + upB
+	}
+	switch sortMode {
+	case 1:
+		sort.SliceStable(filteredConns, func(i, j int) bool {
+			return streamBytes(filteredConns[i]) > streamBytes(filteredConns[j])
+		})
+	case 2:
+		sort.SliceStable(filteredConns, func(i, j int) bool {
+			return streamBytes(filteredConns[i]) < streamBytes(filteredConns[j])
+		})
+	case 3:
+		sort.SliceStable(filteredConns, func(i, j int) bool {
+			hi := strings.ToLower(orDefault(streamHost(filteredConns[i]), func() string { s, _ := filteredConns[i]["app"].(string); return s }()))
+			hj := strings.ToLower(orDefault(streamHost(filteredConns[j]), func() string { s, _ := filteredConns[j]["app"].(string); return s }()))
+			if hi != hj {
+				return hi < hj
+			}
+			ai, _ := filteredConns[i]["app"].(string)
+			aj, _ := filteredConns[j]["app"].(string)
+			return strings.ToLower(ai) < strings.ToLower(aj)
+		})
 	}
 
 	for i := range ui.diagFilterBtns {
@@ -206,7 +283,30 @@ func (ui *gioUI) layoutStreamsTab(gtx layout.Context) layout.Dimensions {
 					}),
 					layout.Rigid(layout.Spacer{Height: unit.Dp(8)}.Layout),
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return ui.editorBox(gtx, "stream-search", &ui.streamSearchEditor, "Фильтр потоков по домену, SNI, IP или программе (например: youtube, chrome.exe, 443)…")
+						return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+							layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+								return ui.editorBox(gtx, "stream-search", &ui.streamSearchEditor, "Фильтр потоков по домену, SNI, IP или программе…")
+							}),
+							layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout),
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								return ui.subCard(gtx, ui.pal.card2, ui.pal.border, unit.Dp(2), func(gtx layout.Context) layout.Dimensions {
+									return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+										layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+											return ui.segRouteButton(gtx, sortRecentBtn, "Время", sortMode == 0, "primary")
+										}),
+										layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+											return ui.segRouteButton(gtx, sortTrDescBtn, "↓ Трафик", sortMode == 1, "teal")
+										}),
+										layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+											return ui.segRouteButton(gtx, sortTrAscBtn, "↑ Трафик", sortMode == 2, "warn")
+										}),
+										layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+											return ui.segRouteButton(gtx, sortNameBtn, "Имя A–Z", sortMode == 3, "vio")
+										}),
+									)
+								})
+							}),
+						)
 					}),
 				)
 			})
@@ -239,7 +339,7 @@ func (ui *gioUI) layoutStreamsTab(gtx layout.Context) layout.Dimensions {
 					upB, _ := c["up"].(float64)
 					dnB, _ := c["down"].(float64)
 
-					rowKey := fmt.Sprintf("strm|%d|%s|%s", i, appNm, h)
+					rowKey := fmt.Sprintf("strm|%s|%s|%s|%d", appNm, h, proto, int(portF))
 					btnDir := ui.appBtn(rowKey + "|direct")
 					btnDPI := ui.appBtn(rowKey + "|dpi")
 					btnWarp := ui.appBtn(rowKey + "|warp")
@@ -285,8 +385,9 @@ func (ui *gioUI) layoutStreamsTab(gtx layout.Context) layout.Dimensions {
 					if isLive {
 						stateTag = "● активен"
 					}
-					meta := fmt.Sprintf("%s · %s:%d · правило: %s · ↓%.1f КБ ↑%.1f КБ",
-						stateTag, strings.ToUpper(proto), int(portF), orDefault(rl, "по умолчанию"), dnB/1024, upB/1024)
+					meta := fmt.Sprintf("%s · %s:%d · правило: %s · ↓ %s ↑ %s (всего %s)",
+						stateTag, strings.ToUpper(proto), int(portF), orDefault(rl, "по умолчанию"),
+						fmtBytes(int64(dnB)), fmtBytes(int64(upB)), fmtBytes(int64(dnB+upB)))
 					if rawHost != "" && rawHost != h {
 						meta += " · IP: " + ui.maskSensitive(rawHost)
 					}

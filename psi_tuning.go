@@ -118,18 +118,28 @@ func applyTuning(cfg *psiphon.Config, preset, carrier string, report *CarrierRep
 	}
 	rIdx := min(max(round, 0), len(budgets)-1)
 	timeout := budgets[rIdx]
-	if cfg.EstablishTunnelTimeoutSeconds != nil && *cfg.EstablishTunnelTimeoutSeconds > timeout {
-		timeout = *cfg.EstablishTunnelTimeoutSeconds
+	if cfg.EstablishTunnelTimeoutSeconds != nil && *cfg.EstablishTunnelTimeoutSeconds > 0 {
+		if rIdx == 0 || *cfg.EstablishTunnelTimeoutSeconds > timeout {
+			timeout = *cfg.EstablishTunnelTimeoutSeconds
+		}
 	}
 	if seedEmptyOrRSL && timeout < minSeedOrRSLTimeout {
 		timeout = minSeedOrRSLTimeout
 	}
 	cfg.EstablishTunnelTimeoutSeconds = ptr(timeout)
 
-	// 4. DNS hardening: if preflight detected DNS poisoning (or always on balanced/patient direct),
-	// supply alternate DNS resolvers to tunnel-core when not already routed via upstream SOCKS.
-	if cfg.UpstreamProxyURL == "" && (p != PresetFast || (report != nil && report.DNSPoisoned)) {
-		cfg.DNSResolverAlternateServers = append([]string(nil), defaultAlternateDNSServers...)
-		cfg.DNSResolverPreferAlternateServerProbability = ptr(1.0)
+	// 4. DNS hardening: if preflight detected DNS poisoning, TUN is active (with DeviceBinder),
+	// or always on balanced/patient direct, supply alternate DNS resolvers to tunnel-core when
+	// not already routed via upstream SOCKS.
+	if cfg.UpstreamProxyURL == "" {
+		poisoned := report != nil && report.DNSPoisoned
+		if cfg.DeviceBinder != nil || p != PresetFast || poisoned {
+			cfg.DNSResolverAlternateServers = append([]string(nil), defaultAlternateDNSServers...)
+		}
+		if p != PresetFast || poisoned || tunActive.Load() {
+			// tunnel-core's Resolver checks DNSResolverPreferredAlternateServers alongside PreferAlternateServerProbability.
+			cfg.DNSResolverPreferredAlternateServers = append([]string(nil), defaultAlternateDNSServers...)
+			cfg.DNSResolverPreferAlternateServerProbability = ptr(1.0)
+		}
 	}
 }

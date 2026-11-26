@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -38,7 +39,7 @@ const (
 	psiRSLKey = "MIICIDANBgkqhkiG9w0BAQEFAAOCAg0AMIICCAKCAgEAt7Ls+/39r+T6zNW7GiVpJfzq/xvL9SBH5rIFnk0RXYEYavax3WS6HOD35eTAqn8AniOwiH+DOkvgSKF2caqk/y1dfq47Pdymtwzp9ikpB1C5OfAysXzBiwVJlCdajBKvBZDerV1cMvRzCKvKwRmvDmHgphQQ7WfXIGbRbmmk6opMBh3roE42KcotLFtqp0RRwLtcBRNtCdsrVsjiI1Lqz/lH+T61sGjSjQ3CHMuZYSQJZo/KrvzgQXpkaCTdbObxHqb6/+i1qaVOfEsvjoiyzTxJADvSytVtcTjijhPEV6XskJVHE1Zgl+7rATr/pDQkw6DPCNBS1+Y6fy7GstZALQXwEDN/qhQI9kWkHijT8ns+i1vGg00Mk/6J75arLhqcodWsdeG/M/moWgqQAnlZAGVtJI1OgeF5fsPpXu4kctOfuZlGjVZXQNW34aOzm8r8S0eVZitPlbhcPiR4gT/aSMz/wd8lZlzZYsje/Jr8u/YtlwjjreZrGRmG8KMOzukV3lLmMppXFMvl4bxv6YFEmIuTsOhbLTwFgh7KYNjodLj/LsqRVfwz31PgWQFTEPICV7GCvgVlPRxnofqKSjgTWI4mxDhBpVcATvaoBl1L/6WLbFvBsoAUBItWwctO2xalKxF5szhGm8lccoc5MZr8kfE0uxMgsxz4er68iCID+rsCAQM="
 
 	// psiRSLURL — основной URL сжатого списка серверов Psiphon на S3.
-	psiRSLURL = "https://s3.amazonaws.com//psiphon/web/mjr4-p23r-puwl/server_list_compressed"
+	psiRSLURL = "https://s3.amazonaws.com/psiphon/web/mjr4-p23r-puwl/server_list_compressed"
 
 	// psiRSLBackupURL1..4 — запасные URL списка серверов (используются tunnel-core
 	// с OnlyAfterAttempts > 0, если основной адрес недоступен или заблокирован).
@@ -352,26 +353,38 @@ func ptr[T any](v T) *T { return &v }
 // primary and backup endpoints using OnlyAfterAttempts so tunnel-core falls
 // back automatically if the primary S3 endpoint fails or times out.
 func psiRSLURLs() parameters.TransferURLs {
+	s3Fronting := parameters.FrontingSpecs{
+		{
+			FrontingProviderID: "aws-s3-direct",
+			Transports:         []string{protocol.FRONTING_TRANSPORT_HTTPS},
+			Addresses: []string{
+				"s3.dualstack.us-east-1.amazonaws.com",
+				"s3-external-1.amazonaws.com",
+				"psiphon.s3.amazonaws.com",
+			},
+			SkipVerify: true,
+			Host:       "s3.amazonaws.com",
+		},
+	}
 	return parameters.TransferURLs{
 		{
 			URL:               base64.StdEncoding.EncodeToString([]byte(psiRSLURL)),
 			OnlyAfterAttempts: 0,
 		},
 		{
-			URL:               base64.StdEncoding.EncodeToString([]byte(psiRSLBackupURL1)),
-			OnlyAfterAttempts: 1,
-		},
-		{
 			URL:               base64.StdEncoding.EncodeToString([]byte(psiRSLBackupURL2)),
-			OnlyAfterAttempts: 2,
+			OnlyAfterAttempts: 1,
+			FrontingSpecs:     s3Fronting,
 		},
 		{
 			URL:               base64.StdEncoding.EncodeToString([]byte(psiRSLBackupURL3)),
-			OnlyAfterAttempts: 3,
+			OnlyAfterAttempts: 2,
+			FrontingSpecs:     s3Fronting,
 		},
 		{
 			URL:               base64.StdEncoding.EncodeToString([]byte(psiRSLBackupURL4)),
-			OnlyAfterAttempts: 4,
+			OnlyAfterAttempts: 3,
+			FrontingSpecs:     s3Fronting,
 		},
 	}
 }
@@ -436,6 +449,11 @@ func (p *Psi) Start() {
 	p.mu.Unlock()
 	if p.app != nil {
 		p.app.tun.refresh()
+		if p.app.warp != nil && p.app.warp.builtin() {
+			// Pre-warm WARP concurrently so AWG/QUIC/MASQUE race runs in parallel
+			// while Psiphon runs preflight / direct strategies.
+			p.app.warp.Want()
+		}
 	}
 	safeGo("Psi.Start", func() {
 		defer close(done)
@@ -495,6 +513,11 @@ func (p *Psi) stopInternal(manual bool) {
 	p.set(func() { p.state = "stopped"; p.tunnels = 0; p.since = time.Time{} })
 	if p.app != nil {
 		p.app.tun.refresh()
+		if p.app.warp != nil && p.app.warp.builtin() {
+			// Pre-warm WARP concurrently so AWG/QUIC/MASQUE race runs in parallel
+			// while Psiphon runs preflight / direct strategies.
+			p.app.warp.Want()
+		}
 	}
 	logf("info", "Psiphon остановлен")
 }
@@ -526,7 +549,11 @@ func (p *Psi) ensureLocalDesyncProxy() string {
 			if err != nil {
 				return
 			}
-			safeGo("Psi.ensureLocalDesyncProxy#2", func() { serveWorkerSocks(p.app.ctx, c, func(ctx context.Context, network, targetAddr string) (net.Conn, error) {
+			appCtx := context.Background()
+			if p.app != nil && p.app.ctx != nil {
+				appCtx = p.app.ctx
+			}
+			safeGo("Psi.ensureLocalDesyncProxy#2", func() { serveWorkerSocks(appCtx, c, func(ctx context.Context, network, targetAddr string) (net.Conn, error) {
 				method := "auto"
 				if p.app != nil && p.app.cfg != nil {
 					p.app.cfg.mu.Lock()
@@ -554,6 +581,24 @@ type psiRawSplitConn struct {
 	done atomic.Bool
 }
 
+func setTCPNoDelayUnwrapped(c net.Conn) {
+	for c != nil {
+		if tc, ok := c.(*net.TCPConn); ok {
+			_ = tc.SetNoDelay(true)
+			return
+		}
+		uw, ok := c.(interface{ underlyingConn() net.Conn })
+		if !ok {
+			return
+		}
+		next := uw.underlyingConn()
+		if next == c {
+			return
+		}
+		c = next
+	}
+}
+
 func (c *psiRawSplitConn) Write(p []byte) (int, error) {
 	if c.done.Swap(true) || len(p) <= 6 {
 		return c.Conn.Write(p)
@@ -562,9 +607,7 @@ func (c *psiRawSplitConn) Write(p []byte) (int, error) {
 	if (p[0] == 0x16 && p[1] == 0x03) || obfsLooksHTTP(p) {
 		return c.Conn.Write(p)
 	}
-	if tc, ok := c.Conn.(*net.TCPConn); ok {
-		_ = tc.SetNoDelay(true)
-	}
+	setTCPNoDelayUnwrapped(c.Conn)
 	splitLimit := min(len(p), 48)
 	written := 0
 	for written < splitLimit {
@@ -684,6 +727,7 @@ func (p *Psi) rotateNetID() {
 func (p *Psi) run(ctx context.Context) {
 	fails := 0
 	prevCarrier := ""
+	rslGraceRetried := false
 	p.set(func() { p.stage = "stage0_preflight" })
 	rep := p.RunPreflight(ctx, false)
 	// Stage 1: check seed health and optionally fetch from user-configured mirror over healthy carriers.
@@ -825,6 +869,7 @@ func (p *Psi) run(ctx context.Context) {
 				p.invalidatePreflight("")
 				p.RunPreflight(ctx, true)
 			}
+			rslGraceRetried = false
 			p.set(func() { p.state = "reconnecting" })
 			continue
 		case errors.Is(err, errNext):
@@ -837,6 +882,7 @@ func (p *Psi) run(ctx context.Context) {
 				DurationMs: attemptDurMs,
 				Outcome:    "next",
 			})
+			rslGraceRetried = false
 			fails++
 			p.set(func() { p.state = "reconnecting" })
 			continue
@@ -853,11 +899,27 @@ func (p *Psi) run(ctx context.Context) {
 				Detail:     err.Error(),
 			})
 			if wasUnstable || len(ordered) == 1 {
+				rslGraceRetried = false
 				fails++
 			}
 			p.set(func() { p.state = "reconnecting" })
 			continue
 		}
+		if !wasConnected && errors.Is(err, errTimeout) && !rslGraceRetried && (p.rslInProgress.Load() || p.tacticsInProgress.Load()) {
+			rslGraceRetried = true
+			logf("info", "Psiphon «%s»: загрузка списка серверов/тактик ещё идёт — даю дополнительное окно ожидания", s.Title)
+			waitUntil := time.Now().Add(4 * time.Second)
+			for time.Now().Before(waitUntil) && (p.rslInProgress.Load() || p.tacticsInProgress.Load()) {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(250 * time.Millisecond):
+				}
+			}
+			p.set(func() { p.state = "reconnecting" })
+			continue
+		}
+		rslGraceRetried = false
 		if wasConnected {
 			fails = 0
 		} else {
@@ -902,11 +964,51 @@ func (p *Psi) run(ctx context.Context) {
 	}
 }
 
+// psiDeviceBinder binds direct Psiphon sockets to the physical network
+// interface when Wintun TUN is active so tunnel-core sockets never loop into TUN.
+type psiDeviceBinder struct{}
+
+func (psiDeviceBinder) BindToDevice(fileDescriptor int) (string, error) {
+	if !tunActive.Load() {
+		return "direct", nil
+	}
+	return bindPhysSocketFD(fileDescriptor)
+}
+
+// psiDNSServerGetter supplies physical adapter DNS servers (excluding Wintun's
+// 172.19.0.2 FakeIP resolver) falling back to public resolvers so tunnel-core's
+// Resolver works even when DeviceBinder is set.
+type psiDNSServerGetter struct{}
+
+func (psiDNSServerGetter) GetDNSServers() []string {
+	if servers := physDNSServers(); len(servers) > 0 {
+		return servers
+	}
+	return append([]string(nil), defaultAlternateDNSServers...)
+}
+
+func isLoopbackProxyURL(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	h := strings.TrimSpace(u.Hostname())
+	if strings.EqualFold(h, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
+}
+
 func (p *Psi) configFor(s strategyDef, timeout int) *psiphon.Config {
 	c := p.app.cfg
 	c.mu.Lock()
 	region := strings.ToUpper(c.Psiphon.Country)
-	pool := c.Psiphon.Parallel
 	dpi := c.Psiphon.DPI
 	preset := normalizePreset(c.Psiphon.Preset)
 	propID := strings.TrimSpace(c.Psiphon.PropagationChannelID)
@@ -925,12 +1027,6 @@ func (p *Psi) configFor(s strategyDef, timeout int) *psiphon.Config {
 	if platform == "" {
 		platform = psiPlatform
 	}
-	if pool < 1 {
-		pool = 1
-	}
-	if pool > 4 {
-		pool = 4
-	}
 	dir := filepath.Join(p.dataDir, "psiphon")
 	_ = os.MkdirAll(dir, 0o700)
 	cfg := &psiphon.Config{
@@ -946,7 +1042,7 @@ func (p *Psi) configFor(s strategyDef, timeout int) *psiphon.Config {
 		NetworkID:                          p.netID(),
 		ClientPlatform:                     platform,
 		DataRootDirectory:                  dir,
-		TunnelPoolSize:                     pool,
+		TunnelPoolSize:                     1,
 		EstablishTunnelPausePeriodSeconds:  ptr(2),
 	}
 	if timeout > 0 {
@@ -961,13 +1057,19 @@ func (p *Psi) configFor(s strategyDef, timeout int) *psiphon.Config {
 				p.app.warp.Want()
 			}
 		}
-		cfg.UpstreamProxyURL = "socks5://" + strings.TrimPrefix(warp, "socks5://")
+		if warp = strings.TrimSpace(warp); warp != "" {
+			cfg.UpstreamProxyURL = "socks5://" + strings.TrimPrefix(warp, "socks5://")
+		}
 	case "proxy":
 		cfg.UpstreamProxyURL = upstream
 	case "desync":
 		if addr := p.ensureLocalDesyncProxy(); addr != "" {
 			cfg.UpstreamProxyURL = "socks5://" + addr
 		}
+	}
+	if !isLoopbackProxyURL(cfg.UpstreamProxyURL) {
+		cfg.DeviceBinder = psiDeviceBinder{}
+		cfg.DNSServerGetter = psiDNSServerGetter{}
 	}
 	if len(s.CustomProtos) > 0 {
 		cfg.LimitTunnelProtocols = append([]string(nil), s.CustomProtos...)
@@ -1001,6 +1103,10 @@ func (p *Psi) configFor(s strategyDef, timeout int) *psiphon.Config {
 func applyDPI(c *psiphon.Config, mode string) {
 	frag := func(minT, maxT, minW, maxW, minD, maxD int) {
 		c.FragmentorProbability = ptr(1.0)
+		c.FragmentorLimitProtocols = []string{
+			"SSH", "OSSH", "TLS-OSSH", "SHADOWSOCKS-OSSH",
+			"UNFRONTED-MEEK-OSSH", "UNFRONTED-MEEK-HTTPS-OSSH", "UNFRONTED-MEEK-SESSION-TICKET-OSSH",
+		}
 		c.FragmentorMinTotalBytes = ptr(minT)
 		c.FragmentorMaxTotalBytes = ptr(maxT)
 		c.FragmentorMinWriteBytes = ptr(minW)
@@ -1016,11 +1122,11 @@ func applyDPI(c *psiphon.Config, mode string) {
 	case "hello":
 		c.FragmentorProbability = ptr(0.0)
 	case "light":
-		frag(100, 600, 20, 200, 100, 2000)
+		frag(100, 500, 24, 160, 100, 1500)
 	case "strong":
-		frag(1000, 3000, 1, 10, 5000, 30000)
+		frag(400, 1200, 2, 16, 1000, 5000)
 	default:
-		frag(256, 1400, 1, 16, 1000, 8000)
+		frag(180, 700, 8, 48, 300, 2500)
 	}
 	c.TLSFragmentClientHelloProbability = ptr(1.0)
 }
@@ -1104,7 +1210,12 @@ func (p *Psi) attemptOnce(ctx context.Context, s strategyDef, timeout int) (conn
 	if err := psiphon.OpenDataStore(cfg); err != nil {
 		return false, err
 	}
-	defer psiphon.CloseDataStore()
+	dsHandedOff := false
+	defer func() {
+		if !dsHandedOff {
+			psiphon.CloseDataStore()
+		}
+	}()
 
 	p.loadSavedServerEntriesIntoStore(cfg)
 
@@ -1130,13 +1241,20 @@ func (p *Psi) attemptOnce(ctx context.Context, s strategyDef, timeout int) (conn
 		}
 		p.cur.CompareAndSwap(ctl, nil)
 		cancel()
-		waitDur := 8 * time.Second
+		waitDur := 12 * time.Second
 		if p.isUserStopped() {
-			waitDur = 3 * time.Second
+			waitDur = 5 * time.Second
 		}
 		select {
 		case <-runDone:
 		case <-time.After(waitDur):
+			// Keep the ref-counted DataStore open until ctl.Run actually exits
+			// so closing the BoltDB never races with shutting-down controller goroutines.
+			dsHandedOff = true
+			safeGo("Psi.attemptOnce.closeDS", func() {
+				<-runDone
+				psiphon.CloseDataStore()
+			})
 		}
 		p.standby.CompareAndSwap(ctl, nil)
 		p.set(func() { p.tunnels = 0 })
@@ -1154,7 +1272,6 @@ func (p *Psi) attemptOnce(ctx context.Context, s strategyDef, timeout int) (conn
 
 	var upAt time.Time
 	var pendingConnMs int
-	var rslGraceExtended bool
 	quick := 0
 	var holdC <-chan time.Time
 
@@ -1194,6 +1311,9 @@ func (p *Psi) attemptOnce(ctx context.Context, s strategyDef, timeout int) (conn
 					})
 					if p.app != nil {
 						p.app.tun.refresh()
+						if p.app.cfg != nil && p.app.cfg.tunWanted() && !tunActive.Load() {
+							safeGo("Psi.tunStart", func() { _ = p.app.tun.start(p.app) })
+						}
 					}
 					p.mu.Lock()
 					activeProto := p.protocol
@@ -1245,11 +1365,6 @@ func (p *Psi) attemptOnce(ctx context.Context, s strategyDef, timeout int) (conn
 					}
 				}
 			case "EstablishTunnelTimeout":
-				if !rslGraceExtended && (p.rslInProgress.Load() || p.tacticsInProgress.Load()) {
-					rslGraceExtended = true
-					logf("info", "Psiphon «%s»: загрузка списка серверов/тактик ещё идёт — продлеваю ожидание", s.Title)
-					continue
-				}
 				p.tl().Record(connTimelineEvent{
 					Stage:      "timeout",
 					Carrier:    carrier,
@@ -1581,9 +1696,11 @@ func (p *Psi) Dial(ctx context.Context, network, addr string) (net.Conn, error) 
 			err error
 		}
 		ch := make(chan res, 1)
-		safeGo("Psi.Dial", func() {
+		safeGoReply("Psi.Dial", ch, func(rec any) res {
+			return res{err: fmt.Errorf("паника туннеля Psiphon: %v", rec)}
+		}, func() res {
 			c, err := ctl.Dial(addr, nil)
-			ch <- res{c, err}
+			return res{c, err}
 		})
 		select {
 		case <-ctx.Done():
@@ -2033,6 +2150,15 @@ func (p *Psi) onNotice(b []byte) {
 		select {
 		case p.notes <- n:
 		default:
+			// Evict oldest buffered notice so critical Tunnels/Exiting state updates are never lost.
+			select {
+			case <-p.notes:
+			default:
+			}
+			select {
+			case p.notes <- n:
+			default:
+			}
 		}
 	case "AvailableEgressRegions":
 		regs := strList(n.Data["regions"])

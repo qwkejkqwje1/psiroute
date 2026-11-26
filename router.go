@@ -403,6 +403,28 @@ func (r *Router) InvalidateRules() {
 	r.cacheMu.Unlock()
 }
 
+// hasDomainOrListRules reports whether any active rule inspects hostnames or domain lists.
+func (r *Router) hasDomainOrListRules() bool {
+	if r == nil || r.a == nil {
+		return false
+	}
+	r.a.cfg.mu.Lock()
+	mode := r.a.cfg.Routing.Mode
+	rules := r.a.cfg.Routing.Rules
+	var has bool
+	for _, ru := range rules {
+		if ru.Disabled {
+			continue
+		}
+		if len(ru.Domains) > 0 || len(ru.Keywords) > 0 || len(ru.Lists) > 0 {
+			has = true
+			break
+		}
+	}
+	r.a.cfg.mu.Unlock()
+	return has || mode == "auto"
+}
+
 func newRouter(a *App, file string) *Router {
 	r := &Router{a: a, file: file, seen: map[string]*learned{}}
 	if b, err := os.ReadFile(file); err == nil {
@@ -426,6 +448,11 @@ func newRouter(a *App, file string) *Router {
 func cleanHostKey(h string) string {
 	h = strings.ToLower(strings.TrimSpace(h))
 	h = strings.Trim(h, "[]")
+	if _, err := netip.ParseAddr(h); err != nil {
+		if hostOnly, _, err2 := net.SplitHostPort(h); err2 == nil && hostOnly != "" {
+			h = strings.Trim(hostOnly, "[]")
+		}
+	}
 	return strings.TrimSuffix(h, ".")
 }
 
@@ -971,8 +998,8 @@ func (r *Router) planForProtoWithStage(proto, host, dstIP string, port int, app 
 	}
 	userStopped := r.a != nil && r.a.psi != nil && r.a.psi.isUserStopped()
 
-	cacheKey := fmt.Sprintf("%d|%s|%s|%s|%d|%s|%s|%s|%t|%t|%t|%t|%d",
-		generation, proto, cleanH, dstIP, port, normAppFullPath(app), mode, def, failover, bypassLAN, blockSTUN, userStopped, rulesLen)
+	cacheKey := fmt.Sprintf("%d|%s|%s|%s|%d|%s|%s|%s|%t|%t|%t|%t|%t|%t|%t|%d",
+		generation, proto, cleanH, dstIP, port, normAppFullPath(app), mode, def, failover, bypassLAN, blockSTUN, userStopped, desyncOn, warpOn, proxyOn, rulesLen)
 	if !killSwitch && mode != "auto" && len(theDNS.cachedIPs(cleanH)) == 0 {
 		if addr, err := netip.ParseAddr(cleanH); err != nil || theRevDNS.get(addr) == "" {
 			r.cacheMu.RLock()

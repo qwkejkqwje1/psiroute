@@ -565,13 +565,27 @@ func (b *obfsBook) result(host, id string, ok bool) {
 		if st, found := b.sites[host]; found && st.method == id {
 			delete(b.sites, host)
 		}
-		// Check if background DPI auto-tune should switch away from failing method
+		// Check if background DPI auto-tune should switch away from failing method.
+		// Hysteresis: the very first switch fires immediately, whereas subsequent
+		// switches strictly respect obfsAutoTuneCooldown (no bypass for current method)
+		// and never bounce to an already-degraded alternative.
 		if deg, failRate := b.isMethodDegradedLocked(id); deg {
 			alt := b.bestHealthyLocked(id)
-			if alt != "" && alt != id && (b.autoTunedMethod == "" || b.autoTunedMethod == id || now.Sub(b.lastAutoTune) >= 15*time.Second) {
+			altDeg := alt == ""
+			if !altDeg {
+				altDeg, _ = b.isMethodDegradedLocked(alt)
+			}
+			cooldownOK := b.lastAutoTune.IsZero() || now.Sub(b.lastAutoTune) >= obfsAutoTuneCooldown
+			if alt != "" && alt != id && !altDeg && cooldownOK {
 				b.autoTunedMethod = alt
 				b.autoTuneSwitches++
 				b.lastAutoTune = now
+				// Reset hysteresis window on the newly selected method alt so it starts clean,
+				// while keeping failed method id marked degraded so forced orders unlock fallback.
+				if aw := b.window[alt]; aw != nil {
+					aw.consecFails = 0
+					aw.outcomes = nil
+				}
 				switchedTo = alt
 				hook = b.onAutoTune
 				if mOld, mNew := obfsByID(id), obfsByID(alt); mOld != nil && mNew != nil {
@@ -967,6 +981,8 @@ func (o *obfsConn) cur() net.Conn {
 	defer o.mu.Unlock()
 	return o.c
 }
+
+func (o *obfsConn) underlyingConn() net.Conn { return o.cur() }
 
 func (o *obfsConn) LocalAddr() net.Addr  { return o.cur().LocalAddr() }
 func (o *obfsConn) RemoteAddr() net.Addr { return o.cur().RemoteAddr() }

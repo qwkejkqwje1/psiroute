@@ -183,6 +183,50 @@ func TestObfsBackgroundAutoTuneOnErrorSpike(t *testing.T) {
 	}
 }
 
+func TestObfsAutoTuneCooldownPreventsPingPong(t *testing.T) {
+	obfs.reset()
+	t.Cleanup(obfs.reset)
+
+	// Give "double" and "multirec" baseline successes so both look viable initially.
+	for i := 0; i < 4; i++ {
+		obfs.result("ok1.example", "double", true)
+		obfs.result("ok2.example", "multirec", true)
+	}
+
+	switches := 0
+	obfs.mu.Lock()
+	obfs.onAutoTune = func(_, _ string) { switches++ }
+	obfs.mu.Unlock()
+	defer func() {
+		obfs.mu.Lock()
+		obfs.onAutoTune = nil
+		obfs.mu.Unlock()
+	}()
+
+	// First spike switches away from "chunk" once.
+	for i := 0; i < 3; i++ {
+		obfs.result("blocked.example", "chunk", false)
+	}
+	if switches != 1 {
+		t.Fatalf("initial switches = %d, want 1", switches)
+	}
+
+	// Simulate failures hitting the active auto-tuned method and fallbacks within seconds
+	// (e.g. an unreachable DoT host): cooldown must prevent 1s ping-pong switching.
+	obfs.mu.Lock()
+	cur := obfs.autoTunedMethod
+	obfs.mu.Unlock()
+	for i := 0; i < 6; i++ {
+		obfs.result("common.dot.dns.yandex.net", cur, false)
+	}
+	for i := 0; i < 6; i++ {
+		obfs.result("common.dot.dns.yandex.net", "split", false)
+	}
+	if switches != 1 {
+		t.Fatalf("switches during cooldown = %d, want 1 (ping-pong not prevented)", switches)
+	}
+}
+
 func TestQUICInitialDesyncFakes(t *testing.T) {
 	qPkt, err := quicInitial("www.youtube.com")
 	if err != nil {

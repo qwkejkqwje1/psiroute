@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"sort"
 	"strconv"
@@ -224,24 +225,80 @@ func (w *netWatch) view() map[string]any {
 	return m
 }
 
+func isTunOrVirtualIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if addr, ok := netip.AddrFromSlice(ip); ok {
+		addr = addr.Unmap()
+		if addr == tunAddr4 || addr == tunAddr6 || tunNet4.Contains(addr) || tunNet6.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+func isPhysicalInterface(iface net.Interface) bool {
+	if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+		return false
+	}
+	return !isVirtualVPNAdapterName(iface.Name, "")
+}
+
+func firstPhysicalInterfaceIP() string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	var fallbackV6 string
+	for _, iface := range ifaces {
+		if !isPhysicalInterface(iface) {
+			continue
+		}
+		addrs, aerr := iface.Addrs()
+		if aerr != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipNet, ok := a.(*net.IPNet)
+			if !ok || ipNet.IP == nil || !ipNet.IP.IsGlobalUnicast() || isTunOrVirtualIP(ipNet.IP) {
+				continue
+			}
+			if ipNet.IP.To4() != nil {
+				return ipNet.IP.String()
+			}
+			if fallbackV6 == "" {
+				fallbackV6 = ipNet.IP.String()
+			}
+		}
+	}
+	return fallbackV6
+}
+
 // primaryIP: the local address of the route to the internet (no packet is
-// sent: a UDP "connect" only picks the route).
+// sent: a UDP "connect" only picks the route). Binds to physical adapter when
+// TUN is active and skips Wintun/virtual VPN adapters so enabling TUN never
+// triggers a false network change.
 func primaryIP() string {
+	d := net.Dialer{Control: directControl}
 	for _, t := range [][2]string{{"udp4", "8.8.8.8:53"}, {"udp6", "[2001:4860:4860::8888]:53"}} {
-		c, err := net.Dial(t[0], t[1])
+		c, err := d.Dial(t[0], t[1])
 		if err != nil {
 			continue
 		}
-		ip := c.LocalAddr().(*net.UDPAddr).IP.String()
+		ua, _ := c.LocalAddr().(*net.UDPAddr)
 		_ = c.Close()
-		return ip
+		if ua == nil || ua.IP == nil || isTunOrVirtualIP(ua.IP) {
+			continue
+		}
+		return ua.IP.String()
 	}
-	return ""
+	return firstPhysicalInterfaceIP()
 }
 
 // detectNetworkFingerprint computes a stable network key from the active
-// outbound interface name, hardware MAC, and IPv4/IPv6 subnet prefix (which
-// uniquely identifies the router/gateway subnet + adapter).
+// outbound physical interface name, hardware MAC, and IPv4/IPv6 subnet prefix
+// (never hashing Wintun / foreign virtual VPN interfaces).
 func detectNetworkFingerprint() string {
 	ipStr := primaryIP()
 	if ipStr == "" {
@@ -253,22 +310,44 @@ func detectNetworkFingerprint() string {
 	}
 	ifaces, err := net.Interfaces()
 	if err == nil {
+		var firstPhys *struct {
+			iface net.Interface
+			ipNet *net.IPNet
+		}
 		for _, iface := range ifaces {
+			if !isPhysicalInterface(iface) {
+				continue
+			}
 			addrs, aerr := iface.Addrs()
 			if aerr != nil {
 				continue
 			}
 			for _, a := range addrs {
 				ipNet, ok := a.(*net.IPNet)
-				if !ok || !ipNet.IP.Equal(ip) {
+				if !ok || ipNet.IP == nil || isTunOrVirtualIP(ipNet.IP) {
 					continue
 				}
-				subnet := ipNet.IP.Mask(ipNet.Mask).String()
-				raw := strings.ToLower(strings.TrimSpace(iface.Name)) + "|" + iface.HardwareAddr.String() + "|" + subnet
-				sum := sha256.Sum256([]byte(raw))
-				cleanName := sanitizeNetAdapterName(iface.Name)
-				return "net-" + cleanName + "-" + hex.EncodeToString(sum[:6])
+				if ipNet.IP.Equal(ip) {
+					subnet := ipNet.IP.Mask(ipNet.Mask).String()
+					raw := strings.ToLower(strings.TrimSpace(iface.Name)) + "|" + iface.HardwareAddr.String() + "|" + subnet
+					sum := sha256.Sum256([]byte(raw))
+					cleanName := sanitizeNetAdapterName(iface.Name)
+					return "net-" + cleanName + "-" + hex.EncodeToString(sum[:6])
+				}
+				if firstPhys == nil && ipNet.IP.IsGlobalUnicast() && ipNet.IP.To4() != nil {
+					firstPhys = &struct {
+						iface net.Interface
+						ipNet *net.IPNet
+					}{iface: iface, ipNet: ipNet}
+				}
 			}
+		}
+		if firstPhys != nil {
+			subnet := firstPhys.ipNet.IP.Mask(firstPhys.ipNet.Mask).String()
+			raw := strings.ToLower(strings.TrimSpace(firstPhys.iface.Name)) + "|" + firstPhys.iface.HardwareAddr.String() + "|" + subnet
+			sum := sha256.Sum256([]byte(raw))
+			cleanName := sanitizeNetAdapterName(firstPhys.iface.Name)
+			return "net-" + cleanName + "-" + hex.EncodeToString(sum[:6])
 		}
 	}
 	// Fallback: hash the /24 subnet of the local IP

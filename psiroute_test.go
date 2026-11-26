@@ -350,7 +350,7 @@ func TestConfigSetKeyAndValues(t *testing.T) {
 		"psiphon.propagation_channel_id": true, "psiphon.sponsor_id": true, "psiphon.client_platform": true,
 		"desync.enabled": false, "desync.method": false,
 		"warp.enabled": true, "warp.socks": true,
-		"warp.engine": true, "warp.mask": false, "warp.endpoint": false,
+		"warp.engine": true, "warp.mask": false, "warp.endpoint": false, "warp.license": false,
 		"proxy.enabled": true, "proxy.upstream": true,
 		"dns.enabled": false, "dns.local_server": false, "dns.local_addr": false, "udp.mode": false,
 		"tun.enabled": false, "tun.mtu": false, "tun.dns_hijack": false, "tun.fake_ip": false, "tun.ipv6": false, "tun.exclude_apps": false,
@@ -360,8 +360,8 @@ func TestConfigSetKeyAndValues(t *testing.T) {
 		"general.watch_config": false, "general.system_proxy": false, "general.ui_mode": false,
 	}
 	vals := c.values()
-	if len(restartKeys) != 42 {
-		t.Fatalf("test table must cover 42 keys, has %d", len(restartKeys))
+	if len(restartKeys) != 43 {
+		t.Fatalf("test table must cover 43 keys, has %d", len(restartKeys))
 	}
 	if len(vals) != len(restartKeys) {
 		t.Fatalf("values() has %d keys, test table has %d", len(vals), len(restartKeys))

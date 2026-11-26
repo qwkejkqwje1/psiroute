@@ -112,13 +112,14 @@
     }
 
     .card {
-      background: var(--bg-surface);
+      background: linear-gradient(180deg, rgba(255,255,255,0.025) 0%, rgba(255,255,255,0) 48px), var(--bg-surface);
       border: 1px solid var(--border-hairline);
       box-shadow: var(--shadow-card);
       border-radius: 16px;
       padding: 18px;
-      transition: border-color 0.2s ease;
+      transition: border-color 0.2s ease, box-shadow 0.2s ease;
     }
+    .card:hover { border-color: rgba(99, 102, 241, 0.28); }
     .subtle {
       background: var(--bg-subtle);
       border: 1px solid var(--border-hairline);
@@ -359,6 +360,7 @@
       newRuleTarget: '',
       newRuleOb: 'psiphon',
       streamFilter: 'all',
+      streamSort: 'recent', // recent | traffic_desc | traffic_asc | name
       streamSearch: '',
       streamTarget: 'domain',
       streamPaused: false,
@@ -1026,20 +1028,40 @@
 
     function renderStreams() {
       const q = ui.streamSearch.toLowerCase();
+      const totalBytes = c => Number(c.rx ?? c.down ?? 0) + Number(c.tx ?? c.up ?? 0);
       const rows = ui.conns.filter(c => {
         if (ui.streamFilter === 'live' && !c.live) return false;
         if (ui.streamFilter === 'warn' && !c.err) return false;
         if (ui.streamFilter === 'block' && c.outbound !== 'block') return false;
-        if (q && !(String(c.app||'') + ' ' + String(c.host||'') + ' ' + String(c.rule||'')).toLowerCase().includes(q)) return false;
+        if (q && !(String(c.app||'') + ' ' + String(c.host||'') + ' ' + String(c.rule||'') + ' ' + String(c.outbound||'')).toLowerCase().includes(q)) return false;
         return true;
       });
+      if (ui.streamSort === 'traffic_desc') {
+        rows.sort((a, b) => totalBytes(b) - totalBytes(a));
+      } else if (ui.streamSort === 'traffic_asc') {
+        rows.sort((a, b) => totalBytes(a) - totalBytes(b));
+      } else if (ui.streamSort === 'name') {
+        rows.sort((a, b) => {
+          const ha = String(a.host || a.app || '').toLowerCase();
+          const hb = String(b.host || b.app || '').toLowerCase();
+          return ha.localeCompare(hb) || String(a.app || '').localeCompare(String(b.app || ''));
+        });
+      }
       return `<div class="stack">
         <div class="card" style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between">
-          <div class="seg">
-            <button class="${ui.streamFilter==='all'?'act-vpn':''}" onclick="ui.streamFilter='all';renderWorkspace()">Все (${ui.conns.length})</button>
-            <button class="${ui.streamFilter==='live'?'act-direct':''}" onclick="ui.streamFilter='live';renderWorkspace()">Активные</button>
-            <button class="${ui.streamFilter==='warn'?'act-warp':''}" onclick="ui.streamFilter='warn';renderWorkspace()">Сбросы</button>
-            <button class="${ui.streamFilter==='block'?'act-block':''}" onclick="ui.streamFilter='block';renderWorkspace()">Блок</button>
+          <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+            <div class="seg">
+              <button class="${ui.streamFilter==='all'?'act-vpn':''}" onclick="ui.streamFilter='all';renderWorkspace()">Все (${ui.conns.length})</button>
+              <button class="${ui.streamFilter==='live'?'act-direct':''}" onclick="ui.streamFilter='live';renderWorkspace()">Активные</button>
+              <button class="${ui.streamFilter==='warn'?'act-warp':''}" onclick="ui.streamFilter='warn';renderWorkspace()">Сбросы</button>
+              <button class="${ui.streamFilter==='block'?'act-block':''}" onclick="ui.streamFilter='block';renderWorkspace()">Блок</button>
+            </div>
+            <div class="seg" title="Сортировка потоков">
+              <button class="${ui.streamSort==='recent'?'act-vpn':''}" onclick="ui.streamSort='recent';renderWorkspace()">Время</button>
+              <button class="${ui.streamSort==='traffic_desc'?'act-dpi':''}" onclick="ui.streamSort='traffic_desc';renderWorkspace()">↓ Трафик</button>
+              <button class="${ui.streamSort==='traffic_asc'?'act-warp':''}" onclick="ui.streamSort='traffic_asc';renderWorkspace()">↑ Трафик</button>
+              <button class="${ui.streamSort==='name'?'act-clean':''}" onclick="ui.streamSort='name';renderWorkspace()">Имя A–Z</button>
+            </div>
           </div>
           <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
             <div class="seg">
@@ -1051,19 +1073,26 @@
           </div>
         </div>
         <div class="card">
-          ${rows.map(c => `<div class="row-item ${c.err?'warn-row':''}">
+          ${rows.map(c => {
+            const rx = Number(c.rx ?? c.down ?? 0);
+            const tx = Number(c.tx ?? c.up ?? 0);
+            return `<div class="row-item ${c.err?'warn-row':''}">
             <div style="min-width:0;flex:1">
-              <div class="mono" style="font-size:12px;font-weight:600">
-                <span class="dot" style="background:${c.live?'#10B981':'#64748B'};margin-right:6px"></span>
-                ${esc(c.app || 'system')} → <span style="color:#818CF8">${esc(mask(c.host))}</span>:${c.port||0}
+              <div class="mono" style="font-size:12px;font-weight:600;display:flex;flex-wrap:wrap;align-items:center;gap:6px">
+                <span class="dot" style="background:${c.live?'#10B981':'#64748B'}"></span>
+                <span>${esc(c.app || 'system')}</span>
+                <span style="color:var(--text-muted)">→</span>
+                <span style="color:#818CF8">${esc(mask(c.host))}</span>:${c.port||0}
                 <span class="badge b-mut">${esc((c.proto||'tcp').toUpperCase())}</span>
+                <span class="badge b-dpi">Σ ${fmtBytes(rx + tx)}</span>
               </div>
-              <div style="font-size:11px;color:var(--text-muted);margin-top:3px">
-                Правило: ${esc(c.rule||'—')} · ↓ ${fmtBytes(c.rx)} · ↑ ${fmtBytes(c.tx)} ${c.err ? '· ⚠ ' + esc(c.err) : ''}
+              <div style="font-size:11px;color:var(--text-muted);margin-top:4px">
+                Правило: ${esc(c.rule||'—')} · ↓ ${fmtBytes(rx)} · ↑ ${fmtBytes(tx)} ${c.hits > 1 ? '· ×' + c.hits : ''} ${c.err ? '· ⚠ ' + esc(c.err) : ''}
               </div>
             </div>
             ${segButtons(c.outbound || '', `quickConnRule('${esc(c.host)}','${esc(c.app||'')}','{ob}')`)}
-          </div>`).join('') || '<div style="text-align:center;padding:24px;color:var(--text-muted);font-size:12px">Нет активных соединений</div>'}
+          </div>`;
+          }).join('') || '<div style="text-align:center;padding:24px;color:var(--text-muted);font-size:12px">Нет активных соединений</div>'}
         </div>
       </div>`;
     }

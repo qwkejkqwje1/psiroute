@@ -15,5 +15,8 @@ func relaunchElevated(waitPID int) error                         { return errTun
 func waitForPID(pid int)                                         {}
 func refreshPhys() error                                         { return errTunUnsupported }
 func bindPhys(network, address string, c syscall.RawConn) error  { return nil }
+func disableUDPConnResetRaw(c syscall.RawConn) error           { return nil }
+func bindPhysSocketFD(fd int) (string, error)                  { return "direct", nil }
+func physDNSServers() []string                                 { return nil }
 
 func flushWindowsDNSCache() {}

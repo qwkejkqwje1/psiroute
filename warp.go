@@ -52,6 +52,7 @@ type warpIdentity struct {
 	PeerKey    string `json:"peer_public_key"`
 	PeerHost   string `json:"peer_host"`
 	Account    string `json:"account_type"`
+	License    string `json:"license,omitempty"`  // applied WARP+ license key
 	Endpoint   string `json:"endpoint,omitempty"` // the endpoint that worked last
 	Colo       string `json:"colo,omitempty"`     // its data center
 	Mask       string `json:"mask,omitempty"`     // the masking that worked
@@ -173,6 +174,29 @@ func warpRegister(clients []*http.Client) (*warpIdentity, error) {
 		PeerKey: r.Config.Peers[0].PublicKey, PeerHost: r.Config.Peers[0].Endpoint.Host,
 		Account: r.Account.AccountType, Created: time.Now().Unix(),
 	}, nil
+}
+
+// warpApplyLicense binds a WARP+ license key to an existing Cloudflare device.
+func warpApplyLicense(clients []*http.Client, id *warpIdentity, license string) error {
+	license = strings.TrimSpace(license)
+	if id == nil || id.ID == "" || id.Token == "" || license == "" {
+		return errors.New("неполные данные для активации WARP+")
+	}
+	b, err := warpAPIDo(clients, "PUT", "/reg/"+id.ID+"/account", id.Token, map[string]string{"license": license})
+	if err != nil {
+		return err
+	}
+	var res struct {
+		AccountType string `json:"account_type"`
+	}
+	_ = json.Unmarshal(b, &res)
+	if res.AccountType != "" {
+		id.Account = res.AccountType
+	} else {
+		id.Account = "plus"
+	}
+	id.License = license
+	return nil
 }
 
 // ---------- handshake masking (I1–I5 CPS chain + MASQUE HTTP/3 & ECH) ----------

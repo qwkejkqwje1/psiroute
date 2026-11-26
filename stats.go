@@ -95,8 +95,12 @@ func (t *tracked) view() map[string]any {
 	if end.IsZero() {
 		end = time.Now()
 	}
+	proto := t.protocol
+	if proto == "" {
+		proto = "tcp"
+	}
 	m := map[string]any{
-		"id": t.id, "app": t.app, "host": t.host, "sni": t.sni, "port": t.port,
+		"id": t.id, "proto": proto, "app": t.app, "host": t.host, "sni": t.sni, "port": t.port,
 		"outbound": t.outbound, "rule": t.rule, "up": t.up.Load(), "down": t.down.Load(),
 		"age": int64(end.Sub(t.start).Seconds()),
 	}
@@ -115,12 +119,16 @@ type agg struct {
 // Stats counts traffic per connection, outbound, application, host and day.
 type recentConn struct {
 	Time     string `json:"time"`
+	Proto    string `json:"proto,omitempty"`
 	App      string `json:"app"`
 	Host     string `json:"host"`
 	Port     int    `json:"port"`
 	Outbound string `json:"outbound"`
 	Rule     string `json:"rule"`
 	Hits     int    `json:"hits"`
+	Up       int64  `json:"up"`
+	Down     int64  `json:"down"`
+	Error    string `json:"error,omitempty"`
 }
 
 // channelTrafficCounters хранит атомарные счётчики сессии и за всё время по каналам (psiphon, warp, direct, proxy).
@@ -305,34 +313,76 @@ func (s *Stats) openProto(proto, app, host, sni string, port int, outbound, rule
 		s.byHost = map[string]*agg{}
 	}
 	bump(s.byHost, t.key, 1, 0, 0).outbound = outbound
-	// Record in unique recent connections ring buffer (max 100 entries)
-	if t.key != "" && t.key != "—" {
-		nowStr := t.start.Format("15:04:05")
-		foundIdx := -1
-		for i := range s.recent {
-			if s.recent[i].Host == t.key && s.recent[i].App == app {
-				foundIdx = i
-				break
-			}
+	// Record in unique recent connections ring buffer (max 150 entries)
+	s.upsertRecentLocked(t, "", true, 0, 0, "")
+	return t
+}
+
+func (s *Stats) upsertRecentLocked(t *tracked, prevKey string, newHit bool, addUp, addDown int64, errStr string) {
+	if t == nil || t.key == "" || t.key == "—" {
+		return
+	}
+	nowStr := t.start.Format("15:04:05")
+	proto := t.protocol
+	if proto == "" {
+		proto = "tcp"
+	}
+	foundIdx := -1
+	for i := range s.recent {
+		if (s.recent[i].Host == t.key || (prevKey != "" && s.recent[i].Host == prevKey)) && s.recent[i].App == t.app {
+			foundIdx = i
+			break
 		}
-		if foundIdx >= 0 {
-			rc := s.recent[foundIdx]
+	}
+	if foundIdx >= 0 {
+		rc := s.recent[foundIdx]
+		rc.Host = t.key
+		rc.Proto = proto
+		rc.Port = t.port
+		rc.Outbound = t.outbound
+		rc.Rule = t.rule
+		if newHit {
 			rc.Time = nowStr
-			rc.Port = port
-			rc.Outbound = outbound
-			rc.Rule = rule
 			rc.Hits++
+		}
+		if addUp > 0 {
+			rc.Up += addUp
+		}
+		if addDown > 0 {
+			rc.Down += addDown
+		}
+		if errStr != "" {
+			rc.Error = errStr
+		}
+		if newHit {
 			copy(s.recent[1:foundIdx+1], s.recent[0:foundIdx])
 			s.recent[0] = rc
 		} else {
-			rc := recentConn{Time: nowStr, App: app, Host: t.key, Port: port, Outbound: outbound, Rule: rule, Hits: 1}
-			s.recent = append([]recentConn{rc}, s.recent...)
-			if len(s.recent) > 100 {
-				s.recent = s.recent[:100]
-			}
+			s.recent[foundIdx] = rc
 		}
+		return
 	}
-	return t
+	hits := 1
+	if !newHit {
+		hits = 1
+	}
+	rc := recentConn{
+		Time:     nowStr,
+		Proto:    proto,
+		App:      t.app,
+		Host:     t.key,
+		Port:     t.port,
+		Outbound: t.outbound,
+		Rule:     t.rule,
+		Hits:     hits,
+		Up:       addUp,
+		Down:     addDown,
+		Error:    errStr,
+	}
+	s.recent = append([]recentConn{rc}, s.recent...)
+	if len(s.recent) > 150 {
+		s.recent = s.recent[:150]
+	}
 }
 
 func displayHost(t *tracked) string {
@@ -360,6 +410,7 @@ func (s *Stats) close(t *tracked, err error) {
 	bump(s.byOb, t.outbound, 0, up, down)
 	bump(s.byApp, t.app, 0, up, down)
 	bump(s.byHost, t.key, 0, up, down)
+	s.upsertRecentLocked(t, "", false, up, down, t.err)
 	s.closed = append(s.closed, t)
 	if len(s.closed) > 300 {
 		s.closed = s.closed[len(s.closed)-300:]
@@ -374,6 +425,7 @@ func (s *Stats) setRoute(t *tracked, outbound, rule string) {
 	t.outbound = outbound
 	t.rule = rule
 	t.chanCode.Store(outboundChanCode(outbound))
+	s.upsertRecentLocked(t, "", false, 0, 0, "")
 	s.mu.Unlock()
 }
 
@@ -655,7 +707,87 @@ func fmtBytes(b int64) string {
 func (s *Stats) recentList() []recentConn {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]recentConn(nil), s.recent...)
+	out := append([]recentConn(nil), s.recent...)
+	// Add live active byte counts on matching recent entries so paused/recent views reflect live traffic too.
+	liveTotals := make(map[string][2]int64, len(s.live))
+	for _, t := range s.live {
+		k := t.app + "\x00" + t.key
+		prev := liveTotals[k]
+		prev[0] += t.up.Load()
+		prev[1] += t.down.Load()
+		liveTotals[k] = prev
+	}
+	for i := range out {
+		k := out[i].App + "\x00" + out[i].Host
+		if add, ok := liveTotals[k]; ok {
+			out[i].Up += add[0]
+			out[i].Down += add[1]
+		}
+	}
+	return out
+}
+
+// connsList returns unified stream rows (live flows first, then recent history) for Web UI /api/conns/recent.
+func (s *Stats) connsList() []map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	liveKeys := make(map[string]struct{}, len(s.live))
+	liveRows := make([]map[string]any, 0, len(s.live))
+	for _, t := range s.live {
+		u, d := t.up.Load(), t.down.Load()
+		proto := t.protocol
+		if proto == "" {
+			proto = "tcp"
+		}
+		h := displayHost(t)
+		liveKeys[t.app+"\x00"+h] = struct{}{}
+		liveRows = append(liveRows, map[string]any{
+			"id":       t.id,
+			"live":     true,
+			"app":      t.app,
+			"host":     h,
+			"sni":      t.sni,
+			"port":     t.port,
+			"proto":    proto,
+			"outbound": t.outbound,
+			"rule":     t.rule,
+			"rx":       d,
+			"tx":       u,
+			"down":     d,
+			"up":       u,
+			"err":      t.err,
+			"time":     t.start.Format("15:04:05"),
+		})
+	}
+	sort.Slice(liveRows, func(i, j int) bool { return liveRows[i]["id"].(int64) > liveRows[j]["id"].(int64) })
+	out := make([]map[string]any, 0, len(liveRows)+len(s.recent))
+	out = append(out, liveRows...)
+	for _, rc := range s.recent {
+		if _, isLive := liveKeys[rc.App+"\x00"+rc.Host]; isLive {
+			continue
+		}
+		proto := rc.Proto
+		if proto == "" {
+			proto = "tcp"
+		}
+		out = append(out, map[string]any{
+			"live":     false,
+			"app":      rc.App,
+			"host":     rc.Host,
+			"port":     rc.Port,
+			"proto":    proto,
+			"outbound": rc.Outbound,
+			"rule":     rc.Rule,
+			"hits":     rc.Hits,
+			"rx":       rc.Down,
+			"tx":       rc.Up,
+			"down":     rc.Down,
+			"up":       rc.Up,
+			"err":      rc.Error,
+			"time":     rc.Time,
+		})
+	}
+	return out
 }
 
 // history is per-day totals, newest first.

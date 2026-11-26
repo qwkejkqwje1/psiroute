@@ -199,17 +199,19 @@ func isForbiddenLANPivot(auth *proxyAuth, remote net.Addr, host string) bool {
 func (s *Stats) setSNI(t *tracked, sni string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	prevKey := t.key
 	t.sni = sni
 	newKey := displayHost(t)
-	if newKey != "" && newKey != t.key {
-		if old := s.byHost[t.key]; old != nil {
+	if newKey != "" && newKey != prevKey {
+		if old := s.byHost[prevKey]; old != nil {
 			old.conns--
 			if old.conns <= 0 && old.up == 0 && old.down == 0 {
-				delete(s.byHost, t.key)
+				delete(s.byHost, prevKey)
 			}
 		}
 		t.key = newKey
 		bump(s.byHost, t.key, 1, 0, 0).outbound = t.outbound
+		s.upsertRecentLocked(t, prevKey, false, 0, 0, "")
 	}
 }
 
@@ -528,33 +530,33 @@ func (a *App) tunnelAppAddr(c net.Conn, br *bufio.Reader, host, dstIP string, po
 	}
 
 	repliedEarly := false
-	// Находка 10: Если клиент (например, Discord или браузер с DoH) стучится по сырому публичному IP
-	// на TLS/HTTP порт (443, 80, 8443 и т.д.), а домен ещё неизвестен в theFakeIP / theRevDNS,
-	// прямое подключение к заблокированной ТСПУ подсети (162.159.x.x и др.) зависнет на TCP SYN blackhole
-	// до того, как клиент пришлёт ClientHello.
-	// Чтобы исключить двойное ожидание 550 мс между tun.go (300 мс) и proxy.go (250 мс):
-	// - если br.Buffered() > 0 (соединение пришло из tun.go после e.sniff), мгновенно без ожидания
-	//   читаем уже буферизованные байты через br.Peek(br.Buffered()) и извлекаем sniffHost(peek);
-	// - только когда br.Buffered() == 0 и fromProxy == true (соединение пришло напрямую в SOCKS5/HTTP прокси),
-	//   подтверждаем рукопожатие и запускаем sniffBufferedConn(c, br, 250*time.Millisecond).
-	if addr, err := netip.ParseAddr(cleanHostKey(host)); err == nil && !addr.IsLoopback() && isEarlySNIPort(port) {
+	// Находка 10: Если соединение открыто по сырому IP (DoH/кэш ОС) или предварительный домен
+	// пришёл из общего RevDNS без реального SNI, а ClientHello уже буферизован в br (0 мс ожидания)
+	// или ожидается от SOCKS5/HTTP-клиента — извлекаем реальный SNI до выбора маршрута.
+	if addr, err := netip.ParseAddr(cleanHostKey(host)); (err == nil && !addr.IsLoopback() && isEarlySNIPort(port)) || (isEarlySNIPort(port) && br.Buffered() > 0) {
 		preOrder, _, preStage := a.router.planForProtoWithStage("tcp", host, dstIP, port, app)
 		if len(preOrder) == 0 || preOrder[0] != obBlock {
-			// Если для этого IP ещё нет точного CIDR/App правила (Stage 7 или Auto), читаем SNI до dial
-			if preStage >= 6 || (len(preOrder) > 0 && preOrder[0] == obDirect) {
+			needEarly := br.Buffered() > 0 || preStage >= 6 || (len(preOrder) > 0 && preOrder[0] == obDirect) || a.router.hasDomainOrListRules()
+			if needEarly {
 				var sni string
 				if buffered := br.Buffered(); buffered > 0 {
 					peek, _ := br.Peek(buffered)
 					sni = sniffHost(peek)
-				} else if fromProxy {
+				} else if fromProxy && err == nil {
 					if err := reply(nil, nil); err != nil {
 						return
 					}
 					repliedEarly = true
 					br, sni = sniffBufferedConn(c, br, 250*time.Millisecond)
 				}
-				if sni != "" {
-					theRevDNS.put(net.IP(addr.AsSlice()), sni, 10*time.Minute)
+				if sni != "" && !isECHOuterHost(sni) {
+					if err == nil {
+						theRevDNS.put(net.IP(addr.AsSlice()), sni, 10*time.Minute)
+					} else if dstIP != "" {
+						if dip := net.ParseIP(dstIP); dip != nil {
+							theRevDNS.put(dip, sni, 10*time.Minute)
+						}
+					}
 					host = sni
 				}
 			}
@@ -724,6 +726,12 @@ func (a *App) relay(c net.Conn, br *bufio.Reader, up net.Conn, t *tracked) (erro
 	}
 	errc := make(chan res, 2)
 	safeGo("App.relay", func() {
+		sent := false
+		defer func() {
+			if !sent {
+				errc <- res{false, errors.New("сбой исходящего потока релея")}
+			}
+		}()
 		bufPtr := getRelayBuf()
 		defer putRelayBuf(bufPtr)
 		buf := *bufPtr
@@ -740,33 +748,52 @@ func (a *App) relay(c net.Conn, br *bufio.Reader, up net.Conn, t *tracked) (erro
 						_, _, _, _, curOb := a.stats.routeAndHost(t)
 						if curOb == obPsiphon || isCountryOb(curOb) {
 							errc <- res{false, errBlocked}
+							sent = true
 							_ = curUp.Close()
 							return
 						}
 					}
-					if s := sniffHost(buf[:n]); s != "" {
+					if s := sniffHost(buf[:n]); s != "" && !isECHOuterHost(s) {
 						a.stats.setSNI(t, s)
 						_, host, port, app, curOb := a.stats.routeAndHost(t)
-						if ip := net.ParseIP(host); ip != nil {
-							theRevDNS.put(ip, s, 10*time.Minute)
-							if ord, newRule := a.router.planForProto("tcp", s, host, port, app); len(ord) > 0 {
+						ip := net.ParseIP(host)
+						needReplan := ip != nil || !strings.EqualFold(cleanHostKey(s), cleanHostKey(host))
+						if needReplan {
+							if ip != nil {
+								theRevDNS.put(ip, s, 10*time.Minute)
+							}
+							dstParam := ""
+							if ip != nil {
+								dstParam = host
+							}
+							if ord, newRule := a.router.planForProto("tcp", s, dstParam, port, app); len(ord) > 0 {
 								if ord[0] == obBlock {
 									_ = curUp.Close()
 									errc <- res{false, errBlocked}
+									sent = true
 									return
 								}
 								// Переподключаем апстрим, если маршрут по домену s отличается от curOb,
-								// ЛИБО если соединение изначально было открыто по сырому (возможно отравленному ТСПУ) IP
+								// ЛИБО если соединение изначально было открыто по сырому/устаревшему адресу
 								// внутрь туннеля (Psiphon/WARP) — чтобы туннель открыл соединение именно по доменному имени s:port!
-								needTunnelDomainRebind := host != s && (ord[0] == obPsiphon || isCountryOb(ord[0]) || ord[0] == obWarp)
+								needTunnelDomainRebind := (ip != nil || !strings.EqualFold(cleanHostKey(s), cleanHostKey(host))) &&
+									(ord[0] == obPsiphon || isCountryOb(ord[0]) || ord[0] == obWarp)
 								if ord[0] != curOb || needTunnelDomainRebind {
+									if oc, ok := curUp.(*countConn); ok {
+										if obc, ok2 := oc.Conn.(*obfsConn); ok2 && cleanHostKey(s) != "" {
+											obc.host = cleanHostKey(s)
+										}
+									}
 									rctx, rcancel := context.WithTimeout(a.ctx, 15*time.Second)
 									var newConn net.Conn
 									var chosenOb string
 									var lastErr error
 									var resolved []string
 									var resolveErr error
-									rawHostAddr := net.JoinHostPort(host, strconv.Itoa(port))
+									rawHostAddr := ""
+									if ip != nil {
+										rawHostAddr = net.JoinHostPort(host, strconv.Itoa(port))
+									}
 									domainAddr := net.JoinHostPort(s, strconv.Itoa(port))
 									for i, o := range ord {
 										if o == obBlock {
@@ -783,19 +810,23 @@ func (a *App) relay(c net.Conn, br *bufio.Reader, up net.Conn, t *tracked) (erro
 										case obDirect:
 											if resolved == nil && resolveErr == nil {
 												resolved, resolveErr = a.directAddrs(dctx, s, port)
-												if resolveErr != nil || len(resolved) == 0 {
+												if (resolveErr != nil || len(resolved) == 0) && rawHostAddr != "" {
 													resolved, resolveErr = []string{rawHostAddr}, nil
-												} else if host != "" && !slices.Contains(resolved, rawHostAddr) {
+												} else if rawHostAddr != "" && !slices.Contains(resolved, rawHostAddr) {
 													resolved = append(resolved, rawHostAddr)
 												}
 											}
-											newConn, lastErr = dialHappyEyeballs(dctx, dial, resolved)
+											if resolveErr == nil && len(resolved) > 0 {
+												newConn, lastErr = dialHappyEyeballs(dctx, dial, resolved)
+											} else {
+												lastErr = resolveErr
+											}
 										case obDesync:
 											if resolved == nil && resolveErr == nil {
 												resolved, resolveErr = a.directAddrs(dctx, s, port)
-												if resolveErr != nil || len(resolved) == 0 {
+												if (resolveErr != nil || len(resolved) == 0) && rawHostAddr != "" {
 													resolved, resolveErr = []string{rawHostAddr}, nil
-												} else if host != "" && !slices.Contains(resolved, rawHostAddr) {
+												} else if rawHostAddr != "" && !slices.Contains(resolved, rawHostAddr) {
 													resolved = append(resolved, rawHostAddr)
 												}
 											}
@@ -811,8 +842,10 @@ func (a *App) relay(c net.Conn, br *bufio.Reader, up net.Conn, t *tracked) (erro
 												}
 												return conn, err
 											}
-											newConn, lastErr = dialHappyEyeballs(dctx, desyncDial, resolved)
-											if lastErr != nil {
+											if len(resolved) > 0 {
+												newConn, lastErr = dialHappyEyeballs(dctx, desyncDial, resolved)
+											}
+											if len(resolved) == 0 || lastErr != nil {
 												newConn, lastErr = desyncDial(dctx, "tcp", domainAddr)
 											}
 										default:
@@ -848,6 +881,7 @@ func (a *App) relay(c net.Conn, br *bufio.Reader, up net.Conn, t *tracked) (erro
 											lastErr = errors.New("нет маршрута")
 										}
 										errc <- res{false, lastErr}
+										sent = true
 										return
 									}
 								}
@@ -857,6 +891,7 @@ func (a *App) relay(c net.Conn, br *bufio.Reader, up net.Conn, t *tracked) (erro
 				}
 				if _, werr := curUp.Write(buf[:n]); werr != nil {
 					errc <- res{false, werr}
+					sent = true
 					return
 				}
 			}
@@ -865,11 +900,18 @@ func (a *App) relay(c net.Conn, br *bufio.Reader, up net.Conn, t *tracked) (erro
 					err = nil
 				}
 				errc <- res{true, err}
+				sent = true
 				return
 			}
 		}
 	})
 	safeGo("App.relay#2", func() {
+		sent := false
+		defer func() {
+			if !sent {
+				errc <- res{false, errors.New("сбой входящего потока релея")}
+			}
+		}()
 		bufPtr := getRelayBuf()
 		defer putRelayBuf(bufPtr)
 		_, err := io.CopyBuffer(c, up, *bufPtr)
@@ -879,6 +921,7 @@ func (a *App) relay(c net.Conn, br *bufio.Reader, up net.Conn, t *tracked) (erro
 		default:
 		}
 		errc <- res{false, err}
+		sent = true
 	})
 	r1 := <-errc
 	curUp := getUp()
@@ -944,9 +987,11 @@ func dialHappyEyeballs(ctx context.Context, dial dialFunc, addrs []string) (net.
 	defer cancel()
 	ch := make(chan res, len(addrs))
 	launch := func(addr string) {
-		safeGo("dialHappyEyeballs", func() {
+		safeGoReply("dialHappyEyeballs", ch, func(rec any) res {
+			return res{err: fmt.Errorf("паника подключения к %s: %v", addr, rec)}
+		}, func() res {
 			c, err := dial(rctx, "tcp", addr)
-			ch <- res{c, err}
+			return res{c, err}
 		})
 	}
 	launch(addrs[0])

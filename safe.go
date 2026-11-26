@@ -62,6 +62,32 @@ func safeGo(name string, f func()) {
 	}()
 }
 
+// safeGoReply runs fn in a panic-recovered goroutine and guarantees exactly one
+// reply reaches ch (falling back to panicVal on panic/Goexit) so waiting
+// callers never hang indefinitely.
+func safeGoReply[T any](name string, ch chan<- T, panicVal func(r any) T, fn func() T) {
+	go func() {
+		sent := false
+		defer func() {
+			if rec := recover(); rec != nil {
+				reportPanic(name, rec)
+				if !sent && ch != nil {
+					ch <- panicVal(rec)
+					sent = true
+				}
+			} else if !sent && ch != nil {
+				ch <- panicVal("не получен ответ")
+				sent = true
+			}
+		}()
+		v := fn()
+		if ch != nil {
+			ch <- v
+		}
+		sent = true
+	}()
+}
+
 // goSafe is the older name of safeGo, kept for existing call sites.
 func goSafe(where string, f func()) { safeGo(where, f) }
 

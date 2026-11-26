@@ -254,10 +254,15 @@ func (p *Psi) scoreStrategyLocked(netKey, id string, baseIdx int, lastGlobal str
 	if st == nil || st.Attempts == 0 {
 		return score
 	}
-	// Laplace-smoothed success ratio in [0..100]
-	ratio := float64(st.Successes+1) / float64(st.Attempts+2)
+	// Laplace-smoothed success ratio in [0..60]; treat proved tunnel lifetime (>= 20s)
+	// as an effective success so user stops before holdOK (3m) never penalize a working route.
+	effectiveSuccesses := st.Successes
+	if effectiveSuccesses == 0 && st.MedianLifetimeSec >= 20 {
+		effectiveSuccesses = 1
+	}
+	ratio := float64(effectiveSuccesses+1) / float64(st.Attempts+2)
 	score += ratio * 60.0
-	if st.Successes > 0 {
+	if effectiveSuccesses > 0 {
 		score += 20.0
 	}
 	// Bonus for long-lived tunnels (up to +35)
@@ -279,8 +284,8 @@ func (p *Psi) scoreStrategyLocked(netKey, id string, baseIdx int, lastGlobal str
 			score += (24.0 - ageHours) * 0.8
 		}
 	}
-	// Penalty if repeated attempts failed without a single success
-	if st.Successes == 0 && st.Attempts >= 2 {
+	// Penalty if repeated attempts failed without a single success or meaningful lifetime
+	if effectiveSuccesses == 0 && st.Attempts >= 2 {
 		score -= float64(st.Attempts) * 12.0
 	}
 	if st.UnstableUntil > now.Unix() {

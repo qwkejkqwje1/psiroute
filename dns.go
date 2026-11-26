@@ -652,14 +652,18 @@ func resolve(ctx context.Context, host string, useDoH bool) ([]string, error) {
 		totalWorkers = 2
 	}
 	ch := make(chan lookupRes, totalWorkers)
-	safeGo("resolve", func() {
+	safeGoReply("resolve", ch, func(rec any) lookupRes {
+		return lookupRes{err: fmt.Errorf("паника DNS-запроса: %v", rec)}
+	}, func() lookupRes {
 		resIPs, lerr := directWireLookup(rctx, cleanH)
-		ch <- lookupRes{resIPs, lerr}
+		return lookupRes{resIPs, lerr}
 	})
 	if useDoH {
-		safeGo("resolve#2", func() {
+		safeGoReply("resolve#2", ch, func(rec any) lookupRes {
+			return lookupRes{err: fmt.Errorf("паника DoH-запроса: %v", rec)}
+		}, func() lookupRes {
 			resIPs, derr := dohLookup(rctx, cleanH)
-			ch <- lookupRes{resIPs, derr}
+			return lookupRes{resIPs, derr}
 		})
 	}
 
